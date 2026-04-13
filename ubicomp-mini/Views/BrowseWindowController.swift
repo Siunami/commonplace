@@ -1,0 +1,120 @@
+import SwiftUI
+import AppKit
+
+final class BrowseWindowController: NSObject, NSWindowDelegate, ManagedWindowController {
+    static let shared = BrowseWindowController()
+
+    private var window: NSWindow?
+    private let hotkeys = HotkeyMonitorSet()
+
+    /// Posted when the browse window becomes visible.
+    static let windowDidShowNotification = Notification.Name("BrowseWindowDidShow")
+
+    /// Posted to open a specific highlight's detail view. UserInfo contains ["highlightId": String].
+    static let showHighlightDetailNotification = Notification.Name("BrowseWindowShowHighlightDetail")
+
+    /// Posted to open the Browse window with the Settings panel showing.
+    static let showSettingsNotification = Notification.Name("BrowseWindowShowSettings")
+
+    func registerHotkey() {
+        hotkeys.install { [weak self] event in
+            self?.handleKeyEvent(event) ?? false
+        }
+    }
+
+    @discardableResult
+    private func handleKeyEvent(_ event: NSEvent) -> Bool {
+        // Ctrl+Cmd+B
+        guard event.modifierFlags.contains([.command, .control]),
+              event.keyCode == 11 /* B */ else { return false }
+
+        DispatchQueue.main.async { self.toggle() }
+        return true
+    }
+
+    func toggle() {
+        if let window = window, window.isVisible {
+            dismiss()
+        } else {
+            show()
+        }
+    }
+
+    func show() {
+        // Create the window once. After that, just show/hide it.
+        // The SwiftUI view hierarchy is never destroyed, preventing
+        // the use-after-free crash that occurs during NSHostingController teardown.
+        if window == nil {
+            let w = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 1200, height: 800),
+                styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                backing: .buffered,
+                defer: true
+            )
+            w.title = "Commonplace"
+            w.minSize = NSSize(width: 400, height: 300)
+            w.isMovableByWindowBackground = false
+            w.delegate = self
+            let hc = NSHostingController(rootView: BrowseView())
+            hc.sizingOptions = []
+            w.contentViewController = hc
+
+            // 70% of screen, centered
+            if let screen = NSScreen.main?.visibleFrame {
+                let width = screen.width * 0.7
+                let height = screen.height * 0.7
+                let x = screen.midX - width / 2
+                let y = screen.midY - height / 2
+                w.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
+            } else {
+                w.center()
+            }
+            window = w
+        }
+
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        // Tell BrowseView to refresh its data
+        NotificationCenter.default.post(name: Self.windowDidShowNotification, object: nil)
+    }
+
+    /// Opens the browse window and shows a specific highlight's detail view.
+    func showHighlight(_ highlightId: String) {
+        show()
+        // Give SwiftUI a moment to set up, then post the detail notification
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            NotificationCenter.default.post(
+                name: Self.showHighlightDetailNotification,
+                object: nil,
+                userInfo: ["highlightId": highlightId]
+            )
+        }
+    }
+
+    func showSettings() {
+        show()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            NotificationCenter.default.post(name: Self.showSettingsNotification, object: nil)
+        }
+    }
+
+    func dismiss() {
+        // Hide — don't close. Window and SwiftUI hierarchy stay alive.
+        window?.orderOut(nil)
+    }
+
+    // Intercept the title bar close button: hide instead of close.
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        dismiss()
+        return false
+    }
+
+    func teardown() {
+        hotkeys.remove()
+        // Only on app quit: actually close and release
+        window?.delegate = nil
+        window?.close()
+        window = nil
+    }
+}

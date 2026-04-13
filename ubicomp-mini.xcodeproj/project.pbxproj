@@ -1,0 +1,612 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		6584BD802F64BD8200AFA3B8 /* GRDB in Frameworks */ = {isa = PBXBuildFile; productRef = 6584BD822F64BD8200AFA3B8 /* GRDB */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		6584BD542F64BD8200AFA3B8 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 6584BD3E2F64BD8100AFA3B8 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 6584BD452F64BD8100AFA3B8;
+			remoteInfo = "ubicomp-mini";
+		};
+		6584BD5E2F64BD8200AFA3B8 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 6584BD3E2F64BD8100AFA3B8 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 6584BD452F64BD8100AFA3B8;
+			remoteInfo = "ubicomp-mini";
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		6584BD462F64BD8100AFA3B8 /* ubicomp-mini.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "ubicomp-mini.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		6584BD532F64BD8200AFA3B8 /* ubicomp-miniTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "ubicomp-miniTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
+		6584BD5D2F64BD8200AFA3B8 /* ubicomp-miniUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "ubicomp-miniUITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		6584BD482F64BD8100AFA3B8 /* ubicomp-mini */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = "ubicomp-mini";
+			sourceTree = "<group>";
+		};
+		6584BD562F64BD8200AFA3B8 /* ubicomp-miniTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = "ubicomp-miniTests";
+			sourceTree = "<group>";
+		};
+		6584BD602F64BD8200AFA3B8 /* ubicomp-miniUITests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = "ubicomp-miniUITests";
+			sourceTree = "<group>";
+		};
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		6584BD432F64BD8100AFA3B8 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6584BD802F64BD8200AFA3B8 /* GRDB in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		6584BD502F64BD8200AFA3B8 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		6584BD5A2F64BD8200AFA3B8 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		6584BD3D2F64BD8100AFA3B8 = {
+			isa = PBXGroup;
+			children = (
+				6584BD482F64BD8100AFA3B8 /* ubicomp-mini */,
+				6584BD562F64BD8200AFA3B8 /* ubicomp-miniTests */,
+				6584BD602F64BD8200AFA3B8 /* ubicomp-miniUITests */,
+				6584BD472F64BD8100AFA3B8 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		6584BD472F64BD8100AFA3B8 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				6584BD462F64BD8100AFA3B8 /* ubicomp-mini.app */,
+				6584BD532F64BD8200AFA3B8 /* ubicomp-miniTests.xctest */,
+				6584BD5D2F64BD8200AFA3B8 /* ubicomp-miniUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		6584BD452F64BD8100AFA3B8 /* ubicomp-mini */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 6584BD672F64BD8200AFA3B8 /* Build configuration list for PBXNativeTarget "ubicomp-mini" */;
+			buildPhases = (
+				6584BD422F64BD8100AFA3B8 /* Sources */,
+				6584BD432F64BD8100AFA3B8 /* Frameworks */,
+				6584BD442F64BD8100AFA3B8 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				6584BD482F64BD8100AFA3B8 /* ubicomp-mini */,
+			);
+			name = "ubicomp-mini";
+			packageProductDependencies = (
+				6584BD822F64BD8200AFA3B8 /* GRDB */,
+			);
+			productName = "ubicomp-mini";
+			productReference = 6584BD462F64BD8100AFA3B8 /* ubicomp-mini.app */;
+			productType = "com.apple.product-type.application";
+		};
+		6584BD522F64BD8200AFA3B8 /* ubicomp-miniTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 6584BD6A2F64BD8200AFA3B8 /* Build configuration list for PBXNativeTarget "ubicomp-miniTests" */;
+			buildPhases = (
+				6584BD4F2F64BD8200AFA3B8 /* Sources */,
+				6584BD502F64BD8200AFA3B8 /* Frameworks */,
+				6584BD512F64BD8200AFA3B8 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				6584BD552F64BD8200AFA3B8 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				6584BD562F64BD8200AFA3B8 /* ubicomp-miniTests */,
+			);
+			name = "ubicomp-miniTests";
+			packageProductDependencies = (
+			);
+			productName = "ubicomp-miniTests";
+			productReference = 6584BD532F64BD8200AFA3B8 /* ubicomp-miniTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		6584BD5C2F64BD8200AFA3B8 /* ubicomp-miniUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 6584BD6D2F64BD8200AFA3B8 /* Build configuration list for PBXNativeTarget "ubicomp-miniUITests" */;
+			buildPhases = (
+				6584BD592F64BD8200AFA3B8 /* Sources */,
+				6584BD5A2F64BD8200AFA3B8 /* Frameworks */,
+				6584BD5B2F64BD8200AFA3B8 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				6584BD5F2F64BD8200AFA3B8 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				6584BD602F64BD8200AFA3B8 /* ubicomp-miniUITests */,
+			);
+			name = "ubicomp-miniUITests";
+			packageProductDependencies = (
+			);
+			productName = "ubicomp-miniUITests";
+			productReference = 6584BD5D2F64BD8200AFA3B8 /* ubicomp-miniUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		6584BD3E2F64BD8100AFA3B8 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2630;
+				LastUpgradeCheck = 2630;
+				TargetAttributes = {
+					6584BD452F64BD8100AFA3B8 = {
+						CreatedOnToolsVersion = 26.3;
+					};
+					6584BD522F64BD8200AFA3B8 = {
+						CreatedOnToolsVersion = 26.3;
+						TestTargetID = 6584BD452F64BD8100AFA3B8;
+					};
+					6584BD5C2F64BD8200AFA3B8 = {
+						CreatedOnToolsVersion = 26.3;
+						TestTargetID = 6584BD452F64BD8100AFA3B8;
+					};
+				};
+			};
+			buildConfigurationList = 6584BD412F64BD8100AFA3B8 /* Build configuration list for PBXProject "ubicomp-mini" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 6584BD3D2F64BD8100AFA3B8;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				6584BD812F64BD8200AFA3B8 /* XCRemoteSwiftPackageReference "GRDB.swift" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 6584BD472F64BD8100AFA3B8 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				6584BD452F64BD8100AFA3B8 /* ubicomp-mini */,
+				6584BD522F64BD8200AFA3B8 /* ubicomp-miniTests */,
+				6584BD5C2F64BD8200AFA3B8 /* ubicomp-miniUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		6584BD442F64BD8100AFA3B8 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		6584BD512F64BD8200AFA3B8 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		6584BD5B2F64BD8200AFA3B8 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		6584BD422F64BD8100AFA3B8 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		6584BD4F2F64BD8200AFA3B8 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		6584BD592F64BD8200AFA3B8 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		6584BD552F64BD8200AFA3B8 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 6584BD452F64BD8100AFA3B8 /* ubicomp-mini */;
+			targetProxy = 6584BD542F64BD8200AFA3B8 /* PBXContainerItemProxy */;
+		};
+		6584BD5F2F64BD8200AFA3B8 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 6584BD452F64BD8100AFA3B8 /* ubicomp-mini */;
+			targetProxy = 6584BD5E2F64BD8200AFA3B8 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		6584BD652F64BD8200AFA3B8 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = N446DBNXUC;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		6584BD662F64BD8200AFA3B8 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = N446DBNXUC;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+			};
+			name = Release;
+		};
+		6584BD682F64BD8200AFA3B8 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = N446DBNXUC;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "ubicomp-mini/Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = Commonplace;
+				INFOPLIST_KEY_LSUIElement = YES;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Capture records your voice alongside screen recordings when audio is enabled.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Capture uses speech recognition for voice note dictation.";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.dubberly.Capture;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		6584BD692F64BD8200AFA3B8 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = N446DBNXUC;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "ubicomp-mini/Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = Commonplace;
+				INFOPLIST_KEY_LSUIElement = YES;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Capture records your voice alongside screen recordings when audio is enabled.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Capture uses speech recognition for voice note dictation.";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.dubberly.Capture;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		6584BD6B2F64BD8200AFA3B8 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = N446DBNXUC;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "playground.ubicomp-miniTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/ubicomp-mini.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/ubicomp-mini";
+			};
+			name = Debug;
+		};
+		6584BD6C2F64BD8200AFA3B8 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = N446DBNXUC;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "playground.ubicomp-miniTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/ubicomp-mini.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/ubicomp-mini";
+			};
+			name = Release;
+		};
+		6584BD6E2F64BD8200AFA3B8 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = N446DBNXUC;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "playground.ubicomp-miniUITests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_TARGET_NAME = "ubicomp-mini";
+			};
+			name = Debug;
+		};
+		6584BD6F2F64BD8200AFA3B8 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = N446DBNXUC;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "playground.ubicomp-miniUITests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_TARGET_NAME = "ubicomp-mini";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		6584BD412F64BD8100AFA3B8 /* Build configuration list for PBXProject "ubicomp-mini" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				6584BD652F64BD8200AFA3B8 /* Debug */,
+				6584BD662F64BD8200AFA3B8 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		6584BD672F64BD8200AFA3B8 /* Build configuration list for PBXNativeTarget "ubicomp-mini" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				6584BD682F64BD8200AFA3B8 /* Debug */,
+				6584BD692F64BD8200AFA3B8 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		6584BD6A2F64BD8200AFA3B8 /* Build configuration list for PBXNativeTarget "ubicomp-miniTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				6584BD6B2F64BD8200AFA3B8 /* Debug */,
+				6584BD6C2F64BD8200AFA3B8 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		6584BD6D2F64BD8200AFA3B8 /* Build configuration list for PBXNativeTarget "ubicomp-miniUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				6584BD6E2F64BD8200AFA3B8 /* Debug */,
+				6584BD6F2F64BD8200AFA3B8 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		6584BD812F64BD8200AFA3B8 /* XCRemoteSwiftPackageReference "GRDB.swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/groue/GRDB.swift.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 6.24.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		6584BD822F64BD8200AFA3B8 /* GRDB */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 6584BD812F64BD8200AFA3B8 /* XCRemoteSwiftPackageReference "GRDB.swift" */;
+			productName = GRDB;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 6584BD3E2F64BD8100AFA3B8 /* Project object */;
+}

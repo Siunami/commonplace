@@ -697,6 +697,8 @@ struct BrowseView: View {
         var counts = db.typeCounts()
         counts["_annotated"] = db.annotatedHighlightCount()
         counts["_links"] = db.linkHighlightCount()
+        counts["_videos"] = db.videoHighlightCount()
+        counts["_filesNoVideo"] = db.fileExcludingVideoCount()
         typeCounts = counts
     }
 
@@ -849,9 +851,7 @@ private struct MasonryCard: View {
     var cardTags: [Tag] = []
     var onTagTap: ((Tag) -> Void)? = nil
     @State private var isHovered = false
-    // Context menu tags loaded on demand (not per-card)
-    // Tag add/remove refreshes auto-propagate via .highlightDataDidChange
-    // posted by DatabaseManager — no local callback needed.
+    @State private var isLinkHovered = false
 
     private var hasAnnotation: Bool {
         if let note = highlight.userNote, !note.isEmpty { return true }
@@ -861,6 +861,13 @@ private struct MasonryCard: View {
     private var hasSourceUrl: Bool {
         guard let url = highlight.sourceUrl, !url.isEmpty else { return false }
         return URL(string: url) != nil
+    }
+
+    private var sourceDomain: String? {
+        guard let urlString = highlight.sourceUrl,
+              let url = URL(string: urlString),
+              let host = url.host else { return nil }
+        return host.replacingOccurrences(of: "www.", with: "")
     }
 
     var body: some View {
@@ -919,13 +926,37 @@ private struct MasonryCard: View {
                         NSWorkspace.shared.open(parsed)
                     }
                 }) {
-                    Image(systemName: "arrow.up.forward.square.fill")
-                        .font(.system(size: 14))
-                        .foregroundStyle(.white)
-                        .shadow(color: .black.opacity(0.5), radius: 2, y: 1)
+                    HStack(spacing: 0) {
+                        if let domain = sourceDomain {
+                            Text(domain)
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(.white)
+                                .lineLimit(1)
+                                .fixedSize()
+                                .frame(width: isLinkHovered ? nil : 0, alignment: .trailing)
+                                .clipped()
+                                .padding(.leading, isLinkHovered ? 8 : 0)
+                                .padding(.trailing, isLinkHovered ? 4 : 0)
+                        }
+                        Image(systemName: "arrow.up.forward.square.fill")
+                            .font(.system(size: 14))
+                            .foregroundStyle(.white)
+                    }
+                    .padding(.trailing, 4)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule().fill(.black.opacity(0.55))
+                            .opacity(isLinkHovered ? 1 : 0)
+                    )
+                    .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
                 }
                 .buttonStyle(.plain)
                 .padding(8)
+                .onHover { hovering in
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isLinkHovered = hovering
+                    }
+                }
                 .transition(.opacity)
             }
         }

@@ -15,6 +15,12 @@ extension DatabaseManager {
         if request.selectedFilter.isLinksFilter {
             return linkHighlightsPaginated(offset: offset, limit: limit)
         }
+        if request.selectedFilter.isVideosFilter {
+            return videoHighlightsPaginated(offset: offset, limit: limit)
+        }
+        if request.selectedFilter.isFilesExcludingVideos {
+            return fileExcludingVideoPaginated(offset: offset, limit: limit)
+        }
         if let app = request.selectedApp {
             return highlightsForApp(sourceApp: app, offset: offset, limit: limit)
         }
@@ -76,6 +82,10 @@ private struct BrowseSearchQuery {
                 (h.contentType = 'url'
                  OR (h.highlightType = 'copy' AND (h.contentText LIKE 'http://%' OR h.contentText LIKE 'https://%')))
                 """)
+        } else if request.selectedFilter.isVideosFilter {
+            whereClauses.append("h.highlightType = 'file' AND h.contentType = 'video'")
+        } else if request.selectedFilter.isFilesExcludingVideos {
+            whereClauses.append("h.highlightType = 'file' AND (h.contentType IS NULL OR h.contentType != 'video')")
         } else if let type = request.selectedFilter.highlightType {
             whereClauses.append("h.highlightType = ?")
             arguments.append(type)

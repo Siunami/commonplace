@@ -2,7 +2,7 @@
 
 ![Commonplace](assets/Archive%20UI.png)
 
-A quiet macOS utility that captures what you see, copy, and save — screenshots, clipboard, downloads, notes — and keeps it browsable in one place.
+A macOS utility that captures what you see, copy, and save — screenshots, clipboard, downloads, notes — and keeps it browsable in one place.
 
 Runs in the menu bar, no dock icon. Requires macOS 15.6+.
 
@@ -22,9 +22,9 @@ A camera icon appears in your menu bar. Click it to open the archive.
 | `Cmd+Shift+4` | Screenshot a selected region  |
 | `Ctrl+Cmd+B`  | Open the Browse window        |
 
-Clipboard copies and file downloads are captured automatically. Right-click selected text or images in any app → Services → **Clip to Capture**.
+Clipboard copies and file downloads are captured automatically.
 
-## Browse
+## Archive
 
 Everything lands in a single masonry grid. Filter by type, app, or tag; search across content, OCR text, URLs, and window titles. Click any card for full detail, notes, and metadata.
 

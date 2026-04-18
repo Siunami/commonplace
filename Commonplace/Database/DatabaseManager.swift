@@ -667,6 +667,46 @@ final class DatabaseManager {
         }) ?? []
     }
 
+    func videoHighlightCount() -> Int {
+        (try? dbQueue?.read { db in
+            try Int.fetchOne(db, sql: """
+                SELECT COUNT(*) FROM highlight
+                WHERE highlightType = 'file' AND contentType = 'video'
+                """)
+        } ?? 0) ?? 0
+    }
+
+    func videoHighlightsPaginated(offset: Int, limit: Int) -> [Highlight] {
+        (try? dbQueue?.read { db in
+            try Highlight.fetchAll(db, sql: """
+                SELECT * FROM highlight
+                WHERE highlightType = 'file' AND contentType = 'video'
+                ORDER BY timestamp DESC
+                LIMIT ? OFFSET ?
+                """, arguments: [limit, offset])
+        }) ?? []
+    }
+
+    func fileExcludingVideoCount() -> Int {
+        (try? dbQueue?.read { db in
+            try Int.fetchOne(db, sql: """
+                SELECT COUNT(*) FROM highlight
+                WHERE highlightType = 'file' AND (contentType IS NULL OR contentType != 'video')
+                """)
+        } ?? 0) ?? 0
+    }
+
+    func fileExcludingVideoPaginated(offset: Int, limit: Int) -> [Highlight] {
+        (try? dbQueue?.read { db in
+            try Highlight.fetchAll(db, sql: """
+                SELECT * FROM highlight
+                WHERE highlightType = 'file' AND (contentType IS NULL OR contentType != 'video')
+                ORDER BY timestamp DESC
+                LIMIT ? OFFSET ?
+                """, arguments: [limit, offset])
+        }) ?? []
+    }
+
     func linkHighlightCount() -> Int {
         (try? dbQueue?.read { db in
             try Int.fetchOne(db, sql: """

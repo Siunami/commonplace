@@ -227,6 +227,10 @@ struct CaptureFilterSidebar: View {
                     typeCounts["_annotated"] ?? 0
                 } else if filter == .links {
                     typeCounts["_links"] ?? 0
+                } else if filter == .videos {
+                    typeCounts["_videos"] ?? 0
+                } else if filter == .files {
+                    typeCounts["_filesNoVideo"] ?? 0
                 } else {
                     typeCounts[filter.highlightType ?? ""] ?? 0
                 }
@@ -336,33 +340,32 @@ enum CaptureFilter: String, CaseIterable {
     case all = "All"
     case annotated = "Annotated"
     case screenshots = "Screenshots"
-    case recordings = "Recordings"
+    case videos = "Videos"
     case links = "Links"
     case copies = "Copies"
     case files = "Files"
 
     var highlightType: String? {
         switch self {
-        case .all, .annotated, .links: return nil
+        case .all, .annotated, .links, .videos: return nil
         case .screenshots: return "screenshot"
-        case .recordings: return "recording"
         case .copies: return "copy"
         case .files: return "file"
         }
     }
 
-    /// True when this filter requires note-based filtering (not type-based).
     var isAnnotatedFilter: Bool { self == .annotated }
-
-    /// True when this filter shows URL copies (contentType = 'url').
     var isLinksFilter: Bool { self == .links }
+    var isVideosFilter: Bool { self == .videos }
+    /// Files filter excludes videos — they have their own category.
+    var isFilesExcludingVideos: Bool { self == .files }
 
     var icon: String {
         switch self {
         case .all: return "square.grid.2x2"
         case .annotated: return "text.bubble"
         case .screenshots: return "camera.viewfinder"
-        case .recordings: return "video.fill"
+        case .videos: return "video.fill"
         case .links: return "link"
         case .copies: return "doc.on.clipboard"
         case .files: return "doc.fill"

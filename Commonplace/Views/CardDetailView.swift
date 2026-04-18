@@ -16,7 +16,7 @@ struct CardDetailView: View {
     @State private var confirmationText: String?
     @State private var showCollectionPicker = false
     @State private var collectionInput = ""
-    @State private var allCollections: [Tag] = []
+    @State private var allCollections: [Tag] = DatabaseManager.shared.allTags()
     @State private var pickerSelection: Int = 0
 
     private var isScreenshot: Bool { highlight.highlightType == "screenshot" }
@@ -119,6 +119,7 @@ struct CardDetailView: View {
             }
             loadNotes()
             tags = DatabaseManager.shared.tagsForHighlight(id: highlight.id)
+            allCollections = DatabaseManager.shared.allTags()
         }
     }
 
@@ -311,7 +312,7 @@ struct CardDetailView: View {
                         }
                         .padding(.vertical, 4)
                     }
-                    .frame(minHeight: 40, maxHeight: 200)
+                    .frame(maxHeight: 300)
                     .onChange(of: pickerSelection) { _, newValue in
                         if newValue < filteredCollections.count {
                             proxy.scrollTo(filteredCollections[newValue].id, anchor: .center)
@@ -357,6 +358,10 @@ struct CardDetailView: View {
             }
         }
         .frame(width: 240)
+        .onAppear {
+            allCollections = DatabaseManager.shared.allTags()
+            pickerSelection = 0
+        }
     }
 
     /// Enter applies the highlighted collection, or creates a new one if no match.
@@ -376,20 +381,33 @@ struct CardDetailView: View {
             if isApplied { removeCollection(tag) } else { applyCollection(tag) }
         }) {
             HStack(spacing: 8) {
-                Image(systemName: isApplied ? "checkmark.circle.fill" : "circle")
-                    .foregroundStyle(isApplied ? Color.blue : Color.gray.opacity(0.4))
-                    .font(.system(size: 14))
+                // Emoji or folder icon — matches the sidebar style
+                if let emoji = tag.emoji, !emoji.isEmpty {
+                    Text(emoji)
+                        .font(.system(size: 13))
+                        .frame(width: 16)
+                } else {
+                    Image(systemName: "folder.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 16)
+                }
                 Text(tag.name)
                     .font(.system(size: 13))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
                 Spacer()
+                if isApplied {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.blue)
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 7)
             .background(
                 isHighlighted ? Color.accentColor.opacity(0.12) :
-                isApplied ? Color.blue.opacity(0.06) : Color.clear
+                isApplied ? Color.blue.opacity(0.04) : Color.clear
             )
             .contentShape(Rectangle())
         }

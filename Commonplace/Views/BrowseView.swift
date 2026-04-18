@@ -484,7 +484,9 @@ struct BrowseView: View {
                                     }
                                 )
                                 .id(highlight.id)
-                                .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = highlight } }
+                                .onTapGesture {
+                                    withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = highlight }
+                                }
                             }
                         }
                         .padding(.horizontal, 16).padding(.vertical, 12)
@@ -526,6 +528,7 @@ struct BrowseView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .contentShape(Rectangle())
+            .simultaneousGesture(TapGesture().onEnded { clearFocus() })
             .onDrop(of: [.fileURL, .item], isTargeted: $isDropTargeted) { providers in
                 handleDrop(providers)
             }
@@ -666,40 +669,56 @@ struct BrowseView: View {
             hasMore = false
         }
 
-        let db = DatabaseManager.shared
-        let batch = db.browseHighlights(
-            browseLoadRequest,
-            offset: highlightsOffset,
-            limit: pageSize
-        )
+        let request = browseLoadRequest
+        let offset = highlightsOffset
+        let limit = pageSize
+        let shouldRefreshFacets = reset
 
-        highlights.append(contentsOf: batch)
-        highlightsOffset += batch.count
-        hasMore = batch.count == pageSize
+        Task.detached(priority: .userInitiated) {
+            let db = DatabaseManager.shared
+            let batch = db.browseHighlights(request, offset: offset, limit: limit)
+            let newCounts = db.noteCountsForHighlights(ids: batch.map(\.id))
+            let newTags = db.tagsForHighlights(ids: batch.map(\.id))
+            let facets: [(appName: String, bundleId: String?, count: Int)]? =
+                shouldRefreshFacets ? db.appFacets() : nil
 
-        let newCounts = db.noteCountsForHighlights(ids: batch.map(\.id))
-        noteCounts.merge(newCounts) { _, new in new }
-        let newTags = db.tagsForHighlights(ids: batch.map(\.id))
-        highlightTags.merge(newTags) { _, new in new }
-
-        if reset {
-            appFacets = db.appFacets().map {
-                AppFacet(appName: $0.appName, bundleId: $0.bundleId, count: $0.count)
+            await MainActor.run {
+                highlights.append(contentsOf: batch)
+                highlightsOffset += batch.count
+                hasMore = batch.count == limit
+                noteCounts.merge(newCounts) { _, new in new }
+                highlightTags.merge(newTags) { _, new in new }
+                if let facets {
+                    appFacets = facets.map {
+                        AppFacet(appName: $0.appName, bundleId: $0.bundleId, count: $0.count)
+                    }
+                }
             }
         }
     }
 
+    private func clearFocus() {
+        NSApp.keyWindow?.makeFirstResponder(nil)
+    }
+
     private func refreshSidebarData() {
-        let db = DatabaseManager.shared
-        db.pruneEmptyTags()
-        allTags = db.allTags()
-        tagCounts = db.tagHighlightCounts()
-        var counts = db.typeCounts()
-        counts["_annotated"] = db.annotatedHighlightCount()
-        counts["_links"] = db.linkHighlightCount()
-        counts["_videos"] = db.videoHighlightCount()
-        counts["_filesNoVideo"] = db.fileExcludingVideoCount()
-        typeCounts = counts
+        Task.detached(priority: .userInitiated) {
+            let db = DatabaseManager.shared
+            db.pruneEmptyTags()
+            let tags = db.allTags()
+            let tCounts = db.tagHighlightCounts()
+            var counts = db.typeCounts()
+            counts["_annotated"] = db.annotatedHighlightCount()
+            counts["_links"] = db.linkHighlightCount()
+            counts["_videos"] = db.videoHighlightCount()
+            counts["_filesNoVideo"] = db.fileExcludingVideoCount()
+
+            await MainActor.run {
+                allTags = tags
+                tagCounts = tCounts
+                typeCounts = counts
+            }
+        }
     }
 
     // MARK: - Drag & Drop Import

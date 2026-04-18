@@ -10,9 +10,20 @@ struct AddTile: View {
     @State private var text: String = ""
     @State private var isEditing: Bool = false
 
+    /// Key for persisting drafts per collection in UserDefaults.
+    private var draftKey: String {
+        let id = tagIds.sorted().joined(separator: ",")
+        return "addTileDraft_\(id)"
+    }
+
+    /// Show the expanded editor if actively editing OR there's a draft with text.
+    private var showExpanded: Bool {
+        isEditing || !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     var body: some View {
         Group {
-            if isEditing {
+            if showExpanded {
                 expandedBody
             } else {
                 collapsedBody
@@ -33,6 +44,15 @@ struct AddTile: View {
             if !isEditing {
                 isEditing = true
             }
+        }
+        .onChange(of: tagIds) { _, _ in
+            // Save current draft, load the new collection's draft
+            saveDraft()
+            isEditing = false
+            text = UserDefaults.standard.string(forKey: draftKey) ?? ""
+        }
+        .onAppear {
+            text = UserDefaults.standard.string(forKey: draftKey) ?? ""
         }
     }
 
@@ -63,7 +83,11 @@ struct AddTile: View {
             NoteTextView(
                 text: $text,
                 onSubmit: save,
-                onCancel: cancel
+                onCancel: cancel,
+                onFocusLost: {
+                    isEditing = false
+                    saveDraft()
+                }
             )
             .padding(12)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -83,11 +107,22 @@ struct AddTile: View {
         HighlightCapture.shared.captureFromUserAdd(text: trimmed, tagIds: tagIds)
         text = ""
         isEditing = false
+        UserDefaults.standard.removeObject(forKey: draftKey)
     }
 
     private func cancel() {
         text = ""
         isEditing = false
+        UserDefaults.standard.removeObject(forKey: draftKey)
+    }
+
+    private func saveDraft() {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            UserDefaults.standard.removeObject(forKey: draftKey)
+        } else {
+            UserDefaults.standard.set(text, forKey: draftKey)
+        }
     }
 }
 
@@ -125,6 +160,7 @@ private struct NoteTextView: NSViewRepresentable {
     @Binding var text: String
     var onSubmit: () -> Void
     var onCancel: () -> Void
+    var onFocusLost: () -> Void = {}
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -192,6 +228,10 @@ private struct NoteTextView: NSViewRepresentable {
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
             parent.text = textView.string
+        }
+
+        func textDidEndEditing(_ notification: Notification) {
+            parent.onFocusLost()
         }
     }
 }

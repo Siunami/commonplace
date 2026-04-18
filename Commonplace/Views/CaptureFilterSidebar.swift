@@ -126,6 +126,13 @@ struct CaptureFilterSidebar: View {
                     .onTapGesture(count: 2) {
                         renameText = tag.name
                         renamingTagId = tag.id
+                        // Also select this collection so you're viewing it while renaming
+                        if selectedTagIds != [tag.id] {
+                            selectedTagIds = [tag.id]
+                            selectedFilter = .all
+                            selectedApp = nil
+                            showSettings = false
+                        }
                     }
             }
             Spacer(minLength: 0)
@@ -203,6 +210,7 @@ struct CaptureFilterSidebar: View {
 
     private func selectTag(_ tagId: String) {
         cancelRename()
+        NSApp.keyWindow?.makeFirstResponder(nil)
         if selectedTagIds == [tagId] { return }
         selectedTagIds = [tagId]
         selectedFilter = .all
@@ -264,6 +272,7 @@ struct CaptureFilterSidebar: View {
 
     private func selectType(_ filter: CaptureFilter) {
         cancelRename()
+        NSApp.keyWindow?.makeFirstResponder(nil)
         selectedFilter = filter
         selectedApp = nil
         selectedTagIds = []
@@ -306,6 +315,7 @@ struct CaptureFilterSidebar: View {
 
     private func selectApp(_ appName: String) {
         cancelRename()
+        NSApp.keyWindow?.makeFirstResponder(nil)
         if selectedApp == appName {
             selectedApp = nil
             selectedFilter = .all

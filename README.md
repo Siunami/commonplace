@@ -1,24 +1,26 @@
 # Commonplace
 
+![Commonplace](assets/Archive%20UI.png)
+
 A quiet macOS utility that captures what you see, copy, and save — screenshots, clipboard, downloads, notes — and keeps it browsable in one place.
 
 Runs in the menu bar, no dock icon. Requires macOS 15.6+.
 
 ## Install
 
-1. Download `Commonplace.dmg`
+1. Download [`Commonplace.dmg`](https://github.com/Siunami/commonplace/releases/latest/download/Commonplace.dmg) from the [latest release](https://github.com/Siunami/commonplace/releases/latest)
 2. Drag **Commonplace** to Applications
 3. Open it — grant Screen Recording and Accessibility when prompted
 
-A camera icon appears in your menu bar. Click it to browse.
+A camera icon appears in your menu bar. Click it to open the archive.
 
 ## Shortcuts
 
-| Shortcut       | What happens                   |
-| -------------- | ------------------------------ |
-| `Cmd+Shift+3`  | Screenshot the current screen  |
-| `Cmd+Shift+4`  | Screenshot a selected region   |
-| `Ctrl+Cmd+B`   | Open the Browse window         |
+| Shortcut      | What happens                  |
+| ------------- | ----------------------------- |
+| `Cmd+Shift+3` | Screenshot the current screen |
+| `Cmd+Shift+4` | Screenshot a selected region  |
+| `Ctrl+Cmd+B`  | Open the Browse window        |
 
 Clipboard copies and file downloads are captured automatically. Right-click selected text or images in any app → Services → **Clip to Capture**.
 

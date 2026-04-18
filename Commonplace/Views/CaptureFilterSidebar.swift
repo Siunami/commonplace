@@ -203,10 +203,7 @@ struct CaptureFilterSidebar: View {
 
     private func selectTag(_ tagId: String) {
         cancelRename()
-        if selectedTagIds == [tagId] {
-            selectedTagIds = []
-            return
-        }
+        if selectedTagIds == [tagId] { return }
         selectedTagIds = [tagId]
         selectedFilter = .all
         selectedApp = nil
@@ -339,6 +336,7 @@ enum CaptureFilter: String, CaseIterable {
     case all = "All"
     case annotated = "Annotated"
     case screenshots = "Screenshots"
+    case recordings = "Recordings"
     case links = "Links"
     case copies = "Copies"
     case files = "Files"
@@ -347,6 +345,7 @@ enum CaptureFilter: String, CaseIterable {
         switch self {
         case .all, .annotated, .links: return nil
         case .screenshots: return "screenshot"
+        case .recordings: return "recording"
         case .copies: return "copy"
         case .files: return "file"
         }
@@ -363,6 +362,7 @@ enum CaptureFilter: String, CaseIterable {
         case .all: return "square.grid.2x2"
         case .annotated: return "text.bubble"
         case .screenshots: return "camera.viewfinder"
+        case .recordings: return "video.fill"
         case .links: return "link"
         case .copies: return "doc.on.clipboard"
         case .files: return "doc.fill"
@@ -470,7 +470,7 @@ private struct InlineTagRenameField: View {
                 }
             }
             .onChange(of: isFocused) { _, focused in
-                if !focused { onCancel() }
+                if !focused { onCommit() }
             }
     }
 }

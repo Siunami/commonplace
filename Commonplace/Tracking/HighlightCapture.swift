@@ -18,6 +18,84 @@ final class HighlightCapture {
 
     private let db = DatabaseManager.shared
 
+    // MARK: - Recording Capture
+
+    func captureFromRecording(result: ScreenRecordingCapture.RecordingResult) {
+        let entryId = UUID().uuidString
+        let fileURL = URL(fileURLWithPath: result.filePath)
+        let filename = fileURL.lastPathComponent
+        let appName = result.context.sourceAppName ?? "Recording"
+
+        let highlight = Highlight(
+            id: entryId,
+            timestamp: Date().timeIntervalSince1970,
+            contentText: result.filePath,
+            sourceApp: appName,
+            sourceUrl: result.context.sourceUrl,
+            userNote: nil,
+            highlightType: "recording",
+            screenshotId: nil,
+            recordingId: result.recordingId,
+            fileId: nil,
+            windowTitle: result.context.windowTitle,
+            bundleId: result.context.bundleId,
+            contentHash: nil,
+            documentPath: result.filePath,
+            contentType: nil,
+            displayName: result.context.displayName,
+            displayResolution: result.context.displayResolution,
+            appearanceMode: result.context.appearanceMode,
+            wifiNetwork: result.context.wifiNetwork
+        )
+        db.insertHighlight(highlight)
+        NotificationCenter.default.post(name: .highlightDidSave, object: nil)
+
+        let entry = AnnotationEntry(
+            id: entryId,
+            content: result.filePath,
+            timestamp: Date().timeIntervalSince1970,
+            sourceApp: appName,
+            type: "recording",
+            annotation: nil
+        )
+        AnnotationStore.shared.save(entry)
+
+        let durationStr = String(format: "%.0fs", result.duration)
+        let sizeStr = RecordingRecord.formatFileSize(result.fileSize)
+        let toastContent = "\(filename) · \(durationStr) · \(sizeStr)"
+
+        if let thumbImage = NSImage(contentsOfFile: result.thumbnailPath) {
+            CopyToastController.shared.show(
+                image: thumbImage,
+                content: toastContent,
+                filePath: result.filePath,
+                badgeLabel: "Recording",
+                entryId: entryId,
+                sourceUrl: result.context.sourceUrl,
+                sourceApp: appName,
+                windowTitle: result.context.windowTitle
+            ) { [weak self] id, note in
+                AnnotationStore.shared.updateAnnotation(id: id, note: note)
+                self?.db.addNoteToHighlight(highlightId: entryId, body: note)
+            }
+        } else {
+            CopyToastController.shared.show(
+                content: toastContent,
+                entryId: entryId,
+                sourceUrl: result.context.sourceUrl,
+                sourceApp: appName,
+                windowTitle: result.context.windowTitle
+            ) { [weak self] id, note in
+                AnnotationStore.shared.updateAnnotation(id: id, note: note)
+                self?.db.addNoteToHighlight(highlightId: entryId, body: note)
+            }
+        }
+
+        CaptureLog.info("Saved recording: \(result.filePath), duration: \(String(format: "%.1f", result.duration))s")
+    }
+
+    // MARK: - Copy Capture
+
     func captureFromCopy(content: String, sourceApp: String?, entryId: String, context: CaptureContext) {
         captureAndShow(content: content, type: "copy", sourceApp: sourceApp, entryId: entryId, context: context)
     }

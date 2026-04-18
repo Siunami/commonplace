@@ -68,6 +68,23 @@ final class DatabaseManager {
     private static func openAndMigrate(path: String) -> DatabaseQueue? {
         do {
             let queue = try DatabaseQueue(path: path)
+
+            // Fix FK orphans before migrations run. The v13 dedup migration can
+            // leave behind highlight_note rows pointing at deleted highlights,
+            // which causes GRDB's FK integrity check to fail on later migrations.
+            try queue.write { db in
+                let tables = try String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type='table'")
+                if tables.contains("highlight_note") && tables.contains("highlight") {
+                    try db.execute(sql: "DELETE FROM highlight_note WHERE highlightId NOT IN (SELECT id FROM highlight)")
+                }
+                if tables.contains("highlight_tag") && tables.contains("highlight") {
+                    try db.execute(sql: "DELETE FROM highlight_tag WHERE highlightId NOT IN (SELECT id FROM highlight)")
+                }
+                if tables.contains("highlight_tag") && tables.contains("tag") {
+                    try db.execute(sql: "DELETE FROM highlight_tag WHERE tagId NOT IN (SELECT id FROM tag)")
+                }
+            }
+
             var migrator = DatabaseMigrator()
             AppMigrations.registerMigrations(&migrator)
             try migrator.migrate(queue)
@@ -806,7 +823,18 @@ final class DatabaseManager {
         return result
     }
 
-    // MARK: - Recordings (legacy viewing only — capture was removed)
+    // MARK: - Recordings
+
+    func insertRecording(_ record: inout RecordingRecord) {
+        guard let dbQueue else { return }
+        do {
+            try dbQueue.write { db in
+                try record.insert(db)
+            }
+        } catch {
+            CaptureLog.error("Failed to insert recording: \(error.localizedDescription)")
+        }
+    }
 
     func recording(byId id: Int64) -> RecordingRecord? {
         try? dbQueue?.read { db in
@@ -968,7 +996,7 @@ final class DatabaseManager {
                 SELECT t.* FROM tag t
                 LEFT JOIN highlight_tag ht ON ht.tagId = t.id
                 GROUP BY t.id
-                ORDER BY COUNT(ht.highlightId) DESC
+                ORDER BY MAX(ht.createdAt) DESC, t.updatedAt DESC
                 """)
         }) ?? []
     }

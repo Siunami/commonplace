@@ -643,6 +643,7 @@ struct BrowseView: View {
                             navigateToTag(from: origin, tag: tag)
                         }
                     )
+                        .id(highlight.id)
                         .frame(maxWidth: 700, maxHeight: .infinity)
                         .background(Color(.windowBackgroundColor))
                         .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -1027,9 +1028,22 @@ private struct ScreenshotCard: View {
         .task {
             if image == nil {
                 let path = highlight.contentText
+                // Try loading as image first (screenshots, PNGs)
                 image = await Task.detached {
                     NSImage(contentsOfFile: path)
                 }.value
+                // Fall back to video thumbnail extraction for recordings (.mov, .mp4)
+                if image == nil {
+                    image = await LiveThumbnail.generate(for: URL(fileURLWithPath: path))
+                }
+                // Fall back to FileRecord thumbnail if available
+                if image == nil, let fileId = highlight.fileId,
+                   let rec = DatabaseManager.shared.fileRecord(byId: fileId),
+                   let thumbPath = rec.thumbnailPath {
+                    image = await Task.detached {
+                        NSImage(contentsOfFile: thumbPath)
+                    }.value
+                }
             }
         }
     }

@@ -94,8 +94,7 @@ struct SettingsView: View {
 
                     shortcutRow("Full screen", "Cmd+Shift+3")
                     shortcutRow("Region", "Cmd+Shift+4")
-                    shortcutRow("Clipboard panel", "Ctrl+Cmd+V")
-                    shortcutRow("Browse history", "Ctrl+Cmd+B")
+                    shortcutRow("Archive", "Ctrl+Cmd+A")
                 }
             }
 

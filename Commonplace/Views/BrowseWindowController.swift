@@ -27,9 +27,9 @@ final class BrowseWindowController: NSObject, NSWindowDelegate, ManagedWindowCon
 
     @discardableResult
     private func handleKeyEvent(_ event: NSEvent) -> Bool {
-        // Ctrl+Cmd+B
+        // Ctrl+Cmd+A
         guard event.modifierFlags.contains([.command, .control]),
-              event.keyCode == 11 /* B */ else { return false }
+              event.keyCode == 0 /* A */ else { return false }
 
         DispatchQueue.main.async { self.toggle() }
         return true

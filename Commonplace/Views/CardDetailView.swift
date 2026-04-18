@@ -17,6 +17,7 @@ struct CardDetailView: View {
     @State private var showCollectionPicker = false
     @State private var collectionInput = ""
     @State private var allCollections: [Tag] = []
+    @State private var pickerSelection: Int = 0
 
     private var isScreenshot: Bool { highlight.highlightType == "screenshot" }
     private var isRecording: Bool { highlight.highlightType == "recording" }
@@ -231,6 +232,7 @@ struct CardDetailView: View {
                     if showCollectionPicker {
                         allCollections = DatabaseManager.shared.allTags()
                         collectionInput = ""
+                        pickerSelection = 0
                     }
                 }) {
                     Text(tags.isEmpty ? "+ add collection" : "+")
@@ -273,7 +275,15 @@ struct CardDetailView: View {
                 TextField("Search or create...", text: $collectionInput)
                     .textFieldStyle(.plain)
                     .font(.system(size: 13))
-                    .onSubmit { createOrApplyCollection() }
+                    .onSubmit { submitPickerSelection() }
+                    .onKeyPress(.downArrow) {
+                        pickerSelection = min(pickerSelection + 1, filteredCollections.count - 1)
+                        return .handled
+                    }
+                    .onKeyPress(.upArrow) {
+                        pickerSelection = max(pickerSelection - 1, 0)
+                        return .handled
+                    }
                 if !collectionInput.isEmpty {
                     Button(action: { collectionInput = "" }) {
                         Image(systemName: "xmark.circle.fill")
@@ -285,20 +295,29 @@ struct CardDetailView: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
+            .onChange(of: collectionInput) { _, _ in pickerSelection = 0 }
 
             Divider()
 
             // Existing collections list
             if !filteredCollections.isEmpty {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
-                        ForEach(filteredCollections) { tag in
-                            collectionRow(tag)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 0) {
+                            ForEach(Array(filteredCollections.enumerated()), id: \.element.id) { index, tag in
+                                collectionRow(tag, isHighlighted: index == pickerSelection)
+                                    .id(tag.id)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                    .frame(minHeight: 40, maxHeight: 200)
+                    .onChange(of: pickerSelection) { _, newValue in
+                        if newValue < filteredCollections.count {
+                            proxy.scrollTo(filteredCollections[newValue].id, anchor: .center)
                         }
                     }
-                    .padding(.vertical, 4)
                 }
-                .frame(minHeight: 40, maxHeight: 200)
             } else if collectionInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 Text("No collections yet")
                     .font(.system(size: 12))
@@ -340,7 +359,18 @@ struct CardDetailView: View {
         .frame(width: 240)
     }
 
-    private func collectionRow(_ tag: Tag) -> some View {
+    /// Enter applies the highlighted collection, or creates a new one if no match.
+    private func submitPickerSelection() {
+        if !filteredCollections.isEmpty && pickerSelection < filteredCollections.count {
+            let tag = filteredCollections[pickerSelection]
+            let isApplied = tags.contains { $0.id == tag.id }
+            if isApplied { removeCollection(tag) } else { applyCollection(tag) }
+        } else {
+            createOrApplyCollection()
+        }
+    }
+
+    private func collectionRow(_ tag: Tag, isHighlighted: Bool = false) -> some View {
         let isApplied = tags.contains { $0.id == tag.id }
         return Button(action: {
             if isApplied { removeCollection(tag) } else { applyCollection(tag) }
@@ -357,7 +387,10 @@ struct CardDetailView: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 7)
-            .background(isApplied ? Color.blue.opacity(0.06) : Color.clear)
+            .background(
+                isHighlighted ? Color.accentColor.opacity(0.12) :
+                isApplied ? Color.blue.opacity(0.06) : Color.clear
+            )
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

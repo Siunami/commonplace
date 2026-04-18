@@ -45,7 +45,10 @@ final class ScreenshotShortcutHandler {
             return nil // consume the event — blocks system screenshot
         case 21: // key code for '4' — Cmd+Shift+4
             DispatchQueue.main.async { handler.handleRegionCapture() }
-            return nil // consume the event — blocks system screenshot
+            return nil
+        case 23: // key code for '5' — Cmd+Shift+5
+            DispatchQueue.main.async { handler.handleToolbarToggle() }
+            return nil
         default:
             return Unmanaged.passRetained(event)
         }
@@ -150,6 +153,20 @@ final class ScreenshotShortcutHandler {
                     context: result.context
                 )
             }
+        }
+    }
+
+    private func handleToolbarToggle() {
+        if ScreenRecordingCapture.shared.state == .recording {
+            Task {
+                let result = await ScreenRecordingCapture.shared.stopRecording()
+                if let result {
+                    HighlightCapture.shared.captureFromRecording(result: result)
+                }
+                RecordingToolbarController.shared.dismiss()
+            }
+        } else {
+            RecordingToolbarController.shared.toggle()
         }
     }
 }

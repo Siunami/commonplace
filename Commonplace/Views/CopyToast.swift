@@ -160,6 +160,7 @@ final class CopyToastController: ManagedWindowController {
         p.hasShadow = true
         p.contentView = hv
         p.isOpaque = false
+        p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
 
         positionPanel(p, height: initialHeight)
 

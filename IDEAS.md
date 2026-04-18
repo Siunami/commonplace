@@ -2,6 +2,49 @@
 
 Sketched-out directions that aren't built (or were built, stripped out, and parked here for later). The goal of this file is to hold the *idea* so it isn't lost — not to commit to shipping it.
 
+---
+
+## Design principles
+
+Capture was never the hard part. **Retrieval is the most important part** — and specifically, how do you want to retrieve things?
+
+- **Organization is sacred.** Each person has different grooves in their head, different latticeworks and models of reality. If you create a space that doesn't map to how they think, it won't feel like theirs. The choice to put objects in relation to each other is a deeply personal task.
+- **Do as much as possible upfront** so the tool feels magical — but carefully. Too much and it feels like overstepping. Connections are fragile.
+- **AI-synthesized dailys don't resonate** because the user didn't choose the organization. They don't recognize their own thinking in it.
+- **Bootstrap off user actions.** Any action a user takes to organize things (moving into folders, tagging, grouping) reveals what they care about. Learn from that, don't impose.
+- **Metadata already creates categories** — smart folders are just surfacing what's already there.
+- **AI suggestion works for obvious categories** and semantic similarity (low-stakes taste questions). It feels noisy for subtle or personal organization.
+- **Build trust with any recommender.** Show what it will do AND what it won't do.
+- **Capture is easy. Retrieval is what's worth sharing.** Not everything is meant to be shared — only content in collections.
+
+---
+
+## Stacks
+
+Small groups of content woven together — not full categories, but clusters that *could* become a category. A way to loosely associate 2-5 captures that feel related without committing to a named collection.
+
+Use cases:
+- Quickly group a few screenshots from the same research thread
+- Bundle a link + a copy + a screenshot that all relate to the same idea
+- Lightweight precursor to a collection — "these go together but I don't know what to call it yet"
+
+Design questions:
+- How do you create a stack? Select multiple items and group?
+- Do stacks live in the sidebar or just as visual clusters in the grid?
+- Can a stack be promoted to a collection with one action?
+- Can AI suggest stacks based on temporal/semantic proximity?
+
+## Batch organization
+
+Fast ways to select many items and move them into a category. Label many things at once rather than one at a time. The current one-by-one tagging flow is too slow for large backlogs.
+
+Ideas:
+- Multi-select mode (shift-click, drag-select) → batch tag/move
+- "More like this" — select one item, surface similar ones, bulk-add to collection
+- Auto-suggest: when a user adds items to a collection, suggest other items that match the emerging pattern
+
+---
+
 ## Pattern engine
 
 Post-hoc analysis layered on the capture stream, surfaced as a separate view in Browse:
@@ -58,3 +101,32 @@ Day view currently leads with a flat grid. A sharper version: summarize today's 
 ## Signal-weighted ranking
 
 Re-access, dwell time, annotation, and tagging are strong "this mattered" signals. Use them to rank search results and fade unannotated noise. Combined with semantic search this starts to feel like actual memory retrieval instead of a reverse-chronological log.
+
+## Permissions onboarding with Permiso
+
+Reference: https://github.com/zats/permiso — a macOS library for accessibility permission dialogs (seen in Codex Computer Use). Could replace or improve the current `PermissionsSetupView` with a more polished, system-native permission request flow.
+
+**Current state:** We have a custom `PermissionsSetupView.swift` that shows permission cards with live polling. It works but is hand-rolled.
+
+**Implementation difficulty: Low.** Permiso is a small, focused library. Integration would mean:
+1. Add the SPM dependency
+2. Replace the manual `AXIsProcessTrusted()` polling + "Open Settings" button with Permiso's dialog
+3. Keep the Screen Recording permission handling as-is (Permiso focuses on Accessibility)
+4. ~1-2 hours of work, mostly UI replacement
+
+The bigger win might come if Permiso handles edge cases we don't (permission revocation detection, system settings deep-linking on newer macOS versions, etc.).
+
+## DMG distribution
+
+Packaging Commonplace as a `.dmg` for distribution outside the Mac App Store. Right now the app only runs from Xcode's build directory.
+
+**Implementation difficulty: Medium.** Steps:
+1. Set up code signing with a Developer ID certificate (not just the dev cert)
+2. Enable Hardened Runtime in build settings
+3. Notarize the app with `notarytool` (Apple requirement for non-App Store distribution)
+4. Create the DMG using `create-dmg` (CLI tool) or `hdiutil` with a background image and Applications symlink
+5. Add a CI/build script to automate: archive → sign → notarize → package DMG
+
+Tools: `create-dmg` (npm), `SwiftyDMG` (Swift), or raw `hdiutil` + `osascript`. The notarization step is the main friction — requires an Apple Developer account ($99/yr) and waiting for Apple's servers.
+
+Entitlements to audit: Screen Recording, Accessibility, and the CGEvent tap all need specific entitlements that work under Hardened Runtime. The current development build skips these checks.

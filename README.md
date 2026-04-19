@@ -10,7 +10,10 @@ Runs in the menu bar, no dock icon. Requires macOS 15.6+.
 
 1. Download [`Commonplace.dmg`](https://github.com/Siunami/commonplace/releases/latest/download/Commonplace.dmg) from the [latest release](https://github.com/Siunami/commonplace/releases/latest)
 2. Drag **Commonplace** to Applications
-3. Open it — grant Screen Recording and Accessibility when prompted
+3. The app isn't notarized yet, so macOS will block it. To open it:
+   - **Right-click** the app → **Open** → click **Open** in the dialog, or
+   - Run `xattr -cr /Applications/Commonplace.app` in Terminal
+4. Grant Screen Recording and Accessibility when prompted
 
 A camera icon appears in your menu bar. Click it to open the archive.
 

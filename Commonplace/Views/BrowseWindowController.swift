@@ -1,11 +1,12 @@
 import SwiftUI
 import AppKit
+import Carbon.HIToolbox
 
 final class BrowseWindowController: NSObject, NSWindowDelegate, ManagedWindowController {
     static let shared = BrowseWindowController()
 
     private var window: NSWindow?
-    private let hotkeys = HotkeyMonitorSet()
+    private var toggleHotKey: CarbonHotKey?
 
     /// Posted when the browse window becomes visible.
     static let windowDidShowNotification = Notification.Name("BrowseWindowDidShow")
@@ -20,19 +21,17 @@ final class BrowseWindowController: NSObject, NSWindowDelegate, ManagedWindowCon
     static let showTagFilterNotification = Notification.Name("BrowseWindowShowTagFilter")
 
     func registerHotkey() {
-        hotkeys.install { [weak self] event in
-            self?.handleKeyEvent(event) ?? false
+        // Carbon RegisterEventHotKey — fires system-wide without Accessibility
+        // permission, unlike NSEvent global monitors.
+        toggleHotKey = CarbonHotKey(
+            keyCode: UInt32(kVK_ANSI_A),
+            modifiers: UInt32(cmdKey | controlKey)
+        ) { [weak self] in
+            DispatchQueue.main.async { self?.toggle() }
         }
-    }
-
-    @discardableResult
-    private func handleKeyEvent(_ event: NSEvent) -> Bool {
-        // Ctrl+Cmd+A
-        guard event.modifierFlags.contains([.command, .control]),
-              event.keyCode == 0 /* A */ else { return false }
-
-        DispatchQueue.main.async { self.toggle() }
-        return true
+        if toggleHotKey == nil {
+            CaptureLog.warning("[BrowseWindowController] Failed to register Ctrl+Cmd+A — combo may be in use by another app")
+        }
     }
 
     func toggle() {
@@ -118,7 +117,8 @@ final class BrowseWindowController: NSObject, NSWindowDelegate, ManagedWindowCon
     }
 
     func teardown() {
-        hotkeys.remove()
+        toggleHotKey?.unregister()
+        toggleHotKey = nil
         // Only on app quit: actually close and release
         window?.delegate = nil
         window?.close()

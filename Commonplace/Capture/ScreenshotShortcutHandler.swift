@@ -1,4 +1,5 @@
 import Cocoa
+import ApplicationServices
 
 final class ScreenshotShortcutHandler {
     static let shared = ScreenshotShortcutHandler()
@@ -6,6 +7,7 @@ final class ScreenshotShortcutHandler {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var isCapturing = false
+    private var retryTimer: Timer?
 
     // MARK: - CGEvent Tap Callback
 
@@ -58,6 +60,15 @@ final class ScreenshotShortcutHandler {
 
     func start() {
         guard eventTap == nil else { return }
+
+        // CGEvent.tapCreate requires Accessibility; check first so we can
+        // schedule a retry instead of giving up silently on first launch.
+        guard AXIsProcessTrusted() else {
+            CaptureLog.warning("[ScreenshotShortcutHandler] Accessibility not granted — will retry when it is")
+            scheduleRetry()
+            return
+        }
+
         CaptureLog.info("[ScreenshotShortcutHandler] start()")
 
         let eventMask: CGEventMask = (1 << CGEventType.keyDown.rawValue)
@@ -70,7 +81,8 @@ final class ScreenshotShortcutHandler {
             callback: eventTapCallback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
-            CaptureLog.warning("[ScreenshotShortcutHandler] Failed to create event tap — Accessibility permission required")
+            CaptureLog.warning("[ScreenshotShortcutHandler] Failed to create event tap — retrying")
+            scheduleRetry()
             return
         }
 
@@ -81,10 +93,16 @@ final class ScreenshotShortcutHandler {
         self.eventTap = tap
         self.runLoopSource = source
 
+        retryTimer?.invalidate()
+        retryTimer = nil
+
         CaptureLog.info("[ScreenshotShortcutHandler] Event tap installed — screenshot hotkeys intercepted")
     }
 
     func stop() {
+        retryTimer?.invalidate()
+        retryTimer = nil
+
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
             eventTap = nil
@@ -95,6 +113,13 @@ final class ScreenshotShortcutHandler {
         }
 
         CaptureLog.info("[ScreenshotShortcutHandler] Event tap removed — screenshot hotkeys restored")
+    }
+
+    private func scheduleRetry() {
+        guard retryTimer == nil else { return }
+        retryTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.start()
+        }
     }
 
     // MARK: - Capture Handlers

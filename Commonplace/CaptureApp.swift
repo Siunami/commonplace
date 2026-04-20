@@ -14,6 +14,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Prime accessory activation policy explicitly. LSUIElement=YES sets
+        // this at Info.plist level, but SwiftUI's @main lifecycle can leave
+        // the Carbon event target un-primed until setActivationPolicy is
+        // called from code — without this, RegisterEventHotKey-based hotkeys
+        // (ctrl+cmd+a) silently don't fire until the app is activated once.
+        NSApp.setActivationPolicy(.accessory)
+
         // Initialize logger first
         _ = CaptureLog.shared
         CaptureLog.info("Commonplace app launching")

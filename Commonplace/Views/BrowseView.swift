@@ -683,7 +683,14 @@ struct BrowseView: View {
                 shouldRefreshFacets ? db.appFacets() : nil
 
             await MainActor.run {
-                highlights.append(contentsOf: batch)
+                // Dedupe by id: an in-flight paginated load can race with a
+                // reset triggered by .highlightDidSave / .highlightDataDidChange,
+                // and real-time inserts can shift rows so the same id appears
+                // on consecutive OFFSET pages. Either way, duplicate ids in
+                // ForEach give undefined layout (overlapping masonry cards).
+                let existingIds = Set(highlights.map(\.id))
+                let newRows = batch.filter { !existingIds.contains($0.id) }
+                highlights.append(contentsOf: newRows)
                 highlightsOffset += batch.count
                 hasMore = batch.count == limit
                 noteCounts.merge(newCounts) { _, new in new }

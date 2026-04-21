@@ -2,6 +2,8 @@
 
 Sketched-out directions that aren't built (or were built, stripped out, and parked here for later). The goal of this file is to hold the *idea* so it isn't lost — not to commit to shipping it.
 
+Longer specs live under `ideas/` as their own files; this file stays the human-readable index with a short summary per entry. Inline ideas below are fine as-is until they grow enough to warrant a dedicated file.
+
 ---
 
 ## Design principles
@@ -130,3 +132,9 @@ Packaging Commonplace as a `.dmg` for distribution outside the Mac App Store. Ri
 Tools: `create-dmg` (npm), `SwiftyDMG` (Swift), or raw `hdiutil` + `osascript`. The notarization step is the main friction — requires an Apple Developer account ($99/yr) and waiting for Apple's servers.
 
 Entitlements to audit: Screen Recording, Accessibility, and the CGEvent tap all need specific entitlements that work under Hardened Runtime. The current development build skips these checks.
+
+## Claude ↔ archive bridge
+
+A CLI (`cp-ai`) that gives Claude Code full *read* access to the Commonplace archive and a structured way to propose organization — tags, collections, links, notes — without ever mutating the curated data. Two-DB split: main is opened read-only at the SQLite URI level (`?mode=ro`, a physical guarantee), while Claude writes into a separate `claude-suggestions.sqlite`. The only command that touches main is a user-invoked `accept`, so the user stays the sole writer into their own archive.
+
+Full spec: [ideas/claude-archive-cli.md](ideas/claude-archive-cli.md).

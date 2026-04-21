@@ -18,20 +18,6 @@ class ToastStateHolder: ObservableObject {
     @Published var timerProgress: CGFloat = 1.0
 }
 
-// MARK: - Menu Action Target (lightweight NSObject for @objc selectors)
-
-private class MenuActionTarget: NSObject {
-    var onCopyImage: (() -> Void)?
-    var onCopyText: (() -> Void)?
-    var onShowInFinder: (() -> Void)?
-    var onDismiss: (() -> Void)?
-
-    @objc func copyImage() { onCopyImage?() }
-    @objc func copyText() { onCopyText?() }
-    @objc func showInFinder() { onShowInFinder?() }
-    @objc func dismiss() { onDismiss?() }
-}
-
 // MARK: - CopyToastController
 
 final class CopyToastController: ManagedWindowController {
@@ -56,7 +42,7 @@ final class CopyToastController: ManagedWindowController {
     private var currentImage: NSImage?
     private var currentContent: String?
     private var currentFilePath: String?
-    private var menuTarget: MenuActionTarget?
+    private var menuTarget: MaterialMenuTarget?
     private var annotationWindow: NSWindow?
     private var annotationDelegate: PanelWindowDelegate?
 
@@ -174,36 +160,46 @@ final class CopyToastController: ManagedWindowController {
 
         self.panel = p
 
-        // Right-click context menu via MenuActionTarget (avoids NSObject on controller)
-        let target = MenuActionTarget()
-        target.onCopyImage = { [weak self] in self?.performCopyImage() }
-        target.onCopyText = { [weak self] in self?.performCopyText() }
-        target.onShowInFinder = { [weak self] in self?.performShowInFinder() }
+        // Right-click context menu — unified with the Browse card menu.
+        let target = MaterialMenuTarget()
+        target.onCopy = { [weak self] in
+            guard let self else { return }
+            if self.currentImage != nil {
+                self.performCopyImage()
+            } else {
+                self.performCopyText()
+            }
+        }
+        target.onOpen = { [weak self] in
+            guard let self, let entryId = self.currentEntryId,
+                  let highlight = DatabaseManager.shared.highlight(byId: entryId) else { return }
+            MaterialAction.open(highlight)
+        }
+        target.onRevealInFinder = { [weak self] in self?.performShowInFinder() }
+        target.onShare = { [weak self] anchor in
+            guard let self, let entryId = self.currentEntryId,
+                  let highlight = DatabaseManager.shared.highlight(byId: entryId) else { return }
+            presentShareMenu(for: highlight, relativeTo: anchor)
+        }
+        target.onToggleTag = { [weak self] tagId in
+            guard let self, let entryId = self.currentEntryId else { return }
+            let applied = Set(DatabaseManager.shared.tagsForHighlight(id: entryId).map { $0.id })
+            if applied.contains(tagId) {
+                DatabaseManager.shared.removeTag(tagId, fromHighlight: entryId)
+            } else {
+                DatabaseManager.shared.addTag(tagId, toHighlight: entryId)
+            }
+        }
         target.onDismiss = { [weak self] in self?.dismiss(animated: true) }
         self.menuTarget = target
 
-        p.contextMenuProvider = { [weak self, weak target] in
-            guard let self, let target, self.generation == showGeneration else { return nil }
-            let menu = NSMenu()
-            if hasImage {
-                let copyItem = NSMenuItem(title: "Copy Image", action: #selector(MenuActionTarget.copyImage), keyEquivalent: "")
-                copyItem.target = target
-                menu.addItem(copyItem)
-                if filePath != nil {
-                    let finderItem = NSMenuItem(title: "Show in Finder", action: #selector(MenuActionTarget.showInFinder), keyEquivalent: "")
-                    finderItem.target = target
-                    menu.addItem(finderItem)
-                }
-            } else {
-                let copyItem = NSMenuItem(title: "Copy Text", action: #selector(MenuActionTarget.copyText), keyEquivalent: "")
-                copyItem.target = target
-                menu.addItem(copyItem)
+        p.contextMenuProvider = { [weak self, weak target, weak hv] in
+            guard let self, let target, let hv, self.generation == showGeneration else { return nil }
+            guard let entryId = self.currentEntryId,
+                  let highlight = DatabaseManager.shared.highlight(byId: entryId) else {
+                return nil
             }
-            menu.addItem(.separator())
-            let dismissItem = NSMenuItem(title: "Dismiss", action: #selector(MenuActionTarget.dismiss), keyEquivalent: "")
-            dismissItem.target = target
-            menu.addItem(dismissItem)
-            return menu
+            return buildMaterialNSMenu(for: highlight, target: target, anchorView: hv, includeDismiss: true)
         }
 
         // Observe state changes for resize + activation

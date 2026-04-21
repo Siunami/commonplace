@@ -2,6 +2,7 @@ import SwiftUI
 import ServiceManagement
 
 struct SettingsView: View {
+    @ObservedObject private var perms = PermissionsMonitor.shared
     @State private var launchAtLogin = false
     @State private var watchedFolders: [String] = []
     @State private var r2Endpoint = CollectionPublisher.shared.endpoint
@@ -146,14 +147,15 @@ struct SettingsView: View {
 
             // Permissions
             settingsSection {
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 10) {
                     Text("Permissions")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
                     permissionRow(
                         "Screen Recording",
-                        granted: CGPreflightScreenCaptureAccess(),
+                        description: "Capture screenshots and recordings",
+                        granted: perms.screenRecordingGranted,
                         action: {
                             if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
                                 NSWorkspace.shared.open(url)
@@ -162,7 +164,8 @@ struct SettingsView: View {
                     )
                     permissionRow(
                         "Accessibility",
-                        granted: AXIsProcessTrusted(),
+                        description: "Intercept ⌘⇧3 / ⌘⇧4 shortcuts",
+                        granted: perms.accessibilityGranted,
                         action: {
                             if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
                                 NSWorkspace.shared.open(url)
@@ -252,31 +255,35 @@ struct SettingsView: View {
         }
     }
 
-    private func permissionRow(_ label: String, granted: Bool, isOptional: Bool = false, action: @escaping () -> Void) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: granted ? "checkmark.circle.fill" : "circle")
-                .font(.caption)
-                .foregroundStyle(granted ? Color.green : Color.gray)
+    private func permissionRow(_ label: String, description: String, granted: Bool, action: @escaping () -> Void) -> some View {
+        HStack(spacing: 10) {
+            ZStack {
+                Circle()
+                    .fill(granted ? Color.green.opacity(0.2) : Color.orange.opacity(0.15))
+                    .frame(width: 22, height: 22)
+                Image(systemName: granted ? "checkmark" : "exclamationmark")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(granted ? Color.green : Color.orange)
+            }
 
-            Text(label)
-                .font(.caption)
-
-            if isOptional {
-                Text("optional")
-                    .font(.system(size: 9))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label)
+                    .font(.system(size: 12, weight: .medium))
+                Text(description)
+                    .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
             }
 
             Spacer()
 
             Button(action: action) {
-                HStack(spacing: 3) {
-                    Text(granted ? "Manage" : "Grant")
-                        .font(.caption2)
-                    Image(systemName: "arrow.up.forward")
-                        .font(.system(size: 8))
-                }
-                .foregroundStyle(Color.accentColor)
+                Text(granted ? "Manage" : "Grant")
+                    .font(.system(size: 11, weight: .medium))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(granted ? Color.primary.opacity(0.08) : Color.accentColor)
+                    .foregroundStyle(granted ? Color.primary : Color.white)
+                    .clipShape(Capsule())
             }
             .buttonStyle(.plain)
         }

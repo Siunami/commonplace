@@ -48,9 +48,11 @@ final class ScreenshotShortcutHandler {
         case 21: // key code for '4' — Cmd+Shift+4
             DispatchQueue.main.async { handler.handleRegionCapture() }
             return nil
-        case 23: // key code for '5' — Cmd+Shift+5
-            DispatchQueue.main.async { handler.handleToolbarToggle() }
-            return nil
+        // Cmd+Shift+5 (keyCode 23) deliberately falls through to the default
+        // branch so macOS's built-in Screenshot utility handles it. The
+        // recording code (handleToolbarToggle, ScreenRecordingCapture,
+        // RecordingToolbarWindow) is intentionally left in the project and
+        // can be re-enabled by restoring this case.
         default:
             return Unmanaged.passRetained(event)
         }

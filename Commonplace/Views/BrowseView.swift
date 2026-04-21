@@ -859,11 +859,14 @@ struct BrowseView: View {
                 shouldRefreshFacets ? db.appFacets() : nil
 
             await MainActor.run {
-                // Guard against parallel in-flight loads each appending
-                // the same page — otherwise ForEach sees duplicate IDs.
+                // Dedupe by id: an in-flight paginated load can race with a
+                // reset triggered by .highlightDidSave / .highlightDataDidChange,
+                // and real-time inserts can shift rows so the same id appears
+                // on consecutive OFFSET pages. Either way, duplicate ids in
+                // ForEach give undefined layout (overlapping masonry cards).
                 let existingIds = Set(highlights.map(\.id))
-                let newItems = batch.filter { !existingIds.contains($0.id) }
-                highlights.append(contentsOf: newItems)
+                let newRows = batch.filter { !existingIds.contains($0.id) }
+                highlights.append(contentsOf: newRows)
                 highlightsOffset += batch.count
                 hasMore = batch.count == limit
                 noteCounts.merge(newCounts) { _, new in new }
@@ -968,18 +971,48 @@ private struct MasonryLayout: Layout {
     }
 
     struct CacheData {
+        var measuredWidth: CGFloat = 0
+        var columns: Int = 0
+        var columnWidth: CGFloat = 0
         var heights: [CGFloat] = []
-        var cachedColumns: Int = 0
+        var assignments: [(col: Int, y: CGFloat)] = []
+        var contentHeight: CGFloat = 0
     }
 
     func makeCache(subviews: Subviews) -> CacheData { CacheData() }
 
-    private func ensureCache(subviews: Subviews, columns: Int, colWidth: CGFloat, cache: inout CacheData) {
-        guard cache.cachedColumns != columns || cache.heights.count != subviews.count else { return }
-        cache.heights = subviews.map {
-            $0.sizeThatFits(.init(width: colWidth, height: nil)).height
+    private func measureHeights(subviews: Subviews, colWidth: CGFloat) -> [CGFloat] {
+        subviews.map {
+            let measured = $0.sizeThatFits(.init(width: colWidth, height: nil)).height
+            return measured.isFinite ? measured : 0
         }
-        cache.cachedColumns = columns
+    }
+
+    private func refreshCache(
+        for totalWidth: CGFloat,
+        subviews: Subviews,
+        cache: inout CacheData
+    ) {
+        let columns = columnCount(for: totalWidth)
+        let colWidth = columnWidth(for: totalWidth, columns: columns)
+        let heights = measureHeights(subviews: subviews, colWidth: colWidth)
+
+        let widthChanged = abs(cache.measuredWidth - totalWidth) > 0.5
+        let structureChanged =
+            widthChanged ||
+            cache.columns != columns ||
+            cache.heights != heights ||
+            cache.assignments.count != subviews.count
+
+        guard structureChanged else { return }
+
+        let (colHeights, assignments) = layout(columns: columns, colWidth: colWidth, heights: heights)
+        cache.measuredWidth = totalWidth
+        cache.columns = columns
+        cache.columnWidth = colWidth
+        cache.heights = heights
+        cache.assignments = assignments
+        cache.contentHeight = colHeights.max() ?? 0
     }
 
     /// Shortest-column-first with deterministic tie-breaking (leftmost column wins).
@@ -1019,25 +1052,20 @@ private struct MasonryLayout: Layout {
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout CacheData) -> CGSize {
         let width = proposal.width ?? 300
-        let columns = columnCount(for: width)
-        let colWidth = columnWidth(for: width, columns: columns)
-        ensureCache(subviews: subviews, columns: columns, colWidth: colWidth, cache: &cache)
-
-        let (colHeights, _) = layout(columns: columns, colWidth: colWidth, heights: cache.heights)
-        return CGSize(width: width, height: colHeights.max() ?? 0)
+        refreshCache(for: width, subviews: subviews, cache: &cache)
+        return CGSize(width: width, height: cache.contentHeight)
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout CacheData) {
-        let columns = columnCount(for: bounds.width)
-        let colWidth = columnWidth(for: bounds.width, columns: columns)
-        ensureCache(subviews: subviews, columns: columns, colWidth: colWidth, cache: &cache)
-
-        let (_, assignments) = layout(columns: columns, colWidth: colWidth, heights: cache.heights)
+        refreshCache(for: bounds.width, subviews: subviews, cache: &cache)
         for (i, subview) in subviews.enumerated() {
-            let a = assignments[i]
-            let x = bounds.minX + CGFloat(a.col) * (colWidth + spacing)
+            let a = cache.assignments[i]
+            let x = bounds.minX + CGFloat(a.col) * (cache.columnWidth + spacing)
             let y = bounds.minY + a.y
-            subview.place(at: CGPoint(x: x, y: y), proposal: .init(width: colWidth, height: cache.heights[i]))
+            subview.place(
+                at: CGPoint(x: x, y: y),
+                proposal: .init(width: cache.columnWidth, height: cache.heights[i])
+            )
         }
     }
 }
@@ -1152,35 +1180,7 @@ private struct MasonryCard: View {
                 isHovered = hovering
             }
         }
-        .contextMenu {
-            Menu("Collection") {
-                ForEach(DatabaseManager.shared.allTags()) { tag in
-                    let isApplied = cardTags.contains(where: { $0.id == tag.id })
-                    Button(action: {
-                        if isApplied {
-                            DatabaseManager.shared.removeTag(tag.id, fromHighlight: highlight.id)
-                        } else {
-                            DatabaseManager.shared.addTag(tag.id, toHighlight: highlight.id)
-                        }
-                        // DatabaseManager posts .highlightDataDidChange — no local refresh needed.
-                    }) {
-                        HStack {
-                            Text(tag.name)
-                            if isApplied {
-                                Image(systemName: "checkmark")
-                            }
-                        }
-                    }
-                }
-                if !false {
-                    Divider()
-                }
-                Button("New Tag...") {
-                    // Opens detail view where user can add tags
-                }
-            }
-        }
-        // Tags loaded lazily on first context menu open, not per-card onAppear
+        .materialContextMenu(for: highlight, cardTags: cardTags)
     }
 
     @ViewBuilder
@@ -1217,6 +1217,86 @@ private struct MasonryCard: View {
 
 // MARK: - Screenshot Card
 
+private struct CardCoverPreview<Placeholder: View, Overlay: View>: View {
+    let image: NSImage?
+    let fallbackAspectRatio: CGFloat
+    let preferredAspectRatio: CGFloat?
+    let aspectRatioBuckets: [CGFloat]
+    let placeholder: Placeholder
+    let overlay: Overlay
+
+    init(
+        image: NSImage?,
+        fallbackAspectRatio: CGFloat = 1.3,
+        preferredAspectRatio: CGFloat? = nil,
+        aspectRatioBuckets: [CGFloat] = [0.82, 1.18, 1.62],
+        @ViewBuilder placeholder: () -> Placeholder,
+        @ViewBuilder overlay: () -> Overlay
+    ) {
+        self.image = image
+        self.fallbackAspectRatio = fallbackAspectRatio
+        self.preferredAspectRatio = preferredAspectRatio
+        self.aspectRatioBuckets = aspectRatioBuckets
+        self.placeholder = placeholder()
+        self.overlay = overlay()
+    }
+
+    private var targetAspectRatio: CGFloat {
+        let buckets = aspectRatioBuckets.isEmpty ? [fallbackAspectRatio] : aspectRatioBuckets.sorted()
+        let seededRatio = preferredAspectRatio ?? fallbackAspectRatio
+        guard let image else { return nearestAspectRatio(to: seededRatio, buckets: buckets) }
+        let size = image.size
+        guard size.width > 0, size.height > 0 else {
+            return nearestAspectRatio(to: seededRatio, buckets: buckets)
+        }
+        let rawAspectRatio = size.width / size.height
+        return nearestAspectRatio(to: rawAspectRatio, buckets: buckets)
+    }
+
+    private func nearestAspectRatio(to rawValue: CGFloat, buckets: [CGFloat]) -> CGFloat {
+        buckets.min(by: { abs($0 - rawValue) < abs($1 - rawValue) }) ?? fallbackAspectRatio
+    }
+
+    var body: some View {
+        ZStack(alignment: .bottomTrailing) {
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                placeholder
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+
+            overlay
+        }
+        .aspectRatio(targetAspectRatio, contentMode: .fit)
+        .frame(maxWidth: .infinity)
+        .background(.quaternary.opacity(0.12))
+        .clipped()
+    }
+}
+
+private extension CardCoverPreview where Overlay == EmptyView {
+    init(
+        image: NSImage?,
+        fallbackAspectRatio: CGFloat = 1.3,
+        preferredAspectRatio: CGFloat? = nil,
+        aspectRatioBuckets: [CGFloat] = [0.82, 1.18, 1.62],
+        @ViewBuilder placeholder: () -> Placeholder
+    ) {
+        self.init(
+            image: image,
+            fallbackAspectRatio: fallbackAspectRatio,
+            preferredAspectRatio: preferredAspectRatio,
+            aspectRatioBuckets: aspectRatioBuckets,
+            placeholder: placeholder,
+            overlay: { EmptyView() }
+        )
+    }
+}
+
 private struct ScreenshotCard: View {
     let highlight: Highlight
     var cardTags: [Tag] = []
@@ -1225,29 +1305,39 @@ private struct ScreenshotCard: View {
     @State private var image: NSImage?
     @State private var imageHovered = false
 
+    private var preferredAspectRatio: CGFloat? {
+        guard let screenshotId = highlight.screenshotId,
+              let record = DatabaseManager.shared.screenshot(byId: screenshotId),
+              let width = record.imageWidth,
+              let height = record.imageHeight,
+              width > 0,
+              height > 0 else { return nil }
+        return CGFloat(width) / CGFloat(height)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if let image {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .overlay(alignment: .topTrailing) {
-                        if let onImageFullscreen {
-                            ExpandImageButton(isHovered: imageHovered) {
-                                onImageFullscreen(image)
-                            }
-                        }
-                    }
-                    .onHover { imageHovered = $0 }
-            } else {
+            CardCoverPreview(
+                image: image,
+                fallbackAspectRatio: 1.42,
+                preferredAspectRatio: preferredAspectRatio,
+                aspectRatioBuckets: [0.82, 1.25, 1.78]
+            ) {
                 Rectangle()
                     .fill(.quaternary.opacity(0.3))
-                    .frame(height: 120)
                     .overlay {
                         Image(systemName: "photo")
                             .foregroundStyle(.tertiary)
                     }
             }
+            .overlay(alignment: .topTrailing) {
+                if let image, let onImageFullscreen {
+                    ExpandImageButton(isHovered: imageHovered) {
+                        onImageFullscreen(image)
+                    }
+                }
+            }
+            .onHover { imageHovered = $0 }
 
             CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
         }
@@ -1285,6 +1375,16 @@ private enum LiveThumbnail {
     static func generate(for fileURL: URL) async -> NSImage? {
         let ext = fileURL.pathExtension.lowercased()
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+
+        // Image files: load directly. QuickLook sometimes returns nil for PNGs
+        // and other common image types, which causes the masonry to render a
+        // file-icon placeholder instead of the actual image.
+        let imageExts: Set<String> = ["png", "jpg", "jpeg", "heic", "heif", "gif", "bmp", "tiff", "tif", "webp"]
+        if imageExts.contains(ext) {
+            return await Task.detached(priority: .utility) {
+                NSImage(contentsOf: fileURL)
+            }.value
+        }
 
         if ext == "pdf" {
             return await Task.detached(priority: .utility) {
@@ -1387,22 +1487,26 @@ private struct TextCard: View {
     var onTagTap: ((Tag) -> Void)? = nil
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .top, spacing: 0) {
-                RoundedRectangle(cornerRadius: 0.5)
-                    .fill(Color.primary.opacity(0.12))
-                    .frame(width: 2)
+        if TextHighlightRouter.isImageFilePath(highlight.contentText) {
+            ScreenshotCard(highlight: highlight)
+        } else {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(alignment: .top, spacing: 0) {
+                    RoundedRectangle(cornerRadius: 0.5)
+                        .fill(Color.primary.opacity(0.12))
+                        .frame(width: 2)
 
-                Text(highlight.contentText)
-                    .font(.system(.callout, design: .serif))
-                    .foregroundStyle(.primary.opacity(0.85))
-                    .lineLimit(12)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 12)
+                    Text(highlight.contentText)
+                        .font(.system(.callout, design: .serif))
+                        .foregroundStyle(.primary.opacity(0.85))
+                        .lineLimit(12)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 12)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
         }
     }
 }
@@ -1415,23 +1519,45 @@ private struct HighlightCard: View {
     var onTagTap: ((Tag) -> Void)? = nil
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .top, spacing: 0) {
-                RoundedRectangle(cornerRadius: 0.5)
-                    .fill(Color.orange.opacity(0.8))
-                    .frame(width: 2)
+        if TextHighlightRouter.isImageFilePath(highlight.contentText) {
+            ScreenshotCard(highlight: highlight)
+        } else {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(alignment: .top, spacing: 0) {
+                    RoundedRectangle(cornerRadius: 0.5)
+                        .fill(Color.orange.opacity(0.8))
+                        .frame(width: 2)
 
-                Text(highlight.contentText)
-                    .font(.system(.callout, design: .serif))
-                    .foregroundStyle(.primary.opacity(0.85))
-                    .lineLimit(12)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 12)
+                    Text(highlight.contentText)
+                        .font(.system(.callout, design: .serif))
+                        .foregroundStyle(.primary.opacity(0.85))
+                        .lineLimit(12)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 12)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
         }
+    }
+}
+
+// Shared detection — some highlights have a raw image file path as their
+// contentText due to legacy capture paths. Render those as images instead of
+// spewing the internal path across the masonry.
+private enum TextHighlightRouter {
+    private static let imageExts: Set<String> = [
+        "png", "jpg", "jpeg", "heic", "heif", "gif", "bmp", "tiff", "tif", "webp"
+    ]
+
+    static func isImageFilePath(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/") else { return false }
+        guard !trimmed.contains("\n") else { return false }
+        let ext = (trimmed as NSString).pathExtension.lowercased()
+        guard imageExts.contains(ext) else { return false }
+        return FileManager.default.fileExists(atPath: trimmed)
     }
 }
 
@@ -1475,44 +1601,13 @@ private struct FileCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if let thumbnail {
-                ZStack(alignment: .bottomTrailing) {
-                    Image(nsImage: thumbnail)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(maxWidth: .infinity, minHeight: 120, maxHeight: 220)
-                        .clipped()
-                        .overlay(alignment: .topTrailing) {
-                            if isImageFile, let onImageFullscreen {
-                                ExpandImageButton(isHovered: imageHovered) {
-                                    // Prefer the original image over the thumbnail.
-                                    if let rec = fileRecord,
-                                       let full = NSImage(contentsOfFile: rec.filePath) {
-                                        onImageFullscreen(full)
-                                    } else {
-                                        onImageFullscreen(thumbnail)
-                                    }
-                                }
-                            }
-                        }
-                        .onHover { imageHovered = $0 }
-
-                    if let pages = fileRecord?.pageCount, pages > 0 {
-                        Text("\(pages) pg")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 2)
-                            .background(.black.opacity(0.6))
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
-                            .padding(6)
-                    }
-                }
-            } else {
-                // Finder-style file icon from the system
+            CardCoverPreview(
+                image: thumbnail,
+                fallbackAspectRatio: 1.28,
+                aspectRatioBuckets: [1.0, 1.28, 1.58]
+            ) {
                 Rectangle()
                     .fill(.quaternary.opacity(0.15))
-                    .frame(height: 100)
                     .overlay {
                         VStack(spacing: 6) {
                             Image(nsImage: systemFileIcon)
@@ -1526,7 +1621,32 @@ private struct FileCard: View {
                             }
                         }
                     }
+            } overlay: {
+                if let pages = fileRecord?.pageCount, pages > 0 {
+                    Text("\(pages) pg")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(.black.opacity(0.6))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                        .padding(6)
+                }
             }
+            .overlay(alignment: .topTrailing) {
+                if isImageFile, let thumbnail, let onImageFullscreen {
+                    ExpandImageButton(isHovered: imageHovered) {
+                        // Prefer the original image over the thumbnail.
+                        if let rec = fileRecord,
+                           let full = NSImage(contentsOfFile: rec.filePath) {
+                            onImageFullscreen(full)
+                        } else {
+                            onImageFullscreen(thumbnail)
+                        }
+                    }
+                }
+            }
+            .onHover { imageHovered = $0 }
 
             Text(fileRecord?.fileName ?? URL(fileURLWithPath: highlight.contentText).lastPathComponent)
                 .font(.caption)
@@ -1538,14 +1658,6 @@ private struct FileCard: View {
                 .padding(.bottom, 2)
 
             CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
-        }
-        .contextMenu {
-            Button("Open") {
-                openFile(highlight.contentText)
-            }
-            Button("Reveal in Finder") {
-                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: highlight.contentText)])
-            }
         }
         .task {
             // Resolve the FileRecord: prefer foreign key, but fall back to
@@ -1623,20 +1735,25 @@ private struct LinkCard: View {
         VStack(alignment: .leading, spacing: 0) {
             Button(action: openURL) {
                 VStack(alignment: .leading, spacing: 0) {
-                    if let heroImage {
-                        Image(nsImage: heroImage)
-                            .resizable()
-                            .aspectRatio(contentMode: .fill)
-                            .frame(maxWidth: .infinity, minHeight: 120, maxHeight: 180)
-                            .clipped()
-                    } else if !didLoad {
-                        Rectangle()
-                            .fill(.quaternary.opacity(0.15))
-                            .frame(height: 100)
-                            .overlay {
-                                ProgressView()
-                                    .controlSize(.small)
-                            }
+                    if heroImage != nil || !didLoad {
+                        CardCoverPreview(
+                            image: heroImage,
+                            fallbackAspectRatio: 1.45,
+                            aspectRatioBuckets: [1.33, 1.58, 1.82]
+                        ) {
+                            Rectangle()
+                                .fill(.quaternary.opacity(0.15))
+                                .overlay {
+                                    if !didLoad {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                    } else {
+                                        Image(systemName: "link")
+                                            .font(.system(size: 20, weight: .medium))
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                }
+                        }
                     }
 
                     VStack(alignment: .leading, spacing: 6) {
@@ -1685,14 +1802,6 @@ private struct LinkCard: View {
             .buttonStyle(.plain)
 
             CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
-        }
-        .contextMenu {
-            Button("Open in Browser", action: openURL)
-            Button("Copy URL") {
-                let pb = NSPasteboard.general
-                pb.clearContents()
-                pb.setString(urlString, forType: .string)
-            }
         }
         .task {
             let fetched = await LinkPreviewStore.shared.preview(for: urlString)

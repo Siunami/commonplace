@@ -53,6 +53,7 @@ struct CardDetailView: View {
                             Image(nsImage: image)
                                 .resizable()
                                 .aspectRatio(contentMode: .fit)
+                                .frame(maxWidth: .infinity)
                                 .clipShape(RoundedRectangle(cornerRadius: 8))
                                 .overlay(alignment: .topTrailing) {
                                     if let onImageFullscreen {
@@ -130,7 +131,7 @@ struct CardDetailView: View {
 
             noteInput
         }
-        .frame(minWidth: 520, idealWidth: 740, minHeight: 420, idealHeight: 720)
+        .frame(minWidth: 520, idealWidth: 740, maxWidth: .infinity, minHeight: 420, idealHeight: 720, maxHeight: .infinity)
         .task {
             if isScreenshot && image == nil {
                 let path = highlight.contentText

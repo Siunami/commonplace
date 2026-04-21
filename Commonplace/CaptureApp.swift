@@ -14,6 +14,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Prime accessory activation policy explicitly. LSUIElement=YES sets
+        // this at Info.plist level, but SwiftUI's @main lifecycle can leave
+        // the Carbon event target un-primed until setActivationPolicy is
+        // called from code — without this, RegisterEventHotKey-based hotkeys
+        // (ctrl+cmd+a) silently don't fire until the app is activated once.
+        NSApp.setActivationPolicy(.accessory)
+
         // Initialize logger first
         _ = CaptureLog.shared
         CaptureLog.info("Commonplace app launching")
@@ -54,13 +61,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             CaptureLog.warning("Screenshot storage exceeds 2 GB (\(diskUsageMB) MB) — consider cleanup")
         }
 
-        // Check screen recording permission
-        if !CGPreflightScreenCaptureAccess() {
-            CGRequestScreenCaptureAccess()
-            CaptureLog.info("Screen recording permission requested")
-        } else {
-            CaptureLog.info("Screen recording permission granted")
-        }
+        // Permissions: single source of truth for live state. The setup wizard
+        // drives the user through granting; no system prompts fire here.
+        PermissionsMonitor.shared.start()
+        PermissionsWindowController.shared.startWatchingForRevocation()
 
         // Menu bar status item — click opens Browse, right-click shows menu
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)

@@ -7,8 +7,7 @@ struct BrowseLoadRequestTests {
         let request = BrowseLoadRequest(
             searchText: "  launch notes  \n",
             selectedFilter: .all,
-            selectedApp: nil,
-            selectedTagIds: []
+            selectedApp: nil
         )
 
         #expect(request.normalizedSearchText == "launch notes")
@@ -25,22 +24,19 @@ struct BrowseLoadRequestTests {
         #expect(counts.totalBrowseHighlights == 7)
     }
 
-    @Test func reloadBehaviorTracksSearchAndTagScopes() {
-        let tagScopedRequest = BrowseLoadRequest(
+    @Test func reloadBehaviorTracksSearchScope() {
+        let plainRequest = BrowseLoadRequest(
             searchText: "",
             selectedFilter: .all,
-            selectedApp: nil,
-            selectedTagIds: ["tag-1"]
+            selectedApp: nil
         )
         let searchRequest = BrowseLoadRequest(
             searchText: "meeting",
             selectedFilter: .all,
-            selectedApp: nil,
-            selectedTagIds: []
+            selectedApp: nil
         )
 
-        #expect(tagScopedRequest.shouldReloadOnHighlightMutation(change: "tags"))
-        #expect(!tagScopedRequest.shouldReloadOnHighlightMutation(change: "notes"))
+        #expect(!plainRequest.shouldReloadOnHighlightMutation(change: "notes"))
         #expect(searchRequest.shouldReloadOnHighlightMutation(change: "notes"))
         #expect(searchRequest.shouldReloadOnHighlightMutation(change: "userNote"))
         #expect(!searchRequest.shouldReloadOnHighlightMutation(change: "sourceApp"))

@@ -2,19 +2,12 @@ import SwiftUI
 import AppKit
 
 /// Simple text note "+" tile pinned to the top-left of the Browse masonry.
-/// Click to start typing, ⌘+Enter to save, Esc to cancel. Inherits the
-/// current tag filter so notes land in the collection the user is viewing.
+/// Click to start typing, ⌘+Enter to save, Esc to cancel.
 struct AddTile: View {
-    let tagIds: [String]
-
     @State private var text: String = ""
     @State private var isEditing: Bool = false
 
-    /// Key for persisting drafts per collection in UserDefaults.
-    private var draftKey: String {
-        let id = tagIds.sorted().joined(separator: ",")
-        return "addTileDraft_\(id)"
-    }
+    private let draftKey = "addTileDraft"
 
     /// Show the expanded editor if actively editing OR there's a draft with text.
     private var showExpanded: Bool {
@@ -44,12 +37,6 @@ struct AddTile: View {
             if !isEditing {
                 isEditing = true
             }
-        }
-        .onChange(of: tagIds) { _, _ in
-            // Save current draft, load the new collection's draft
-            saveDraft()
-            isEditing = false
-            text = UserDefaults.standard.string(forKey: draftKey) ?? ""
         }
         .onAppear {
             text = UserDefaults.standard.string(forKey: draftKey) ?? ""
@@ -104,7 +91,7 @@ struct AddTile: View {
     private func save() {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { cancel(); return }
-        HighlightCapture.shared.captureFromUserAdd(text: trimmed, tagIds: tagIds)
+        HighlightCapture.shared.captureFromUserAdd(text: trimmed)
         text = ""
         isEditing = false
         UserDefaults.standard.removeObject(forKey: draftKey)

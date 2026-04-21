@@ -17,9 +17,6 @@ final class BrowseWindowController: NSObject, NSWindowDelegate, ManagedWindowCon
     /// Posted to open the Browse window with the Settings panel showing.
     static let showSettingsNotification = Notification.Name("BrowseWindowShowSettings")
 
-    /// Posted to open the Browse window filtered to a specific tag/collection.
-    static let showTagFilterNotification = Notification.Name("BrowseWindowShowTagFilter")
-
     func registerHotkey() {
         // Carbon RegisterEventHotKey — fires system-wide without Accessibility
         // permission, unlike NSEvent global monitors.

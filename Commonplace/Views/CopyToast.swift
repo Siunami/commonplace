@@ -181,15 +181,6 @@ final class CopyToastController: ManagedWindowController {
                   let highlight = DatabaseManager.shared.highlight(byId: entryId) else { return }
             presentShareMenu(for: highlight, relativeTo: anchor)
         }
-        target.onToggleTag = { [weak self] tagId in
-            guard let self, let entryId = self.currentEntryId else { return }
-            let applied = Set(DatabaseManager.shared.tagsForHighlight(id: entryId).map { $0.id })
-            if applied.contains(tagId) {
-                DatabaseManager.shared.removeTag(tagId, fromHighlight: entryId)
-            } else {
-                DatabaseManager.shared.addTag(tagId, toHighlight: entryId)
-            }
-        }
         target.onDismiss = { [weak self] in self?.dismiss(animated: true) }
         self.menuTarget = target
 
@@ -716,7 +707,6 @@ struct CopyToastView: View {
 
     @State private var note = ""
     @State private var imageCopied = false
-    @State private var toastTags: [Tag] = []
 
     private var isExpanded: Bool { stateHolder.state == .expanded }
     private var isCompact: Bool { stateHolder.state == .compact }
@@ -935,13 +925,6 @@ struct CopyToastView: View {
                 .padding(.horizontal, 12)
                 .padding(.top, 6)
 
-            // Quick-tag chips
-            if let eid = entryId {
-                tagChips(for: eid)
-                    .padding(.horizontal, 12)
-                    .padding(.top, 6)
-            }
-
             HStack(spacing: 6) {
                 ZStack {
                     NativeNoteField(
@@ -1022,18 +1005,6 @@ struct CopyToastView: View {
         .fixedSize(horizontal: false, vertical: true)
     }
 
-    // MARK: - Tag Chips
-
-    private func tagChips(for highlightId: String) -> some View {
-        TagInputView(
-            highlightId: highlightId,
-            tags: $toastTags,
-            compact: true
-        )
-        .onAppear {
-            toastTags = DatabaseManager.shared.tagsForHighlight(id: highlightId)
-        }
-    }
 }
 
 // MARK: - Waveform View
@@ -1146,7 +1117,6 @@ struct AnnotationWindowView: View {
 
     @State private var note = ""
     @State private var imageCopied = false
-    @State private var tags: [Tag] = []
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1217,7 +1187,7 @@ struct AnnotationWindowView: View {
                     }
                 }
 
-                // Tags + actions row
+                // Actions row
                 HStack(spacing: 10) {
                     // Action buttons
                     if image != nil {
@@ -1241,13 +1211,6 @@ struct AnnotationWindowView: View {
                         .buttonStyle(.plain)
                         .help("Show in Finder")
                     }
-
-                    // Tags
-                    TagInputView(
-                        highlightId: entryId,
-                        tags: $tags,
-                        compact: true
-                    )
 
                     Spacer()
 
@@ -1273,9 +1236,6 @@ struct AnnotationWindowView: View {
         }
         .animation(.easeInOut(duration: 0.15), value: imageCopied)
         .animation(.easeInOut(duration: 0.2), value: transcriber.isRecording)
-        .onAppear {
-            tags = DatabaseManager.shared.tagsForHighlight(id: entryId)
-        }
         .onChange(of: transcriber.transcribedText) { _, newText in
             note = newText
         }

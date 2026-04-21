@@ -276,11 +276,9 @@ final class HighlightCapture {
 
     /// User typed or pasted text into the Browse "+" tile. Saves as a "note"
     /// highlight with minimal context (no source app, no window title — user-
-    /// initiated, not observed), then applies any tagIds that represent the
-    /// current Browse filter so the new item appears in the space the user
-    /// was viewing.
+    /// initiated, not observed).
     @discardableResult
-    func captureFromUserAdd(text: String, tagIds: [String]) -> String {
+    func captureFromUserAdd(text: String) -> String {
         let highlightId = UUID().uuidString
         let highlight = Highlight(
             id: highlightId,
@@ -304,55 +302,7 @@ final class HighlightCapture {
             wifiNetwork: nil
         )
         db.insertHighlight(highlight)
-        for tagId in tagIds {
-            db.addTag(tagId, toHighlight: highlightId)
-        }
         NotificationCenter.default.post(name: .highlightDidSave, object: nil)
-        return highlightId
-    }
-
-    /// User pasted a URL into the Browse "+" tile. Saves as a "copy" highlight
-    /// (so the Browse grid renders it via LinkCard and link-preview fetch
-    /// kicks in). Also triggers URLFileDownloader when the URL looks like a
-    /// direct file link, matching captureFromCopy's behavior for clipboard URLs.
-    @discardableResult
-    func captureFromUserAddURL(urlString: String, tagIds: [String]) -> String {
-        let highlightId = UUID().uuidString
-        let highlight = Highlight(
-            id: highlightId,
-            timestamp: Date().timeIntervalSince1970,
-            contentText: urlString,
-            sourceApp: nil,
-            sourceUrl: nil,
-            userNote: nil,
-            highlightType: "copy",
-            screenshotId: nil,
-            recordingId: nil,
-            fileId: nil,
-            windowTitle: nil,
-            bundleId: nil,
-            contentHash: CaptureContext.contentHash(for: urlString),
-            documentPath: nil,
-            contentType: "url",
-            displayName: nil,
-            displayResolution: nil,
-            appearanceMode: nil,
-            wifiNetwork: nil
-        )
-        db.insertHighlight(highlight)
-        for tagId in tagIds {
-            db.addTag(tagId, toHighlight: highlightId)
-        }
-        NotificationCenter.default.post(name: .highlightDidSave, object: nil)
-
-        if URLFileDownloader.isLikelyFileURL(urlString) {
-            Task.detached(priority: .utility) {
-                await URLFileDownloader.shared.downloadIfFile(
-                    urlString: urlString, attachTo: highlightId
-                )
-            }
-        }
-
         return highlightId
     }
 }

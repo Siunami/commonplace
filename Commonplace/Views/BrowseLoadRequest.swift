@@ -4,15 +4,10 @@ struct BrowseLoadRequest: Equatable {
     let searchText: String
     let selectedFilter: CaptureFilter
     let selectedApp: String?
-    let selectedTagIds: Set<String>
 
     var normalizedSearchText: String? {
         let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
-    }
-
-    var selectedTagId: String? {
-        selectedTagIds.sorted().first
     }
 
     var hasActiveSearch: Bool {
@@ -20,14 +15,14 @@ struct BrowseLoadRequest: Equatable {
     }
 
     var hasActiveFilters: Bool {
-        selectedFilter != .all || selectedApp != nil || selectedTagId != nil
+        selectedFilter != .all || selectedApp != nil
     }
 
     func shouldReloadOnHighlightMutation(change: String) -> Bool {
         if hasActiveSearch {
-            return change == "tags" || change == "notes" || change == "userNote"
+            return change == "notes" || change == "userNote"
         }
-        return change == "tags" && selectedTagId != nil
+        return false
     }
 }
 

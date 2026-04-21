@@ -6,9 +6,6 @@ extension DatabaseManager {
         if let query = request.normalizedSearchText {
             return searchedBrowseHighlights(request, query: query, offset: offset, limit: limit)
         }
-        if let tagId = request.selectedTagId {
-            return highlightsForTagPaginated(tagId: tagId, offset: offset, limit: limit)
-        }
         if request.selectedFilter.isAnnotatedFilter {
             return annotatedHighlightsPaginated(offset: offset, limit: limit)
         }
@@ -59,16 +56,6 @@ private struct BrowseSearchQuery {
     init(query: String, request: BrowseLoadRequest) {
         var whereClauses: [String] = []
         var arguments: [String] = []
-
-        if let tagId = request.selectedTagId {
-            whereClauses.append("""
-                EXISTS (
-                    SELECT 1 FROM highlight_tag scope_ht
-                    WHERE scope_ht.highlightId = h.id AND scope_ht.tagId = ?
-                )
-                """)
-            arguments.append(tagId)
-        }
 
         if request.selectedFilter.isAnnotatedFilter {
             whereClauses.append("""

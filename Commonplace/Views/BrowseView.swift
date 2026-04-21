@@ -79,43 +79,6 @@ extension View {
     }
 }
 
-struct TagChip: View {
-    let name: String
-    var onRemove: (() -> Void)? = nil
-    var onTap: (() -> Void)? = nil
-    @State private var isHovered = false
-
-    var body: some View {
-        HStack(spacing: 4) {
-            Text(name)
-                .font(UITokens.tagFont)
-                .foregroundStyle(onTap != nil && isHovered ? Color.accentColor : .secondary)
-            if let onRemove {
-                Button(action: onRemove) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(.tertiary)
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .chipBackground()
-        .contentShape(Capsule())
-        .onTapGesture {
-            onTap?()
-        }
-        .onHover { hovering in
-            guard onTap != nil else { return }
-            isHovered = hovering
-            if hovering {
-                NSCursor.pointingHand.set()
-            } else {
-                NSCursor.arrow.set()
-            }
-        }
-    }
-}
-
 struct SectionLabel: View {
     let text: String
     var body: some View {
@@ -123,48 +86,6 @@ struct SectionLabel: View {
             .font(UITokens.sectionLabelFont)
             .tracking(UITokens.sectionLabelTracking)
             .foregroundStyle(.tertiary)
-    }
-}
-
-struct FlatTag: View {
-    let name: String
-    var onRemove: (() -> Void)?
-    var onTap: (() -> Void)?
-    @State private var isHovered = false
-
-    private var labelColor: Color {
-        if onTap != nil && isHovered { return Color.accentColor }
-        return isHovered ? Color.primary.opacity(0.85) : Color.primary.opacity(0.55)
-    }
-
-    var body: some View {
-        HStack(spacing: 3) {
-            Text("#\(name)")
-                .font(.system(size: 12))
-                .foregroundStyle(labelColor)
-            if isHovered, let onRemove {
-                Button(action: onRemove) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(.tertiary)
-                }
-                .buttonStyle(.plain)
-                .transition(.opacity)
-            }
-        }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            onTap?()
-        }
-        .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.1)) { isHovered = hovering }
-            guard onTap != nil else { return }
-            if hovering {
-                NSCursor.pointingHand.set()
-            } else {
-                NSCursor.arrow.set()
-            }
-        }
     }
 }
 
@@ -320,18 +241,13 @@ struct BrowseView: View {
     @State private var sidebarRefreshGeneration = 0
     @State private var isReloadingCaptures = false
     @State private var noteCounts: [String: Int] = [:]
-    @State private var highlightTags: [String: [Tag]] = [:]
     @State private var aspectRatios: [String: CGFloat] = [:]
     @State private var selectedFilter: CaptureFilter = .all
     @State private var selectedApp: String? = nil
-    @State private var selectedTagIds: Set<String> = []
     @State private var appFacets: [AppFacet] = []
-    @State private var allTags: [Tag] = []
-    @State private var tagCounts: [String: Int] = [:]
     // Scroll position managed by SwiftUI's default behavior
     @State private var typeCounts: [String: Int] = [:]
     @State private var isDropTargeted = false
-    @State private var pinnedOrigin: PinnedOrigin? = nil
     @State private var showSettings = false
     @State private var hasMore = false
     @State private var pinnedStack: Stack? = nil
@@ -344,74 +260,6 @@ struct BrowseView: View {
     @State private var footerBarFrame: CGRect = .zero
     @AppStorage("browseViewMode") private var viewMode: BrowseViewMode = .mosaic
     private let pageSize = 50
-
-    // MARK: - Pinned origin (navigation breadcrumb)
-
-    struct PinnedOrigin: Equatable {
-        let highlight: Highlight
-        let targetTagId: String
-
-        static func == (lhs: PinnedOrigin, rhs: PinnedOrigin) -> Bool {
-            lhs.highlight.id == rhs.highlight.id && lhs.targetTagId == rhs.targetTagId
-        }
-    }
-
-    private func navigateToTag(from origin: Highlight, tag: Tag) {
-        // Dismiss detail view (if currently open).
-        selectedHighlight = nil
-        // Remember where we came from so we can pin it.
-        pinnedOrigin = PinnedOrigin(highlight: origin, targetTagId: tag.id)
-        // Switch the sidebar filter to this single tag (mutually exclusive
-        // with type/app per the single-select sidebar logic).
-        selectedFilter = .all
-        selectedApp = nil
-        searchText = ""
-        selectedTagIds = [tag.id]
-        // loadCaptures triggered by onChange(of: selectedTagIds)
-    }
-
-    @ViewBuilder
-    private func pinnedOriginRow(_ pinned: PinnedOrigin) -> some View {
-        let tagName = allTags.first(where: { $0.id == pinned.targetTagId })?.name ?? "collection"
-        HStack(alignment: .top, spacing: 12) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    Image(systemName: "pin.fill")
-                        .font(.system(size: 10))
-                        .foregroundStyle(Color.accentColor)
-                    Text("From this capture → #\(tagName)")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-
-                MasonryCard(
-                    highlight: pinned.highlight,
-                    noteCount: noteCounts[pinned.highlight.id] ?? 0,
-                    cardTags: highlightTags[pinned.highlight.id] ?? [],
-                    preferredAspectRatio: aspectRatios[pinned.highlight.id],
-                    onTagTap: { tag in
-                        navigateToTag(from: pinned.highlight, tag: tag)
-                    }
-                )
-                .frame(width: 240)
-                .onTapGesture { selectedHighlight = pinned.highlight }
-            }
-
-            Spacer()
-
-            Button(action: { pinnedOrigin = nil }) {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 14))
-                    .foregroundStyle(.tertiary)
-            }
-            .buttonStyle(.plain)
-            .help("Unpin")
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 12)
-        .padding(.bottom, 12)
-        .background(Color.accentColor.opacity(0.04))
-    }
 
     /// The pinned stack rendered as a compact, intrinsic-sized floating tile
     /// anchored to the browse window's bottom-right corner. Sized by content
@@ -444,18 +292,12 @@ struct BrowseView: View {
         BrowseLoadRequest(
             searchText: searchText,
             selectedFilter: selectedFilter,
-            selectedApp: selectedApp,
-            selectedTagIds: selectedTagIds
+            selectedApp: selectedApp
         )
     }
 
     private var filteredHighlights: [Highlight] {
-        var result = highlights
-        // Exclude the pinned-origin highlight so it only shows as the pinned card.
-        if let pinned = pinnedOrigin {
-            result = result.filter { $0.id != pinned.highlight.id }
-        }
-        return result
+        highlights
     }
 
     private var emptyStateTitle: String {
@@ -489,33 +331,18 @@ struct BrowseView: View {
         HStack(spacing: 0) {
             CaptureFilterSidebar(
                 appFacets: appFacets,
-                allTags: allTags,
-                tagCounts: tagCounts,
                 typeCounts: typeCounts,
                 selectedApp: $selectedApp,
                 selectedFilter: $selectedFilter,
-                selectedTagIds: $selectedTagIds,
                 showSettings: $showSettings,
                 showStacks: $showStacks
             )
             .onChange(of: selectedApp) { _, _ in
                 guard isActive else { return }
-                pinnedOrigin = nil
                 loadCaptures(reset: true)
             }
             .onChange(of: selectedFilter) { _, _ in
                 guard isActive else { return }
-                pinnedOrigin = nil
-                loadCaptures(reset: true)
-            }
-            .onChange(of: selectedTagIds) { _, newValue in
-                guard isActive else { return }
-                // Clear the pin whenever the tag filter is changed through any
-                // path other than navigateToTag() — in navigateToTag the new
-                // Set always matches the pin's target id so this is a no-op.
-                if let pinned = pinnedOrigin, newValue != Set([pinned.targetTagId]) {
-                    pinnedOrigin = nil
-                }
                 loadCaptures(reset: true)
             }
             .onChange(of: searchText) { _, _ in
@@ -546,12 +373,6 @@ struct BrowseView: View {
                 } else {
 
             VStack(spacing: 0) {
-                // Breadcrumb: pinned origin from a tag navigation
-                if let pinned = pinnedOrigin {
-                    pinnedOriginRow(pinned)
-                    Divider()
-                }
-
                 if filteredHighlights.isEmpty && !(showAddTile && viewMode == .mosaic) {
                     VStack(spacing: 12) {
                         Spacer()
@@ -585,17 +406,13 @@ struct BrowseView: View {
                             case .mosaic:
                                 MasonryLayout(minColumnWidth: 260, spacing: 14, pinFirst: showAddTile) {
                                     if showAddTile {
-                                        AddTile(tagIds: Array(selectedTagIds))
+                                        AddTile()
                                     }
                                     ForEach(filteredHighlights) { highlight in
                                         MasonryCard(
                                             highlight: highlight,
                                             noteCount: noteCounts[highlight.id] ?? 0,
-                                            cardTags: highlightTags[highlight.id] ?? [],
                                             preferredAspectRatio: aspectRatios[highlight.id],
-                                            onTagTap: { tag in
-                                                navigateToTag(from: highlight, tag: tag)
-                                            },
                                             onImageFullscreen: { image in
                                                 withAnimation(.easeInOut(duration: 0.2)) { fullScreenImage = image }
                                             }
@@ -611,12 +428,8 @@ struct BrowseView: View {
                                 HistoryListView(
                                     highlights: filteredHighlights,
                                     noteCounts: noteCounts,
-                                    highlightTags: highlightTags,
                                     onSelect: { highlight in
                                         withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = highlight }
-                                    },
-                                    onTagTap: { highlight, tag in
-                                        navigateToTag(from: highlight, tag: tag)
                                     }
                                 )
                             }
@@ -750,8 +563,6 @@ struct BrowseView: View {
             // Targeted refresh for the affected highlight's cached state.
             if let hid {
                 switch change {
-                case "tags":
-                    highlightTags[hid] = DatabaseManager.shared.tagsForHighlight(id: hid)
                 case "notes":
                     let counts = DatabaseManager.shared.noteCountsForHighlights(ids: [hid])
                     noteCounts[hid] = counts[hid] ?? 0
@@ -771,7 +582,7 @@ struct BrowseView: View {
                 }
             }
 
-            // Sidebar counts + allTags always refresh — both are cheap indexed scans.
+            // Sidebar counts always refresh — cheap indexed scans.
             refreshSidebarData()
 
             if browseLoadRequest.shouldReloadOnHighlightMutation(change: change) {
@@ -793,15 +604,6 @@ struct BrowseView: View {
                 selectedStack = nil
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: BrowseWindowController.showTagFilterNotification)) { notification in
-            guard let tagId = notification.userInfo?["tagId"] as? String else { return }
-            selectedFilter = .all
-            selectedApp = nil
-            searchText = ""
-            isActive = true
-            selectedTagIds = [tagId]
-            // loadCaptures triggered by onChange(of: selectedTagIds)
-        }
         .onReceive(NotificationCenter.default.publisher(for: BrowseWindowController.showHighlightDetailNotification)) { notification in
             guard let highlightId = notification.userInfo?["highlightId"] as? String,
                   let highlight = DatabaseManager.shared.highlight(byId: highlightId) else { return }
@@ -809,7 +611,6 @@ struct BrowseView: View {
             // once the detail overlay is dismissed.
             selectedFilter = .all
             selectedApp = nil
-            selectedTagIds = []
             searchText = ""
             isActive = true
             loadCaptures(reset: true)
@@ -825,9 +626,6 @@ struct BrowseView: View {
                     CardDetailView(
                         highlight: highlight,
                         onDismiss: { withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = nil } },
-                        onTagNavigation: { origin, tag in
-                            navigateToTag(from: origin, tag: tag)
-                        },
                         onStackNavigation: { stack in
                             withAnimation(.easeInOut(duration: 0.2)) {
                                 selectedHighlight = nil
@@ -928,7 +726,6 @@ struct BrowseView: View {
             let db = DatabaseManager.shared
             let batch = db.browseHighlights(request, offset: offset, limit: limit)
             let newCounts = db.noteCountsForHighlights(ids: batch.map(\.id))
-            let newTags = db.tagsForHighlights(ids: batch.map(\.id))
             let newRatios = db.aspectRatiosForHighlights(ids: batch.map(\.id))
             let facets: [(appName: String, bundleId: String?, count: Int)]? =
                 shouldRefreshFacets ? db.appFacets() : nil
@@ -954,7 +751,6 @@ struct BrowseView: View {
                 }
                 hasMore = batch.count == limit
                 noteCounts.merge(newCounts) { _, new in new }
-                highlightTags.merge(newTags) { _, new in new }
                 aspectRatios.merge(newRatios) { _, new in new }
                 if let facets {
                     appFacets = facets.map {
@@ -979,9 +775,6 @@ struct BrowseView: View {
 
         let task = Task.detached(priority: .userInitiated) {
             let db = DatabaseManager.shared
-            db.pruneEmptyTags()
-            let tags = db.allTags()
-            let tCounts = db.tagHighlightCounts()
             var counts = db.typeCounts()
             counts["_annotated"] = db.annotatedHighlightCount()
             counts["_links"] = db.linkHighlightCount()
@@ -992,8 +785,6 @@ struct BrowseView: View {
 
             await MainActor.run {
                 guard generation == sidebarRefreshGeneration else { return }
-                allTags = tags
-                tagCounts = tCounts
                 typeCounts = counts
                 sidebarRefreshTask = nil
             }
@@ -1005,10 +796,6 @@ struct BrowseView: View {
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
         guard !providers.isEmpty else { return false }
-
-        // Snapshot the current tag filter at drop time so any tag change
-        // mid-import doesn't race with the async import pipeline.
-        let inheritedTagIds = Array(selectedTagIds)
 
         for provider in providers {
             provider.loadFileRepresentation(forTypeIdentifier: UTType.item.identifier) { url, error in
@@ -1037,7 +824,7 @@ struct BrowseView: View {
                 }
 
                 Task {
-                    await FileMonitor.shared.importFile(from: tempURL, tagIds: inheritedTagIds)
+                    await FileMonitor.shared.importFile(from: tempURL)
                     try? FileManager.default.removeItem(at: tempDir)
                 }
             }
@@ -1193,13 +980,11 @@ private struct MasonryLayout: Layout {
 private struct MasonryCard: View {
     let highlight: Highlight
     var noteCount: Int = 0
-    var cardTags: [Tag] = []
     /// Pre-resolved intrinsic aspect ratio (width/height) for this highlight's
     /// media, loaded in a batch by BrowseView. Passing it down lets the cover
     /// preview reserve aspect-correct space before any image/video decodes,
     /// which keeps neighbour cards from re-flowing when the bitmap arrives.
     var preferredAspectRatio: CGFloat? = nil
-    var onTagTap: ((Tag) -> Void)? = nil
     var onImageFullscreen: ((NSImage) -> Void)? = nil
     @State private var isHovered = false
     @State private var isLinkHovered = false
@@ -1310,27 +1095,27 @@ private struct MasonryCard: View {
                 isHovered = hovering
             }
         }
-        .materialContextMenu(for: highlight, cardTags: cardTags)
+        .materialContextMenu(for: highlight)
     }
 
     @ViewBuilder
     private var cardContent: some View {
         switch highlight.highlightType {
         case "screenshot":
-            ScreenshotCard(highlight: highlight, cardTags: cardTags, preferredAspectRatio: preferredAspectRatio, onTagTap: onTagTap, onImageFullscreen: onImageFullscreen)
+            ScreenshotCard(highlight: highlight, preferredAspectRatio: preferredAspectRatio, onImageFullscreen: onImageFullscreen)
         case "recording":
-            ScreenshotCard(highlight: highlight, cardTags: cardTags, preferredAspectRatio: preferredAspectRatio, onTagTap: onTagTap, onImageFullscreen: nil)
+            ScreenshotCard(highlight: highlight, preferredAspectRatio: preferredAspectRatio, onImageFullscreen: nil)
         case "highlight":
-            HighlightCard(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
+            HighlightCard(highlight: highlight)
         case "note":
-            NoteCard(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
+            NoteCard(highlight: highlight)
         case "file":
-            FileCard(highlight: highlight, cardTags: cardTags, preferredAspectRatio: preferredAspectRatio, onTagTap: onTagTap, onImageFullscreen: onImageFullscreen)
+            FileCard(highlight: highlight, preferredAspectRatio: preferredAspectRatio, onImageFullscreen: onImageFullscreen)
         default:
             if highlight.isURLCopy {
-                LinkCard(highlight: highlight, cardTags: cardTags, preferredAspectRatio: preferredAspectRatio, onTagTap: onTagTap)
+                LinkCard(highlight: highlight, preferredAspectRatio: preferredAspectRatio)
             } else {
-                TextCard(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
+                TextCard(highlight: highlight)
             }
         }
     }
@@ -1450,13 +1235,11 @@ private extension CardCoverPreview where Overlay == EmptyView {
 
 private struct ScreenshotCard: View {
     let highlight: Highlight
-    var cardTags: [Tag] = []
     /// Intrinsic aspect ratio pre-resolved by BrowseView's batch map. Passed
     /// down instead of re-queried here so the cover can reserve an
     /// aspect-correct frame before `image` finishes loading — without this
     /// the card resizes when the bitmap arrives and neighbours shift.
     var preferredAspectRatio: CGFloat? = nil
-    var onTagTap: ((Tag) -> Void)? = nil
     var onImageFullscreen: ((NSImage) -> Void)? = nil
     @State private var image: NSImage?
     @State private var imageHovered = false
@@ -1690,8 +1473,6 @@ private enum TextCardStyle {
 
 private struct TextCard: View {
     let highlight: Highlight
-    var cardTags: [Tag] = []
-    var onTagTap: ((Tag) -> Void)? = nil
 
     var body: some View {
         if TextHighlightRouter.isImageFilePath(highlight.contentText) {
@@ -1719,8 +1500,6 @@ private struct TextCard: View {
 
 private struct HighlightCard: View {
     let highlight: Highlight
-    var cardTags: [Tag] = []
-    var onTagTap: ((Tag) -> Void)? = nil
 
     var body: some View {
         if TextHighlightRouter.isImageFilePath(highlight.contentText) {
@@ -1766,8 +1545,6 @@ private enum TextHighlightRouter {
 
 private struct NoteCard: View {
     let highlight: Highlight
-    var cardTags: [Tag] = []
-    var onTagTap: ((Tag) -> Void)? = nil
 
     var body: some View {
         let style = TextCardStyle.style(for: highlight.contentText)
@@ -1785,11 +1562,9 @@ private struct NoteCard: View {
 
 private struct FileCard: View {
     let highlight: Highlight
-    var cardTags: [Tag] = []
     /// Pre-resolved intrinsic aspect ratio from BrowseView's batch map. See
     /// ScreenshotCard for the rationale — same problem, same fix.
     var preferredAspectRatio: CGFloat? = nil
-    var onTagTap: ((Tag) -> Void)? = nil
     var onImageFullscreen: ((NSImage) -> Void)? = nil
     @State private var thumbnail: NSImage?
     @State private var fileRecord: FileRecord?
@@ -1903,11 +1678,9 @@ private struct FileCard: View {
 
 private struct LinkCard: View {
     let highlight: Highlight
-    var cardTags: [Tag] = []
     /// Pre-resolved intrinsic aspect ratio for the link's hero image, from
     /// BrowseView's batch map. See ScreenshotCard for the rationale.
     var preferredAspectRatio: CGFloat? = nil
-    var onTagTap: ((Tag) -> Void)? = nil
     @State private var preview: LinkPreview?
     @State private var heroImage: NSImage?
     @State private var faviconImage: NSImage?
@@ -2604,9 +2377,7 @@ enum HistoryGrouping {
 private struct HistoryListView: View {
     let highlights: [Highlight]
     let noteCounts: [String: Int]
-    let highlightTags: [String: [Tag]]
     let onSelect: (Highlight) -> Void
-    let onTagTap: (Highlight, Tag) -> Void
 
     private var days: [HistoryDay] { HistoryGrouping.group(highlights) }
 
@@ -2622,18 +2393,14 @@ private struct HistoryListView: View {
                                 case .row(let h):
                                     HistoryRow(
                                         highlight: h,
-                                        noteCount: noteCounts[h.id] ?? 0,
-                                        cardTags: highlightTags[h.id] ?? [],
-                                        onTagTap: { onTagTap(h, $0) }
+                                        noteCount: noteCounts[h.id] ?? 0
                                     )
                                     .contentShape(Rectangle())
                                     .onTapGesture { onSelect(h) }
                                 case .media(let h):
                                     HistoryMediaRow(
                                         highlight: h,
-                                        cardTags: highlightTags[h.id] ?? [],
                                         noteCount: noteCounts[h.id] ?? 0,
-                                        onTagTap: { onTagTap(h, $0) },
                                         onSelect: { onSelect(h) }
                                     )
                                 case .strip(let hs):
@@ -2780,8 +2547,6 @@ private struct HistoryClusterHeader: View {
 private struct HistoryRow: View {
     let highlight: Highlight
     var noteCount: Int = 0
-    var cardTags: [Tag] = []
-    var onTagTap: ((Tag) -> Void)? = nil
     @State private var isHovered = false
 
     var body: some View {
@@ -2815,20 +2580,6 @@ private struct HistoryRow: View {
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                             .lineLimit(1)
-                    }
-                    if !cardTags.isEmpty {
-                        HStack(spacing: 4) {
-                            ForEach(cardTags.prefix(3)) { tag in
-                                TagChip(name: tag.name, onTap: onTagTap.map { handler in
-                                    { handler(tag) }
-                                })
-                            }
-                            if cardTags.count > 3 {
-                                Text("+\(cardTags.count - 3)")
-                                    .font(.system(size: 10, weight: .medium))
-                                    .foregroundStyle(.tertiary)
-                            }
-                        }
                     }
                     if noteCount > 0 {
                         HStack(spacing: 3) {
@@ -2989,9 +2740,7 @@ private struct HistoryRowThumbnail: View {
 
 private struct HistoryMediaRow: View {
     let highlight: Highlight
-    var cardTags: [Tag] = []
     var noteCount: Int = 0
-    var onTagTap: ((Tag) -> Void)? = nil
     var onSelect: () -> Void
     @State private var isHovered = false
 
@@ -3024,20 +2773,6 @@ private struct HistoryMediaRow: View {
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
-                }
-                if !cardTags.isEmpty {
-                    HStack(spacing: 4) {
-                        ForEach(cardTags.prefix(3)) { tag in
-                            TagChip(name: tag.name, onTap: onTagTap.map { handler in
-                                { handler(tag) }
-                            })
-                        }
-                        if cardTags.count > 3 {
-                            Text("+\(cardTags.count - 3)")
-                                .font(.system(size: 10, weight: .medium))
-                                .foregroundStyle(.tertiary)
-                        }
-                    }
                 }
                 if noteCount > 0 {
                     HStack(spacing: 3) {

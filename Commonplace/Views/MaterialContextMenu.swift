@@ -2,7 +2,7 @@ import SwiftUI
 import AppKit
 
 // Unified right-click menu for any material in the archive.
-// Layout: Copy, Open, Reveal in Finder, Share, Collection.
+// Layout: Copy, Open, Reveal in Finder, Share.
 // Open/Reveal only appear when the action has a meaningful target for the type.
 
 enum MaterialAction {
@@ -90,7 +90,6 @@ enum MaterialAction {
 
 struct MaterialContextMenuModifier: ViewModifier {
     let highlight: Highlight
-    let cardTags: [Tag]
 
     func body(content: Content) -> some View {
         content.contextMenu {
@@ -111,26 +110,6 @@ struct MaterialContextMenuModifier: ViewModifier {
             }
 
             shareButton
-
-            Divider()
-
-            Menu("Collection") {
-                ForEach(DatabaseManager.shared.allTags()) { tag in
-                    let isApplied = cardTags.contains(where: { $0.id == tag.id })
-                    Button(action: {
-                        if isApplied {
-                            DatabaseManager.shared.removeTag(tag.id, fromHighlight: highlight.id)
-                        } else {
-                            DatabaseManager.shared.addTag(tag.id, toHighlight: highlight.id)
-                        }
-                    }) {
-                        HStack {
-                            Text(tag.name)
-                            if isApplied { Image(systemName: "checkmark") }
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -148,8 +127,8 @@ struct MaterialContextMenuModifier: ViewModifier {
 }
 
 extension View {
-    func materialContextMenu(for highlight: Highlight, cardTags: [Tag] = []) -> some View {
-        modifier(MaterialContextMenuModifier(highlight: highlight, cardTags: cardTags))
+    func materialContextMenu(for highlight: Highlight) -> some View {
+        modifier(MaterialContextMenuModifier(highlight: highlight))
     }
 }
 
@@ -160,7 +139,6 @@ final class MaterialMenuTarget: NSObject {
     var onOpen: (() -> Void)?
     var onRevealInFinder: (() -> Void)?
     var onShare: ((NSView) -> Void)?
-    var onToggleTag: ((String) -> Void)?
     var onDismiss: (() -> Void)?
 
     @objc func copyMaterial() { onCopy?() }
@@ -169,10 +147,6 @@ final class MaterialMenuTarget: NSObject {
     @objc func share(_ sender: NSMenuItem) {
         guard let view = sender.representedObject as? NSView else { return }
         onShare?(view)
-    }
-    @objc func toggleTag(_ sender: NSMenuItem) {
-        guard let tagId = sender.representedObject as? String else { return }
-        onToggleTag?(tagId)
     }
     @objc func dismissToast() { onDismiss?() }
 }
@@ -213,30 +187,6 @@ func buildMaterialNSMenu(
     shareItem.target = target
     shareItem.representedObject = anchorView
     menu.addItem(shareItem)
-
-    menu.addItem(.separator())
-
-    let collMenu = NSMenu()
-    let applied = Set(DatabaseManager.shared.tagsForHighlight(id: highlight.id).map { $0.id })
-    let tags = DatabaseManager.shared.allTags()
-    if tags.isEmpty {
-        let empty = NSMenuItem(title: "No collections yet", action: nil, keyEquivalent: "")
-        empty.isEnabled = false
-        collMenu.addItem(empty)
-    } else {
-        for tag in tags {
-            let item = NSMenuItem(title: tag.name,
-                                  action: #selector(MaterialMenuTarget.toggleTag(_:)),
-                                  keyEquivalent: "")
-            item.target = target
-            item.representedObject = tag.id
-            item.state = applied.contains(tag.id) ? .on : .off
-            collMenu.addItem(item)
-        }
-    }
-    let collItem = NSMenuItem(title: "Collection", action: nil, keyEquivalent: "")
-    collItem.submenu = collMenu
-    menu.addItem(collItem)
 
     if includeDismiss {
         menu.addItem(.separator())

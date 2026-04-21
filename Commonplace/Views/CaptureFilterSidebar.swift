@@ -1,20 +1,14 @@
 import SwiftUI
 
 /// Left sidebar for the Browse window.
-/// Collections (tags) first, then type filters, then source apps.
+/// Stacks, type filters, and source apps — category/tag UI is hidden for now.
 struct CaptureFilterSidebar: View {
     let appFacets: [AppFacet]
-    let allTags: [Tag]
-    let tagCounts: [String: Int]
     let typeCounts: [String: Int]
     @Binding var selectedApp: String?
     @Binding var selectedFilter: CaptureFilter
-    @Binding var selectedTagIds: Set<String>
     @Binding var showSettings: Bool
     @Binding var showStacks: Bool
-    @State private var emojiPickerTagId: String?
-    @State private var renamingTagId: String?
-    @State private var renameText: String = ""
 
     private var totalCount: Int {
         typeCounts.totalBrowseHighlights
@@ -26,11 +20,6 @@ struct CaptureFilterSidebar: View {
                 VStack(alignment: .leading, spacing: 16) {
                     // Stacks — provisional, lightweight grouping
                     stacksRow
-
-                    // Collections (tags) — first, only those with items
-                    if !allTags.isEmpty {
-                        collectionsSection
-                    }
 
                     // Type filters
                     typeSection
@@ -45,7 +34,7 @@ struct CaptureFilterSidebar: View {
 
             Divider()
 
-            Button(action: { cancelRename(); showSettings.toggle(); if showSettings { showStacks = false } }) {
+            Button(action: { showSettings.toggle(); if showSettings { showStacks = false } }) {
                 HStack(spacing: 8) {
                     Image(systemName: "gear")
                         .font(.caption)
@@ -88,172 +77,13 @@ struct CaptureFilterSidebar: View {
     }
 
     private func selectStacks() {
-        cancelRename()
         NSApp.keyWindow?.makeFirstResponder(nil)
         showStacks.toggle()
         if showStacks {
             showSettings = false
             selectedFilter = .all
             selectedApp = nil
-            selectedTagIds = []
         }
-    }
-
-    // MARK: - Collections (Tags)
-
-    private var collectionsSection: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("Collections")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-                .padding(.horizontal, 12)
-                .padding(.bottom, 4)
-
-            ForEach(allTags) { tag in
-                tagRow(tag)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func tagRow(_ tag: Tag) -> some View {
-        let count = tagCounts[tag.id] ?? 0
-        let isSelected = selectedTagIds.contains(tag.id)
-        HStack(spacing: 8) {
-            // Clickable icon — hover highlights, click opens emoji picker
-            TagIconButton(tag: tag, isPickerOpen: emojiPickerTagId == tag.id) {
-                emojiPickerTagId = tag.id
-            }
-            .popover(isPresented: Binding(
-                get: { emojiPickerTagId == tag.id },
-                set: { if !$0 { emojiPickerTagId = nil } }
-            ), arrowEdge: .trailing) {
-                EmojiPickerView(
-                    currentEmoji: tag.emoji,
-                    onSelect: { emoji in
-                        DatabaseManager.shared.setTagEmoji(id: tag.id, emoji: emoji)
-                        emojiPickerTagId = nil
-                        NotificationCenter.default.post(name: .highlightDataDidChange, object: nil,
-                                                        userInfo: ["change": "tags"])
-                    },
-                    onRemove: {
-                        DatabaseManager.shared.setTagEmoji(id: tag.id, emoji: nil)
-                        emojiPickerTagId = nil
-                        NotificationCenter.default.post(name: .highlightDataDidChange, object: nil,
-                                                        userInfo: ["change": "tags"])
-                    }
-                )
-            }
-
-            if renamingTagId == tag.id {
-                InlineTagRenameField(
-                    text: $renameText,
-                    onCommit: {
-                        commitRename(tag)
-                    },
-                    onCancel: {
-                        renamingTagId = nil
-                    }
-                )
-                .font(.callout)
-            } else {
-                Text(tag.name)
-                    .font(.callout)
-                    .lineLimit(1)
-                    .onTapGesture(count: 2) {
-                        renameText = tag.name
-                        renamingTagId = tag.id
-                        // Also select this collection so you're viewing it while renaming
-                        if selectedTagIds != [tag.id] {
-                            selectedTagIds = [tag.id]
-                            selectedFilter = .all
-                            selectedApp = nil
-                            showSettings = false
-                        }
-                    }
-            }
-            Spacer(minLength: 0)
-            if renamingTagId != tag.id {
-                if tag.isPublished == true {
-                    Image(systemName: "cloud.fill")
-                        .font(.system(size: 8))
-                        .foregroundStyle(.blue.opacity(0.6))
-                }
-                Text("\(count)")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(isSelected ? Color.accentColor.opacity(0.15) : Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: 4))
-        .contentShape(Rectangle())
-        .foregroundStyle(isSelected ? .primary : .secondary)
-        .onTapGesture {
-            if renamingTagId == tag.id { return }
-            selectTag(tag.id)
-        }
-        .contextMenu {
-            tagContextMenu(tag)
-        }
-    }
-
-    private func commitRename(_ tag: Tag) {
-        let trimmed = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty && trimmed.lowercased() != tag.name {
-            DatabaseManager.shared.renameTag(id: tag.id, newName: trimmed)
-            NotificationCenter.default.post(name: .highlightDataDidChange, object: nil,
-                                            userInfo: ["change": "tags"])
-        }
-        renamingTagId = nil
-    }
-
-    @ViewBuilder
-    private func tagContextMenu(_ tag: Tag) -> some View {
-        Button("Rename") {
-            renameText = tag.name
-            renamingTagId = tag.id
-        }
-        Divider()
-        if tag.isPublished == true {
-            Button("Unpublish") {
-                CollectionPublisher.shared.unpublishCollection(tag)
-            }
-            if !CollectionPublisher.shared.publicUrl.isEmpty {
-                let url = "\(CollectionPublisher.shared.publicUrl)/\(tag.slug)/index.html"
-                Button("Copy Web URL") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(url, forType: .string)
-                }
-                let apiUrl = "\(CollectionPublisher.shared.publicUrl)/\(tag.slug)/manifest.json"
-                Button("Copy API URL") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(apiUrl, forType: .string)
-                }
-            }
-        } else {
-            Button("Publish") {
-                Task { await CollectionPublisher.shared.publishCollection(tag) }
-            }
-            .disabled(!CollectionPublisher.shared.isConfigured)
-        }
-    }
-
-    private func cancelRename() {
-        renamingTagId = nil
-    }
-
-    private func selectTag(_ tagId: String) {
-        cancelRename()
-        NSApp.keyWindow?.makeFirstResponder(nil)
-        if selectedTagIds == [tagId] { return }
-        selectedTagIds = [tagId]
-        selectedFilter = .all
-        selectedApp = nil
-        showSettings = false
-        showStacks = false
     }
 
     // MARK: - Type Filters
@@ -309,15 +139,12 @@ struct CaptureFilterSidebar: View {
             && !showSettings
             && selectedFilter == filter
             && selectedApp == nil
-            && selectedTagIds.isEmpty
     }
 
     private func selectType(_ filter: CaptureFilter) {
-        cancelRename()
         NSApp.keyWindow?.makeFirstResponder(nil)
         selectedFilter = filter
         selectedApp = nil
-        selectedTagIds = []
         showSettings = false
         showStacks = false
     }
@@ -357,17 +184,14 @@ struct CaptureFilterSidebar: View {
     }
 
     private func selectApp(_ appName: String) {
-        cancelRename()
         NSApp.keyWindow?.makeFirstResponder(nil)
         if selectedApp == appName {
             selectedApp = nil
             selectedFilter = .all
-            selectedTagIds = []
             return
         }
         selectedApp = appName
         selectedFilter = .all
-        selectedTagIds = []
         showSettings = false
         showStacks = false
     }
@@ -454,80 +278,5 @@ extension Color {
             r = 0.5; g = 0.5; b = 0.5
         }
         self.init(red: r, green: g, blue: b)
-    }
-}
-
-// MARK: - Tag Icon Button
-
-/// The folder/emoji icon in a tag row. Hover shows a subtle highlight;
-/// click opens the emoji picker popover.
-private struct TagIconButton: View {
-    let tag: Tag
-    let isPickerOpen: Bool
-    let onTap: () -> Void
-    @State private var isHovered = false
-
-    var body: some View {
-        Group {
-            if let emoji = tag.emoji, !emoji.isEmpty {
-                Text(emoji)
-                    .font(.system(size: 13))
-            } else {
-                Image(systemName: "folder.fill")
-                    .font(.caption)
-            }
-        }
-        .frame(width: 22, height: 22)
-        .background(
-            RoundedRectangle(cornerRadius: 4)
-                .fill(isHovered || isPickerOpen ? Color.primary.opacity(0.08) : Color.clear)
-        )
-        .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.1)) { isHovered = hovering }
-        }
-        .onTapGesture {
-            onTap()
-        }
-        .help("Set icon")
-    }
-}
-
-// MARK: - Inline Rename Field
-
-/// A text field that appears in place of the tag name for renaming.
-/// Auto-focuses and selects all text. Enter or focus-loss commits, Escape cancels.
-private struct InlineTagRenameField: View {
-    @Binding var text: String
-    let onCommit: () -> Void
-    let onCancel: () -> Void
-    @FocusState private var isFocused: Bool
-
-    var body: some View {
-        TextField("", text: $text)
-            .textFieldStyle(.plain)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 3)
-            .background(
-                RoundedRectangle(cornerRadius: 4)
-                    .fill(Color.primary.opacity(0.06))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 4)
-                            .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
-                    )
-            )
-            .focused($isFocused)
-            .onSubmit { onCommit() }
-            .onExitCommand { onCancel() }
-            .onAppear {
-                isFocused = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    if let editor = NSApp.keyWindow?.firstResponder as? NSTextView {
-                        editor.selectAll(nil)
-                    }
-                }
-            }
-            .onChange(of: isFocused) { _, focused in
-                if !focused { onCommit() }
-            }
     }
 }

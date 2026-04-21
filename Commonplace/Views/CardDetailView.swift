@@ -9,7 +9,6 @@ import Combine
 struct CardDetailView: View {
     let highlight: Highlight
     var onDismiss: (() -> Void)?
-    var onTagNavigation: ((Highlight, Tag) -> Void)?
     var onStackNavigation: ((Stack) -> Void)?
     var onImageFullscreen: ((NSImage) -> Void)?
     @State private var image: NSImage?
@@ -17,12 +16,7 @@ struct CardDetailView: View {
     @State private var fileImageHovered = false
     @State private var notes: [HighlightNote] = []
     @State private var newNoteText = ""
-    @State private var tags: [Tag] = []
     @State private var confirmationText: String?
-    @State private var showCollectionPicker = false
-    @State private var collectionInput = ""
-    @State private var allCollections: [Tag] = DatabaseManager.shared.allTags()
-    @State private var pickerSelection: Int = 0
 
     // Stack organization
     @State private var stacks: [Stack] = []
@@ -149,8 +143,6 @@ struct CardDetailView: View {
                 }.value
             }
             loadNotes()
-            tags = DatabaseManager.shared.tagsForHighlight(id: highlight.id)
-            allCollections = DatabaseManager.shared.allTags()
             reloadStacks()
         }
         .onReceive(NotificationCenter.default.publisher(for: .stackDataDidChange).receive(on: DispatchQueue.main)) { _ in
@@ -205,7 +197,7 @@ struct CardDetailView: View {
                 }
             }
 
-            // Meta row — flat line: date · time · app · host  |  #tags  + add       Copied
+            // Meta row — date/time (app + URL live in the Source card below)
             headerMetaLine
         }
         .padding(.horizontal, 20)
@@ -229,44 +221,6 @@ struct CardDetailView: View {
             .font(.system(size: 12))
             .foregroundStyle(.secondary)
 
-            // Spacer between provenance and organisation groups
-            if !tags.isEmpty {
-                Spacer().frame(width: 18)
-            } else {
-                Spacer().frame(width: 12)
-            }
-
-            // Organisation group — flat tags + add
-            HStack(spacing: 10) {
-                ForEach(tags) { tag in
-                    FlatTag(
-                        name: tag.name,
-                        onRemove: { removeCollection(tag) },
-                        onTap: onTagNavigation.map { handler in
-                            { handler(highlight, tag) }
-                        }
-                    )
-                }
-
-                Button(action: {
-                    showCollectionPicker.toggle()
-                    if showCollectionPicker {
-                        allCollections = DatabaseManager.shared.allTags()
-                        collectionInput = ""
-                        pickerSelection = 0
-                    }
-                }) {
-                    Text(tags.isEmpty ? "+ add collection" : "+")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.tertiary)
-                }
-                .buttonStyle(.plain)
-                .help(tags.isEmpty ? "Add to a collection" : "Add to another collection")
-                .popover(isPresented: $showCollectionPicker, arrowEdge: .bottom) {
-                    collectionPickerContent
-                }
-            }
-
             Spacer(minLength: 8)
 
             // Inline confirmation — no pill, no background
@@ -285,183 +239,6 @@ struct CardDetailView: View {
             .font(.system(size: 12))
             .foregroundStyle(.quaternary)
     }
-
-    private var collectionPickerContent: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Search input
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
-                TextField("Search or create...", text: $collectionInput)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 13))
-                    .onSubmit { submitPickerSelection() }
-                    .onKeyPress(.downArrow) {
-                        pickerSelection = min(pickerSelection + 1, filteredCollections.count - 1)
-                        return .handled
-                    }
-                    .onKeyPress(.upArrow) {
-                        pickerSelection = max(pickerSelection - 1, 0)
-                        return .handled
-                    }
-                if !collectionInput.isEmpty {
-                    Button(action: { collectionInput = "" }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.tertiary)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .onChange(of: collectionInput) { _, _ in pickerSelection = 0 }
-
-            Divider()
-
-            // Existing collections list
-            if !filteredCollections.isEmpty {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 0) {
-                            ForEach(Array(filteredCollections.enumerated()), id: \.element.id) { index, tag in
-                                collectionRow(tag, isHighlighted: index == pickerSelection)
-                                    .id(tag.id)
-                            }
-                        }
-                        .padding(.vertical, 4)
-                    }
-                    .frame(maxHeight: 300)
-                    .onChange(of: pickerSelection) { _, newValue in
-                        if newValue < filteredCollections.count {
-                            proxy.scrollTo(filteredCollections[newValue].id, anchor: .center)
-                        }
-                    }
-                }
-            } else if collectionInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                Text("No collections yet")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 16)
-            } else {
-                Text("No matches")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-            }
-
-            // "Create new" at the bottom
-            if !collectionInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                let trimmed = collectionInput.trimmingCharacters(in: .whitespacesAndNewlines)
-                let exactMatch = filteredCollections.contains { $0.name.lowercased() == trimmed.lowercased() }
-                if !exactMatch {
-                    Divider()
-                    Button(action: { createOrApplyCollection() }) {
-                        HStack(spacing: 6) {
-                            Image(systemName: "plus.circle.fill")
-                                .font(.system(size: 13))
-                                .foregroundStyle(.blue)
-                            Text("Create \"\(trimmed)\"")
-                                .font(.system(size: 13))
-                                .foregroundStyle(.primary)
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-        .frame(width: 240)
-        .onAppear {
-            allCollections = DatabaseManager.shared.allTags()
-            pickerSelection = 0
-        }
-    }
-
-    /// Enter applies the highlighted collection, or creates a new one if no match.
-    private func submitPickerSelection() {
-        if !filteredCollections.isEmpty && pickerSelection < filteredCollections.count {
-            let tag = filteredCollections[pickerSelection]
-            let isApplied = tags.contains { $0.id == tag.id }
-            if isApplied { removeCollection(tag) } else { applyCollection(tag) }
-        } else {
-            createOrApplyCollection()
-        }
-    }
-
-    private func collectionRow(_ tag: Tag, isHighlighted: Bool = false) -> some View {
-        let isApplied = tags.contains { $0.id == tag.id }
-        return Button(action: {
-            if isApplied { removeCollection(tag) } else { applyCollection(tag) }
-        }) {
-            HStack(spacing: 8) {
-                // Emoji or folder icon — matches the sidebar style
-                if let emoji = tag.emoji, !emoji.isEmpty {
-                    Text(emoji)
-                        .font(.system(size: 13))
-                        .frame(width: 16)
-                } else {
-                    Image(systemName: "folder.fill")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .frame(width: 16)
-                }
-                Text(tag.name)
-                    .font(.system(size: 13))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                Spacer()
-                if isApplied {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(.blue)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 7)
-            .background(
-                isHighlighted ? Color.accentColor.opacity(0.12) :
-                isApplied ? Color.blue.opacity(0.04) : Color.clear
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var filteredCollections: [Tag] {
-        let trimmed = collectionInput.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if trimmed.isEmpty { return allCollections }
-        return allCollections.filter { $0.name.lowercased().contains(trimmed) }
-    }
-
-    private func createOrApplyCollection() {
-        let name = collectionInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else { return }
-        if let tag = DatabaseManager.shared.findOrCreateTag(name: name) {
-            applyCollection(tag)
-        }
-        collectionInput = ""
-    }
-
-    private func applyCollection(_ tag: Tag) {
-        guard !tags.contains(where: { $0.id == tag.id }) else { return }
-        DatabaseManager.shared.addTag(tag.id, toHighlight: highlight.id)
-        tags.append(tag)
-        allCollections = DatabaseManager.shared.allTags()
-    }
-
-    private func removeCollection(_ tag: Tag) {
-        DatabaseManager.shared.removeTag(tag.id, fromHighlight: highlight.id)
-        tags.removeAll { $0.id == tag.id }
-    }
-
-    // MARK: - Collections (moved to header bar — see collectionChips)
 
     // MARK: - Stacks
 
@@ -1055,9 +832,8 @@ private struct StackDetailRow: View {
     }
 }
 
-/// Inline chip rendering a stack's identity in the item detail view —
-/// visually distinguished from FlatTag (tags use `#name`; stacks use a
-/// stack icon + name). Hover reveals an X for removing the item from the stack.
+/// Inline chip rendering a stack's identity in the item detail view.
+/// Stack icon + name; hover reveals an X for removing the item from the stack.
 struct StackChip: View {
     let stack: Stack
     var onRemove: (() -> Void)?

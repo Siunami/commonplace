@@ -485,6 +485,12 @@ private final class FolderWatcher {
         "crdownload", "download", "part", "tmp", "partial", "opdownload"
     ]
 
+    // A single sweep that turns up more candidates than this is almost
+    // certainly a bulk move/unzip/restore/sync — not user-intent capture.
+    // Ingesting 2,700 old files at once is a much worse failure than
+    // skipping a legit 50-file download.
+    private static let bulkArrivalThreshold = 50
+
     struct PendingFile {
         let detectedAt: Date
         var lastSize: Int64
@@ -537,6 +543,7 @@ private final class FolderWatcher {
         let currentSet = Set(currentFiles)
         let newFiles = currentSet.subtracting(knownFiles)
 
+        var candidates: [String] = []
         for fileName in newFiles {
             // Skip hidden files
             guard !fileName.hasPrefix(".") else {
@@ -552,6 +559,21 @@ private final class FolderWatcher {
             let ext = (fileName as NSString).pathExtension.lowercased()
             guard !Self.skipExtensions.contains(ext) else { continue }
 
+            candidates.append(fileName)
+        }
+
+        // Bulk-arrival guard: unzip/restore/sync/Time Machine can drop
+        // thousands of files into a watched folder at once. Mark them seen
+        // so we don't keep re-processing, and skip capture.
+        if candidates.count > Self.bulkArrivalThreshold {
+            CaptureLog.warning(
+                "FileMonitor: bulk arrival in \(path) — \(candidates.count) files detected in one sweep, skipping capture"
+            )
+            knownFiles.formUnion(currentSet)
+            return
+        }
+
+        for fileName in candidates {
             let fullPath = (path as NSString).appendingPathComponent(fileName)
             let size = fileSize(at: fullPath) ?? 0
 

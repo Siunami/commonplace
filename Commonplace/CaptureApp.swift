@@ -54,13 +54,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             CaptureLog.warning("Screenshot storage exceeds 2 GB (\(diskUsageMB) MB) — consider cleanup")
         }
 
-        // Check screen recording permission
-        if !CGPreflightScreenCaptureAccess() {
-            CGRequestScreenCaptureAccess()
-            CaptureLog.info("Screen recording permission requested")
-        } else {
-            CaptureLog.info("Screen recording permission granted")
-        }
+        // Permissions: single source of truth for live state. The setup wizard
+        // drives the user through granting; no system prompts fire here.
+        PermissionsMonitor.shared.start()
+        PermissionsWindowController.shared.startWatchingForRevocation()
 
         // Menu bar status item — click opens Browse, right-click shows menu
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)

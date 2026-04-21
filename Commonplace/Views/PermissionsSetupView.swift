@@ -1,179 +1,213 @@
 import SwiftUI
 import AppKit
 
-/// First-run permissions setup window. Shows required permissions with
-/// live status updates. Auto-closes when all required permissions are granted.
+// Stepwise permissions gate. Presents one permission at a time; auto-advances
+// when the user grants it. Blocks access to the rest of the app until both
+// required permissions are granted.
 struct PermissionsSetupView: View {
     let onComplete: () -> Void
-    @State private var screenRecordingGranted = false
-    @State private var accessibilityGranted = false
-    @State private var pollTimer: Timer?
+    @ObservedObject private var perms = PermissionsMonitor.shared
+    @State private var didFinish = false
 
-    private var allRequired: Bool {
-        screenRecordingGranted && accessibilityGranted
+    private enum Step {
+        case screenRecording
+        case accessibility
+        case done
+    }
+
+    private var step: Step {
+        if !perms.screenRecordingGranted { return .screenRecording }
+        if !perms.accessibilityGranted { return .accessibility }
+        return .done
     }
 
     var body: some View {
-        VStack(spacing: 24) {
-            Spacer().frame(height: 8)
+        VStack(spacing: 0) {
+            header
 
-            // Header
-            VStack(spacing: 8) {
-                Image(systemName: "camera.viewfinder")
-                    .font(.system(size: 40))
-                    .foregroundStyle(.secondary)
+            Divider().opacity(0.4).padding(.top, 8)
 
-                Text("Permissions Required")
-                    .font(.title2.weight(.semibold))
+            stepIndicator
+                .padding(.top, 18)
+                .padding(.bottom, 8)
 
-                Text("Commonplace needs a couple of permissions to work properly.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
+            Group {
+                switch step {
+                case .screenRecording:
+                    permissionStep(
+                        icon: "rectangle.dashed.badge.record",
+                        iconColor: .red,
+                        title: "Enable Screen Recording",
+                        description: "Commonplace needs this to capture screenshots and record your screen.",
+                        buttonTitle: "Open System Settings",
+                        action: openScreenRecordingSettings
+                    )
+                case .accessibility:
+                    permissionStep(
+                        icon: "accessibility",
+                        iconColor: .blue,
+                        title: "Enable Accessibility",
+                        description: "Lets Commonplace intercept ⌘⇧3, ⌘⇧4, and ⌘⇧5 so screenshots flow into your archive instead of your desktop.",
+                        buttonTitle: "Open System Settings",
+                        action: openAccessibilitySettings
+                    )
+                case .done:
+                    doneStep
+                }
             }
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 32)
+            .padding(.vertical, 20)
+            .animation(.easeInOut(duration: 0.25), value: step)
 
-            // Permission cards
-            VStack(spacing: 12) {
-                permissionCard(
-                    icon: "rectangle.dashed.badge.record",
-                    iconColor: .red,
-                    title: "Screen & System Audio Recording",
-                    description: "Required to capture screenshots and record your screen.",
-                    isGranted: screenRecordingGranted,
-                    action: {
-                        CGRequestScreenCaptureAccess()
-                        openScreenRecordingSettings()
-                    }
-                )
+            Spacer(minLength: 0)
 
-                permissionCard(
-                    icon: "accessibility",
-                    iconColor: .blue,
-                    title: "Accessibility",
-                    description: "Required to intercept screenshot shortcuts and capture window context.",
-                    isGranted: accessibilityGranted,
-                    action: openAccessibilitySettings
-                )
-            }
-
-            // Continue button
-            Button(action: onComplete) {
-                Text(allRequired ? "Get Started" : "Continue Anyway")
-                    .font(.callout.weight(.medium))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 8)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(allRequired ? .accentColor : .gray)
-            .padding(.horizontal, 20)
-
-            Spacer().frame(height: 8)
+            footer
+                .padding(.horizontal, 20)
+                .padding(.bottom, 18)
         }
-        .padding(32)
-        .frame(width: 420)
-        .onAppear { startPolling() }
-        .onDisappear { pollTimer?.invalidate() }
+        .frame(width: 460, height: 520)
+        .onChange(of: perms.allGranted) { _, granted in
+            guard granted, !didFinish else { return }
+            didFinish = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { onComplete() }
+        }
     }
 
-    // MARK: - Permission Card
+    private var header: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "camera.viewfinder")
+                .font(.system(size: 38))
+                .foregroundStyle(.secondary)
+                .padding(.top, 28)
 
-    private func permissionCard(
+            Text("Welcome to Commonplace")
+                .font(.title3.weight(.semibold))
+
+            Text("Two quick permissions and you're set.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var stepIndicator: some View {
+        HStack(spacing: 10) {
+            stepDot(filled: true, done: perms.screenRecordingGranted, label: "Screen Recording")
+            Rectangle()
+                .fill(perms.screenRecordingGranted ? Color.green.opacity(0.6) : Color.primary.opacity(0.15))
+                .frame(width: 30, height: 1)
+            stepDot(
+                filled: perms.screenRecordingGranted,
+                done: perms.accessibilityGranted,
+                label: "Accessibility"
+            )
+        }
+    }
+
+    private func stepDot(filled: Bool, done: Bool, label: String) -> some View {
+        HStack(spacing: 6) {
+            ZStack {
+                Circle()
+                    .strokeBorder(filled ? Color.accentColor.opacity(0.6) : Color.primary.opacity(0.25), lineWidth: 1)
+                    .frame(width: 14, height: 14)
+                if done {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(.green)
+                } else if filled {
+                    Circle()
+                        .fill(Color.accentColor)
+                        .frame(width: 6, height: 6)
+                }
+            }
+            Text(label)
+                .font(.system(size: 10))
+                .foregroundStyle(filled ? .primary : .tertiary)
+        }
+    }
+
+    private func permissionStep(
         icon: String,
         iconColor: Color,
         title: String,
         description: String,
-        isGranted: Bool,
-        action: @escaping () -> Void,
-        isOptional: Bool = false
+        buttonTitle: String,
+        action: @escaping () -> Void
     ) -> some View {
-        HStack(spacing: 14) {
-            // Icon
+        VStack(spacing: 16) {
             Image(systemName: icon)
-                .font(.system(size: 20))
-                .foregroundStyle(iconColor.opacity(0.8))
-                .frame(width: 44, height: 44)
+                .font(.system(size: 36))
+                .foregroundStyle(iconColor)
+                .frame(width: 72, height: 72)
                 .background(iconColor.opacity(0.1))
                 .clipShape(Circle())
 
-            // Text
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
-                    Text(title)
-                        .font(.callout.weight(.medium))
-                    if isOptional {
-                        Text("optional")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.tertiary)
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1)
-                            .background(.quaternary.opacity(0.3))
-                            .clipShape(Capsule())
-                    }
-                }
+            VStack(spacing: 8) {
+                Text(title)
+                    .font(.title3.weight(.semibold))
 
                 Text(description)
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
-
-                // Status
-                if isGranted {
-                    HStack(spacing: 4) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.caption)
-                        Text("Granted")
-                            .font(.caption.weight(.medium))
-                    }
-                    .foregroundStyle(.green)
-                } else {
-                    Button(action: action) {
-                        HStack(spacing: 4) {
-                            Image(systemName: "arrow.up.forward")
-                                .font(.system(size: 9))
-                            Text("Open Settings")
-                                .font(.caption)
-                        }
-                        .foregroundStyle(Color.accentColor)
-                    }
-                    .buttonStyle(.plain)
-                }
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
+            Button(action: action) {
+                Text(buttonTitle)
+                    .font(.callout.weight(.medium))
+                    .frame(minWidth: 200)
+                    .padding(.vertical, 8)
+            }
+            .buttonStyle(.borderedProminent)
+            .keyboardShortcut(.defaultAction)
+
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text("Waiting for permission…")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.top, 4)
+        }
+    }
+
+    private var doneStep: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 48))
+                .foregroundStyle(.green)
+
+            Text("All set")
+                .font(.title2.weight(.semibold))
+
+            Text("Commonplace is ready.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+
+            Button(action: onComplete) {
+                Text("Get Started")
+                    .font(.callout.weight(.medium))
+                    .frame(minWidth: 200)
+                    .padding(.vertical, 8)
+            }
+            .buttonStyle(.borderedProminent)
+            .keyboardShortcut(.defaultAction)
+        }
+    }
+
+    private var footer: some View {
+        HStack {
+            Text("You can revisit these anytime in Settings.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
             Spacer()
-        }
-        .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(Color.primary.opacity(0.03))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10)
-                        .strokeBorder(isGranted ? Color.green.opacity(0.2) : Color.primary.opacity(0.08), lineWidth: 1)
-                )
-        )
-    }
-
-    // MARK: - Polling
-
-    private func startPolling() {
-        checkPermissions()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
-            checkPermissions()
+            Button("Quit") { NSApplication.shared.terminate(nil) }
+                .font(.caption2)
+                .buttonStyle(.plain)
+                .foregroundStyle(.tertiary)
         }
     }
-
-    private func checkPermissions() {
-        screenRecordingGranted = CGPreflightScreenCaptureAccess()
-        accessibilityGranted = AXIsProcessTrusted()
-
-        if allRequired {
-            pollTimer?.invalidate()
-            // Small delay so the user sees the green checkmarks
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                onComplete()
-            }
-        }
-    }
-
-    // MARK: - Open Settings
 
     private func openScreenRecordingSettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
@@ -194,17 +228,29 @@ final class PermissionsWindowController {
     static let shared = PermissionsWindowController()
 
     private var window: NSWindow?
-
-    private static let hasCompletedKey = "hasCompletedPermissionsSetup"
+    private var revocationObserver: NSObjectProtocol?
 
     var needsSetup: Bool {
-        !UserDefaults.standard.bool(forKey: Self.hasCompletedKey)
-        && !CGPreflightScreenCaptureAccess()
+        !PermissionsMonitor.shared.allGranted
     }
 
     func showIfNeeded() {
         guard needsSetup else { return }
         show()
+    }
+
+    func startWatchingForRevocation() {
+        guard revocationObserver == nil else { return }
+        revocationObserver = NotificationCenter.default.addObserver(
+            forName: .permissionsDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            if !PermissionsMonitor.shared.allGranted {
+                self.showIfNeeded()
+            }
+        }
     }
 
     func show() {
@@ -214,16 +260,15 @@ final class PermissionsWindowController {
             return
         }
 
-        let view = PermissionsSetupView {
-            UserDefaults.standard.set(true, forKey: Self.hasCompletedKey)
-            self.window?.close()
-            self.window = nil
+        let view = PermissionsSetupView { [weak self] in
+            self?.window?.close()
+            self?.window = nil
             BrowseWindowController.shared.show()
         }
 
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 480),
-            styleMask: [.titled, .closable, .fullSizeContentView],
+            contentRect: NSRect(x: 0, y: 0, width: 460, height: 520),
+            styleMask: [.titled, .fullSizeContentView],
             backing: .buffered,
             defer: true
         )
@@ -231,6 +276,7 @@ final class PermissionsWindowController {
         w.titleVisibility = .hidden
         w.titlebarAppearsTransparent = true
         w.isMovableByWindowBackground = true
+        w.level = .floating
         w.contentViewController = NSHostingController(rootView: view)
         w.center()
         w.makeKeyAndOrderFront(nil)

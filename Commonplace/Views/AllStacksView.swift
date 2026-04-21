@@ -60,7 +60,7 @@ struct AllStacksView: View {
     }
 
     private var gridColumns: [GridItem] {
-        [GridItem(.adaptive(minimum: 210), spacing: 20, alignment: .center)]
+        [GridItem(.adaptive(minimum: 236), spacing: 20, alignment: .center)]
     }
 
     // MARK: - Empty state

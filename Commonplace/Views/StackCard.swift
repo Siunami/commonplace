@@ -20,7 +20,7 @@ struct StackCard: View {
     private let cellSize: CGFloat = 58
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             // Center the mosaic horizontally within the card so single-item
             // stacks aren't left-shoved when the label text makes the card
             // wider than the mosaic itself.
@@ -28,17 +28,13 @@ struct StackCard: View {
                 Spacer(minLength: 0)
                 mosaic
                     .clipShape(RoundedRectangle(cornerRadius: 6))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6)
-                            .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
-                    )
                 Spacer(minLength: 0)
             }
 
             labelRow
         }
-        .padding(10)
-        .frame(width: 196)
+        .padding(12)
+        .frame(width: 220)
         .background(UITokens.surfaceCard)
         .clipShape(RoundedRectangle(cornerRadius: UITokens.radiusCard))
         .overlay(

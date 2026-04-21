@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import AVKit
 import Combine
 import UniformTypeIdentifiers
@@ -19,6 +20,41 @@ enum UITokens {
     static let chipBorder = Color.primary.opacity(0.1)
     static let linkColor = Color.primary.opacity(0.78)
     static let linkHoverColor = Color.primary
+
+    // MARK: - Surface elevation
+    //
+    // Three adaptive layers — background → card → floating. In dark mode
+    // each step is lighter than the last; in light mode each step is more
+    // saturated white. Borders + shadows add definition on top of the fill.
+
+    static let surfaceBackground = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(calibratedWhite: 0.09, alpha: 1.0)
+            : NSColor(calibratedWhite: 0.94, alpha: 1.0)
+    })
+
+    static let surfaceCard = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(calibratedWhite: 0.17, alpha: 1.0)
+            : NSColor.white
+    })
+
+    static let surfaceFloater = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(calibratedWhite: 0.22, alpha: 1.0)
+            : NSColor.white
+    })
+
+    static let surfaceBorder = Color.primary.opacity(0.08)
+    static let surfaceBorderStrong = Color.primary.opacity(0.14)
+
+    // Elevation shadows — stronger than the old 0.05/2pt to read in dark mode.
+    static let shadowCard = Color.black.opacity(0.22)
+    static let shadowFloater = Color.black.opacity(0.38)
+
+    // Corner radii.
+    static let radiusCard: CGFloat = 10
+    static let radiusFloater: CGFloat = 14
 }
 
 struct ChipBackground: ViewModifier {
@@ -271,6 +307,11 @@ struct BrowseView: View {
     @State private var pinnedOrigin: PinnedOrigin? = nil
     @State private var showSettings = false
     @State private var hasMore = false
+    @State private var pinnedStack: Stack? = nil
+    @State private var selectedStack: Stack? = nil
+    @State private var showStacks = false
+    @State private var fullScreenImage: NSImage?
+    @AppStorage("browseViewMode") private var viewMode: BrowseViewMode = .mosaic
     private let pageSize = 50
 
     // MARK: - Pinned origin (navigation breadcrumb)
@@ -340,6 +381,31 @@ struct BrowseView: View {
         .background(Color.accentColor.opacity(0.04))
     }
 
+    /// The pinned stack rendered as a compact, intrinsic-sized floating tile
+    /// at the bottom-center of the archive. Sized by content (small square
+    /// mosaic + label row) so it never dominates the window. The floater
+    /// The pinned stack lives just above the archive floor. It reuses the
+    /// same card surface as every other StackCard (no accent border, no
+    /// glow) and leans on the isPinned-driven stronger shadow plus the
+    /// pin-off badge to signal that it's the active container.
+    @ViewBuilder
+    private func pinnedStackFloater(_ pinned: Stack) -> some View {
+        StackCard(
+            stack: pinned,
+            isPinned: true,
+            onTap: {
+                selectedStack = pinned
+            }
+        )
+        .overlay(alignment: .topTrailing) {
+            StackUnpinBadge {
+                DatabaseManager.shared.setPinnedStack(id: nil)
+            }
+            .offset(x: 6, y: -6)
+        }
+        .id("pinned-stack-\(pinned.id)")
+    }
+
     // MARK: - Computed
 
     private var browseLoadRequest: BrowseLoadRequest {
@@ -397,7 +463,8 @@ struct BrowseView: View {
                 selectedApp: $selectedApp,
                 selectedFilter: $selectedFilter,
                 selectedTagIds: $selectedTagIds,
-                showSettings: $showSettings
+                showSettings: $showSettings,
+                showStacks: $showStacks
             )
             .onChange(of: selectedApp) { _, _ in
                 guard isActive else { return }
@@ -426,14 +493,25 @@ struct BrowseView: View {
 
             Divider()
 
-            if showSettings {
-                ScrollView {
-                    SettingsView()
-                        .frame(maxWidth: 500)
-                        .padding(24)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
+            ZStack(alignment: .bottom) {
+                // Darker surface than the sidebar so cards visually rest
+                // on a distinct backdrop — fundamental to the elevation
+                // hierarchy (background → card → floating).
+                UITokens.surfaceBackground
+                    .ignoresSafeArea()
+
+                if showSettings {
+                    ScrollView {
+                        SettingsView()
+                            .frame(maxWidth: 500)
+                            .padding(24)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if showStacks {
+                    AllStacksView(onOpenStack: { stack in
+                        withAnimation(.easeInOut(duration: 0.2)) { selectedStack = stack }
+                    })
+                } else {
 
             VStack(spacing: 0) {
                 // Breadcrumb: pinned origin from a tag navigation
@@ -442,7 +520,7 @@ struct BrowseView: View {
                     Divider()
                 }
 
-                if filteredHighlights.isEmpty && !showAddTile {
+                if filteredHighlights.isEmpty && !(showAddTile && viewMode == .mosaic) {
                     VStack(spacing: 12) {
                         Spacer()
                         Image(systemName: "tray")
@@ -470,26 +548,49 @@ struct BrowseView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     ScrollView {
-                        MasonryLayout(minColumnWidth: 260, spacing: 14, pinFirst: showAddTile) {
-                            if showAddTile {
-                                AddTile(tagIds: Array(selectedTagIds))
-                            }
-                            ForEach(filteredHighlights) { highlight in
-                                MasonryCard(
-                                    highlight: highlight,
-                                    noteCount: noteCounts[highlight.id] ?? 0,
-                                    cardTags: highlightTags[highlight.id] ?? [],
-                                    onTagTap: { tag in
+                        Group {
+                            switch viewMode {
+                            case .mosaic:
+                                MasonryLayout(minColumnWidth: 260, spacing: 14, pinFirst: showAddTile) {
+                                    if showAddTile {
+                                        AddTile(tagIds: Array(selectedTagIds))
+                                    }
+                                    ForEach(filteredHighlights) { highlight in
+                                        MasonryCard(
+                                            highlight: highlight,
+                                            noteCount: noteCounts[highlight.id] ?? 0,
+                                            cardTags: highlightTags[highlight.id] ?? [],
+                                            onTagTap: { tag in
+                                                navigateToTag(from: highlight, tag: tag)
+                                            },
+                                            onImageFullscreen: { image in
+                                                withAnimation(.easeInOut(duration: 0.2)) { fullScreenImage = image }
+                                            }
+                                        )
+                                        .id(highlight.id)
+                                        .onTapGesture {
+                                            withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = highlight }
+                                        }
+                                    }
+                                }
+                                .padding(.horizontal, 16).padding(.vertical, 12)
+                            case .history:
+                                HistoryListView(
+                                    highlights: filteredHighlights,
+                                    noteCounts: noteCounts,
+                                    highlightTags: highlightTags,
+                                    onSelect: { highlight in
+                                        withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = highlight }
+                                    },
+                                    onTagTap: { highlight, tag in
                                         navigateToTag(from: highlight, tag: tag)
                                     }
                                 )
-                                .id(highlight.id)
-                                .onTapGesture {
-                                    withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = highlight }
-                                }
                             }
                         }
-                        .padding(.horizontal, 16).padding(.vertical, 12)
+                        // Reserve clearance below the last card so the floating
+                        // pinned stack doesn't obscure content at the bottom.
+                        .padding(.bottom, pinnedStack != nil ? 220 : 0)
                     }
                     .onScrollGeometryChange(for: Bool.self) { geo in
                         // True when scrolled within 400pt of the bottom of the content
@@ -522,6 +623,7 @@ struct BrowseView: View {
                     Text("\(filteredHighlights.count) captures")
                         .font(.caption)
                         .foregroundStyle(.tertiary)
+                    BrowseViewModeToggle(viewMode: $viewMode)
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
@@ -553,11 +655,13 @@ struct BrowseView: View {
             }
 
             } // end else (showSettings)
+            } // end ZStack
         }
         .onAppear {
             isActive = true
             loadCaptures(reset: true)
             refreshSidebarData()
+            pinnedStack = DatabaseManager.shared.pinnedStack()
         }
         .onDisappear { isActive = false }
         .onReceive(NotificationCenter.default.publisher(for: BrowseWindowController.windowDidShowNotification)) { _ in
@@ -610,6 +714,14 @@ struct BrowseView: View {
         .onReceive(NotificationCenter.default.publisher(for: BrowseWindowController.showSettingsNotification)) { _ in
             showSettings = true
         }
+        .onReceive(NotificationCenter.default.publisher(for: .stackDataDidChange).receive(on: DispatchQueue.main)) { _ in
+            pinnedStack = DatabaseManager.shared.pinnedStack()
+            // Keep selectedStack in sync if the active one was renamed/updated
+            if let sel = selectedStack,
+               let refreshed = DatabaseManager.shared.stack(byId: sel.id) {
+                selectedStack = refreshed
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: BrowseWindowController.showTagFilterNotification)) { notification in
             guard let tagId = notification.userInfo?["tagId"] as? String else { return }
             selectedFilter = .all
@@ -644,6 +756,15 @@ struct BrowseView: View {
                         onDismiss: { withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = nil } },
                         onTagNavigation: { origin, tag in
                             navigateToTag(from: origin, tag: tag)
+                        },
+                        onStackNavigation: { stack in
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                selectedHighlight = nil
+                                selectedStack = stack
+                            }
+                        },
+                        onImageFullscreen: { image in
+                            withAnimation(.easeInOut(duration: 0.2)) { fullScreenImage = image }
                         }
                     )
                         .id(highlight.id)
@@ -655,6 +776,61 @@ struct BrowseView: View {
                 }
                 .transition(.opacity)
                 .onExitCommand { withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = nil } }
+            }
+        }
+        .overlay {
+            if let stack = selectedStack {
+                ZStack {
+                    Color.black.opacity(0.3)
+                        .ignoresSafeArea()
+                        .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { selectedStack = nil } }
+
+                    StackDetailView(
+                        stack: stack,
+                        onDismiss: { withAnimation(.easeInOut(duration: 0.2)) { selectedStack = nil } },
+                        onOpenHighlight: { highlight in
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                selectedStack = nil
+                                selectedHighlight = highlight
+                            }
+                        }
+                    )
+                    .id(stack.id)
+                    .frame(maxWidth: 900, maxHeight: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .shadow(color: .black.opacity(0.25), radius: 16, y: 4)
+                    .padding(40)
+                }
+                .transition(.opacity)
+            }
+        }
+        .overlay {
+            if let image = fullScreenImage {
+                FullImageViewer(
+                    image: image,
+                    onDismiss: {
+                        withAnimation(.easeInOut(duration: 0.2)) { fullScreenImage = nil }
+                    }
+                )
+                .transition(.opacity)
+            }
+        }
+        // Pinned stack floater — rendered as the topmost overlay so it's
+        // always reachable, even when a highlight or stack detail view
+        // is open on top of the archive. Anchored to the bottom of the
+        // masonry area (right side of the HStack), not the full window —
+        // Anchored to the bottom-right corner with fixed padding from
+        // both edges. Because StackCard is intrinsic-sized, adding more
+        // items to the mosaic grows the card up and to the left — the
+        // bottom-right anchor point stays put.
+        // Hidden only when the pinned stack's own detail view is
+        // showing (to avoid a duplicate).
+        .overlay(alignment: .bottomTrailing) {
+            if let pinned = pinnedStack, selectedStack?.id != pinned.id {
+                pinnedStackFloater(pinned)
+                    .padding(.trailing, 24)
+                    .padding(.bottom, 36)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
     }
@@ -683,7 +859,11 @@ struct BrowseView: View {
                 shouldRefreshFacets ? db.appFacets() : nil
 
             await MainActor.run {
-                highlights.append(contentsOf: batch)
+                // Guard against parallel in-flight loads each appending
+                // the same page — otherwise ForEach sees duplicate IDs.
+                let existingIds = Set(highlights.map(\.id))
+                let newItems = batch.filter { !existingIds.contains($0.id) }
+                highlights.append(contentsOf: newItems)
                 highlightsOffset += batch.count
                 hasMore = batch.count == limit
                 noteCounts.merge(newCounts) { _, new in new }
@@ -869,6 +1049,7 @@ private struct MasonryCard: View {
     var noteCount: Int = 0
     var cardTags: [Tag] = []
     var onTagTap: ((Tag) -> Void)? = nil
+    var onImageFullscreen: ((NSImage) -> Void)? = nil
     @State private var isHovered = false
     @State private var isLinkHovered = false
 
@@ -916,28 +1097,15 @@ private struct MasonryCard: View {
                 .padding(.vertical, 14)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-
-            if !cardTags.isEmpty {
-                HStack(spacing: 5) {
-                    ForEach(cardTags.prefix(3)) { tag in
-                        TagChip(name: tag.name, onTap: onTagTap.map { handler in
-                            { handler(tag) }
-                        })
-                    }
-                    if cardTags.count > 3 {
-                        Text("+\(cardTags.count - 3)")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-                .padding(.horizontal, 10)
-                .padding(.bottom, 10)
-            }
         }
-        .background(Color(.windowBackgroundColor))
+        .background(UITokens.surfaceCard)
         .clipped()
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        .shadow(color: .black.opacity(0.05), radius: 2, y: 1)
+        .clipShape(RoundedRectangle(cornerRadius: UITokens.radiusCard))
+        .overlay(
+            RoundedRectangle(cornerRadius: UITokens.radiusCard)
+                .strokeBorder(UITokens.surfaceBorder, lineWidth: 0.5)
+        )
+        .shadow(color: UITokens.shadowCard, radius: 6, y: 2)
         .overlay(alignment: .topTrailing) {
             if hasSourceUrl && isHovered {
                 Button(action: {
@@ -1019,20 +1187,20 @@ private struct MasonryCard: View {
     private var cardContent: some View {
         switch highlight.highlightType {
         case "screenshot":
-            ScreenshotCard(highlight: highlight)
+            ScreenshotCard(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap, onImageFullscreen: onImageFullscreen)
         case "recording":
-            ScreenshotCard(highlight: highlight)
+            ScreenshotCard(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap, onImageFullscreen: nil)
         case "highlight":
-            HighlightCard(highlight: highlight)
+            HighlightCard(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
         case "note":
-            NoteCard(highlight: highlight)
+            NoteCard(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
         case "file":
-            FileCard(highlight: highlight)
+            FileCard(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap, onImageFullscreen: onImageFullscreen)
         default:
             if highlight.isURLCopy {
-                LinkCard(highlight: highlight)
+                LinkCard(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
             } else {
-                TextCard(highlight: highlight)
+                TextCard(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
             }
         }
     }
@@ -1044,13 +1212,18 @@ private struct MasonryCard: View {
         // Ensure the whole thing is a URL, not a paragraph containing one.
         return !trimmed.contains(" ") && !trimmed.contains("\n")
     }
+
 }
 
 // MARK: - Screenshot Card
 
 private struct ScreenshotCard: View {
     let highlight: Highlight
+    var cardTags: [Tag] = []
+    var onTagTap: ((Tag) -> Void)? = nil
+    var onImageFullscreen: ((NSImage) -> Void)? = nil
     @State private var image: NSImage?
+    @State private var imageHovered = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1058,6 +1231,14 @@ private struct ScreenshotCard: View {
                 Image(nsImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
+                    .overlay(alignment: .topTrailing) {
+                        if let onImageFullscreen {
+                            ExpandImageButton(isHovered: imageHovered) {
+                                onImageFullscreen(image)
+                            }
+                        }
+                    }
+                    .onHover { imageHovered = $0 }
             } else {
                 Rectangle()
                     .fill(.quaternary.opacity(0.3))
@@ -1068,12 +1249,7 @@ private struct ScreenshotCard: View {
                     }
             }
 
-            Text(CardMetadata.timeAgo(from: highlight.date))
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .frame(maxWidth: .infinity, alignment: .trailing)
+            CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
         }
         .task {
             if image == nil {
@@ -1207,6 +1383,8 @@ struct InlineVideoPlayer: NSViewRepresentable {
 
 private struct TextCard: View {
     let highlight: Highlight
+    var cardTags: [Tag] = []
+    var onTagTap: ((Tag) -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1224,12 +1402,7 @@ private struct TextCard: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            Text(CardMetadata.timeAgo(from: highlight.date))
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .padding(.horizontal, 10)
-                .padding(.bottom, 8)
-                .frame(maxWidth: .infinity, alignment: .trailing)
+            CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
         }
     }
 }
@@ -1238,6 +1411,8 @@ private struct TextCard: View {
 
 private struct HighlightCard: View {
     let highlight: Highlight
+    var cardTags: [Tag] = []
+    var onTagTap: ((Tag) -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1255,12 +1430,7 @@ private struct HighlightCard: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            Text(CardMetadata.timeAgo(from: highlight.date))
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .padding(.horizontal, 10)
-                .padding(.bottom, 8)
-                .frame(maxWidth: .infinity, alignment: .trailing)
+            CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
         }
     }
 }
@@ -1269,6 +1439,8 @@ private struct HighlightCard: View {
 
 private struct NoteCard: View {
     let highlight: Highlight
+    var cardTags: [Tag] = []
+    var onTagTap: ((Tag) -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1281,12 +1453,7 @@ private struct NoteCard: View {
                 .padding(.bottom, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-            Text(CardMetadata.timeAgo(from: highlight.date))
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .padding(.horizontal, 10)
-                .padding(.bottom, 8)
-                .frame(maxWidth: .infinity, alignment: .trailing)
+            CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
         }
     }
 }
@@ -1295,8 +1462,16 @@ private struct NoteCard: View {
 
 private struct FileCard: View {
     let highlight: Highlight
+    var cardTags: [Tag] = []
+    var onTagTap: ((Tag) -> Void)? = nil
+    var onImageFullscreen: ((NSImage) -> Void)? = nil
     @State private var thumbnail: NSImage?
     @State private var fileRecord: FileRecord?
+    @State private var imageHovered = false
+
+    private var isImageFile: Bool {
+        fileRecord?.contentType == "image"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1307,6 +1482,20 @@ private struct FileCard: View {
                         .aspectRatio(contentMode: .fill)
                         .frame(maxWidth: .infinity, minHeight: 120, maxHeight: 220)
                         .clipped()
+                        .overlay(alignment: .topTrailing) {
+                            if isImageFile, let onImageFullscreen {
+                                ExpandImageButton(isHovered: imageHovered) {
+                                    // Prefer the original image over the thumbnail.
+                                    if let rec = fileRecord,
+                                       let full = NSImage(contentsOfFile: rec.filePath) {
+                                        onImageFullscreen(full)
+                                    } else {
+                                        onImageFullscreen(thumbnail)
+                                    }
+                                }
+                            }
+                        }
+                        .onHover { imageHovered = $0 }
 
                     if let pages = fileRecord?.pageCount, pages > 0 {
                         Text("\(pages) pg")
@@ -1339,18 +1528,16 @@ private struct FileCard: View {
                     }
             }
 
-            HStack {
-                Text(fileRecord?.fileName ?? URL(fileURLWithPath: highlight.contentText).lastPathComponent)
-                    .font(.caption)
-                    .lineLimit(2)
-                    .truncationMode(.middle)
-                Spacer()
-                Text(CardMetadata.timeAgo(from: highlight.date))
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
+            Text(fileRecord?.fileName ?? URL(fileURLWithPath: highlight.contentText).lastPathComponent)
+                .font(.caption)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10)
+                .padding(.top, 8)
+                .padding(.bottom, 2)
+
+            CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
         }
         .contextMenu {
             Button("Open") {
@@ -1404,6 +1591,8 @@ private struct FileCard: View {
 
 private struct LinkCard: View {
     let highlight: Highlight
+    var cardTags: [Tag] = []
+    var onTagTap: ((Tag) -> Void)? = nil
     @State private var preview: LinkPreview?
     @State private var heroImage: NSImage?
     @State private var faviconImage: NSImage?
@@ -1481,24 +1670,21 @@ private struct LinkCard: View {
                             .truncationMode(.tail)
                             .multilineTextAlignment(.leading)
 
-                        HStack(spacing: 4) {
-                            if let app = highlight.sourceApp {
-                                Text(app)
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                            }
-                            Spacer()
-                            Text(CardMetadata.timeAgo(from: highlight.date))
+                        if let app = highlight.sourceApp {
+                            Text(app)
                                 .font(.caption2)
                                 .foregroundStyle(.tertiary)
                         }
                     }
                     .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
+                    .padding(.top, 8)
+                    .padding(.bottom, 2)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             .buttonStyle(.plain)
+
+            CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
         }
         .contextMenu {
             Button("Open in Browser", action: openURL)
@@ -1859,6 +2045,46 @@ enum CardMetadata {
     }
 }
 
+/// Standard bottom row for every masonry card: the persistent
+/// AddToStackButton on the leading edge, tag chips in the middle,
+/// timestamp on the trailing edge.
+///
+/// The row uses a fixed minHeight so adding a tag doesn't change the
+/// card's overall height — which would otherwise reshuffle the masonry.
+private struct CardFooterRow: View {
+    let highlight: Highlight
+    var cardTags: [Tag] = []
+    var onTagTap: ((Tag) -> Void)? = nil
+
+    var body: some View {
+        HStack(spacing: 6) {
+            AddToStackButton(highlightId: highlight.id)
+            if !cardTags.isEmpty {
+                HStack(spacing: 4) {
+                    ForEach(cardTags.prefix(2)) { tag in
+                        TagChip(name: tag.name, onTap: onTagTap.map { handler in
+                            { handler(tag) }
+                        })
+                    }
+                    if cardTags.count > 2 {
+                        Text("+\(cardTags.count - 2)")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                .lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            Text(CardMetadata.timeAgo(from: highlight.date))
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .frame(minHeight: 32)
+    }
+}
+
 private struct CardMetadataFooter: View {
     let highlight: Highlight
 
@@ -1906,3 +2132,512 @@ private struct CardMetadataFooter: View {
 }
 
 // CardDetailView and StableVideoPlayer live in CardDetailView.swift
+
+// MARK: - Browse View Mode
+
+enum BrowseViewMode: String, CaseIterable {
+    case mosaic
+    case history
+}
+
+private struct BrowseViewModeToggle: View {
+    @Binding var viewMode: BrowseViewMode
+
+    var body: some View {
+        HStack(spacing: 2) {
+            button(mode: .mosaic, icon: "square.grid.2x2.fill", help: "Mosaic")
+            button(mode: .history, icon: "list.bullet", help: "History")
+        }
+        .padding(2)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(UITokens.chipFill)
+        )
+    }
+
+    @ViewBuilder
+    private func button(mode: BrowseViewMode, icon: String, help: String) -> some View {
+        let selected = viewMode == mode
+        Button(action: { viewMode = mode }) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(selected ? .primary : Color.secondary.opacity(0.7))
+                .frame(width: 22, height: 18)
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(selected ? UITokens.surfaceCard : Color.clear)
+                        .shadow(color: selected ? UITokens.shadowCard : .clear, radius: 2, y: 1)
+                )
+                .contentShape(RoundedRectangle(cornerRadius: 4))
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+}
+
+// MARK: - History Grouping
+//
+// Chronologically ordered captures are split first by calendar day, then by
+// "burst" inside each day — a burst is a run of items within `burstGap`
+// seconds of each other. Bursts surface the natural rhythm of capture
+// sessions ("everything I grabbed while researching X at 2 PM") without the
+// user having to eyeball timestamps. A 30-minute gap is the default
+// boundary; long enough that a short coffee break doesn't split a session,
+// short enough that morning vs. afternoon work remains distinct.
+
+struct HistoryCluster: Identifiable {
+    let id = UUID()
+    let highlights: [Highlight]  // newest first within the cluster
+
+    var itemCount: Int { highlights.count }
+    var startDate: Date { highlights.last?.date ?? Date() }
+    var endDate: Date { highlights.first?.date ?? Date() }
+
+    var rangeLabel: String {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        let s = f.string(from: startDate)
+        let e = f.string(from: endDate)
+        return s == e ? s : "\(s) – \(e)"
+    }
+}
+
+struct HistoryDay: Identifiable {
+    let id: Date  // start-of-day; unique per day
+    let label: String
+    let clusters: [HistoryCluster]
+
+    var totalCount: Int { clusters.reduce(0) { $0 + $1.itemCount } }
+    var allHighlightIds: [String] { clusters.flatMap { $0.highlights.map(\.id) } }
+}
+
+enum HistoryGrouping {
+    static let burstGap: TimeInterval = 30 * 60  // 30 minutes
+
+    static func group(_ highlights: [Highlight]) -> [HistoryDay] {
+        guard !highlights.isEmpty else { return [] }
+        let calendar = Calendar.current
+        var days: [HistoryDay] = []
+
+        var dayStart: Date? = nil
+        var dayClusters: [HistoryCluster] = []
+        var clusterItems: [Highlight] = []
+        var lastItemDate: Date? = nil
+
+        func flushCluster() {
+            guard !clusterItems.isEmpty else { return }
+            dayClusters.append(HistoryCluster(highlights: clusterItems))
+            clusterItems = []
+        }
+        func flushDay() {
+            flushCluster()
+            guard let start = dayStart, !dayClusters.isEmpty else { return }
+            days.append(HistoryDay(
+                id: start,
+                label: dayLabel(for: start, calendar: calendar),
+                clusters: dayClusters
+            ))
+            dayClusters = []
+        }
+
+        for h in highlights {
+            let itemDay = calendar.startOfDay(for: h.date)
+            if dayStart == nil {
+                dayStart = itemDay
+            } else if itemDay != dayStart {
+                flushDay()
+                dayStart = itemDay
+                lastItemDate = nil
+            }
+            // highlights arrive newest-first, so `last - current` is the gap
+            if let last = lastItemDate, last.timeIntervalSince(h.date) > burstGap {
+                flushCluster()
+            }
+            clusterItems.append(h)
+            lastItemDate = h.date
+        }
+        flushDay()
+        return days
+    }
+
+    static func dayLabel(for date: Date, calendar: Calendar) -> String {
+        if calendar.isDateInToday(date) { return "Today" }
+        if calendar.isDateInYesterday(date) { return "Yesterday" }
+        let f = DateFormatter()
+        let now = Date()
+        if calendar.isDate(date, equalTo: now, toGranularity: .weekOfYear) {
+            f.dateFormat = "EEEE"
+        } else if calendar.isDate(date, equalTo: now, toGranularity: .year) {
+            f.dateFormat = "EEEE, MMM d"
+        } else {
+            f.dateFormat = "MMM d, yyyy"
+        }
+        return f.string(from: date)
+    }
+}
+
+// MARK: - History List
+
+private struct HistoryListView: View {
+    let highlights: [Highlight]
+    let noteCounts: [String: Int]
+    let highlightTags: [String: [Tag]]
+    let onSelect: (Highlight) -> Void
+    let onTagTap: (Highlight, Tag) -> Void
+
+    private var days: [HistoryDay] { HistoryGrouping.group(highlights) }
+
+    var body: some View {
+        LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
+            ForEach(days) { day in
+                Section {
+                    ForEach(Array(day.clusters.enumerated()), id: \.element.id) { _, cluster in
+                        HistoryClusterHeader(cluster: cluster)
+                        ForEach(Array(cluster.highlights.enumerated()), id: \.element.id) { idx, h in
+                            HistoryRow(
+                                highlight: h,
+                                noteCount: noteCounts[h.id] ?? 0,
+                                cardTags: highlightTags[h.id] ?? [],
+                                onTagTap: { onTagTap(h, $0) }
+                            )
+                            .contentShape(Rectangle())
+                            .onTapGesture { onSelect(h) }
+                            if idx < cluster.highlights.count - 1 {
+                                Divider()
+                                    .opacity(0.4)
+                                    .padding(.leading, 76)
+                            }
+                        }
+                    }
+                } header: {
+                    HistoryDayHeader(day: day)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Day Header
+
+private struct HistoryDayHeader: View {
+    let day: HistoryDay
+    @State private var isHovered = false
+    @State private var justAdded = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(day.label.uppercased())
+                .font(.system(size: 11, weight: .semibold))
+                .tracking(UITokens.sectionLabelTracking)
+                .foregroundStyle(.secondary)
+            Text("\(day.totalCount) \(day.totalCount == 1 ? "capture" : "captures")")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            Spacer()
+            Button(action: addAll) {
+                HStack(spacing: 4) {
+                    Image(systemName: justAdded ? "checkmark" : "rectangle.stack.badge.plus")
+                        .font(.system(size: 10, weight: .medium))
+                    Text(justAdded ? "Added day" : "Add day to stack")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .foregroundStyle(justAdded ? Color.accentColor : .secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(justAdded
+                              ? Color.accentColor.opacity(0.1)
+                              : (isHovered ? Color.primary.opacity(0.06) : Color.clear))
+                )
+            }
+            .buttonStyle(.plain)
+            .opacity(isHovered || justAdded ? 1 : 0)
+            .help("Add every capture from this day into the pinned stack")
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+        .background(UITokens.surfaceBackground)
+        .overlay(alignment: .bottom) {
+            Divider().opacity(0.6)
+        }
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.12)) { isHovered = hovering }
+        }
+    }
+
+    private func addAll() {
+        _ = DatabaseManager.shared.addHighlightsToPinnedOrNewStack(day.allHighlightIds)
+        withAnimation(.easeInOut(duration: 0.2)) { justAdded = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            withAnimation(.easeOut(duration: 0.25)) { justAdded = false }
+        }
+    }
+}
+
+// MARK: - Cluster Header
+
+private struct HistoryClusterHeader: View {
+    let cluster: HistoryCluster
+    @State private var isHovered = false
+    @State private var justAdded = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Rectangle()
+                .fill(Color.secondary.opacity(0.25))
+                .frame(width: 32, height: 1)
+            Text(cluster.rangeLabel)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+            Text("·")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            Text("\(cluster.itemCount) item\(cluster.itemCount == 1 ? "" : "s")")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            Spacer()
+            Button(action: addAll) {
+                HStack(spacing: 4) {
+                    Image(systemName: justAdded ? "checkmark" : "rectangle.stack.badge.plus")
+                        .font(.system(size: 10, weight: .medium))
+                    Text(justAdded ? "Added" : "Add all to stack")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .foregroundStyle(justAdded ? Color.accentColor : .secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(justAdded
+                              ? Color.accentColor.opacity(0.1)
+                              : (isHovered ? Color.primary.opacity(0.06) : Color.clear))
+                )
+            }
+            .buttonStyle(.plain)
+            .opacity(isHovered || justAdded ? 1 : 0)
+            .help("Add every capture in this time window into the pinned stack")
+        }
+        .padding(.horizontal, 20)
+        .padding(.top, 16)
+        .padding(.bottom, 6)
+        .contentShape(Rectangle())
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.12)) { isHovered = hovering }
+        }
+    }
+
+    private func addAll() {
+        let ids = cluster.highlights.map(\.id)
+        _ = DatabaseManager.shared.addHighlightsToPinnedOrNewStack(ids)
+        withAnimation(.easeInOut(duration: 0.2)) { justAdded = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            withAnimation(.easeOut(duration: 0.25)) { justAdded = false }
+        }
+    }
+}
+
+// MARK: - History Row
+
+private struct HistoryRow: View {
+    let highlight: Highlight
+    var noteCount: Int = 0
+    var cardTags: [Tag] = []
+    var onTagTap: ((Tag) -> Void)? = nil
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            HistoryRowThumbnail(highlight: highlight)
+                .frame(width: 44, height: 44)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(UITokens.surfaceBorder, lineWidth: 0.5)
+                )
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(primaryText)
+                    .font(.system(.callout, design: .serif))
+                    .foregroundStyle(.primary.opacity(0.88))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let annotation = highlight.userNote, !annotation.isEmpty {
+                    Text(annotation)
+                        .font(.caption)
+                        .foregroundStyle(.orange.opacity(0.85))
+                        .lineLimit(1)
+                }
+
+                HStack(spacing: 6) {
+                    if let meta = secondaryMeta {
+                        Text(meta)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                    }
+                    if !cardTags.isEmpty {
+                        HStack(spacing: 4) {
+                            ForEach(cardTags.prefix(3)) { tag in
+                                TagChip(name: tag.name, onTap: onTagTap.map { handler in
+                                    { handler(tag) }
+                                })
+                            }
+                            if cardTags.count > 3 {
+                                Text("+\(cardTags.count - 3)")
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                    }
+                    if noteCount > 0 {
+                        HStack(spacing: 3) {
+                            Image(systemName: "text.bubble")
+                                .font(.system(size: 9))
+                            Text("\(noteCount)")
+                                .font(.system(size: 10, weight: .medium))
+                        }
+                        .foregroundStyle(.tertiary)
+                    }
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            VStack(alignment: .trailing, spacing: 6) {
+                Text(timeString)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .monospacedDigit()
+                AddToStackButton(highlightId: highlight.id)
+                    .opacity(isHovered ? 1 : 0)
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .background(isHovered ? Color.primary.opacity(0.03) : Color.clear)
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.1)) { isHovered = hovering }
+        }
+    }
+
+    private var primaryText: String {
+        switch highlight.highlightType {
+        case "screenshot": return "Screenshot"
+        case "recording": return "Recording"
+        case "file":
+            let name = (highlight.contentText as NSString).lastPathComponent
+            return name.isEmpty ? "File" : name
+        default:
+            let trimmed = highlight.contentText.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? "(empty)" : trimmed
+        }
+    }
+
+    private var secondaryMeta: String? {
+        var parts: [String] = []
+        if let app = highlight.sourceApp, !app.isEmpty { parts.append(app) }
+        if let short = CardMetadata.shortURL(from: highlight.sourceUrl) {
+            parts.append(short)
+        }
+        if parts.isEmpty, let wt = highlight.windowTitle, !wt.isEmpty {
+            parts.append(wt)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private var timeString: String {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        return f.string(from: highlight.date)
+    }
+}
+
+// MARK: - History Row Thumbnail
+
+private struct HistoryRowThumbnail: View {
+    let highlight: Highlight
+    @State private var image: NSImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                ZStack {
+                    Rectangle().fill(iconBackground)
+                    Image(systemName: iconName)
+                        .font(.system(size: 16, weight: .regular))
+                        .foregroundStyle(iconColor)
+                }
+            }
+        }
+        .task(id: highlight.id) {
+            await loadImageIfNeeded()
+        }
+    }
+
+    private var iconName: String {
+        switch highlight.highlightType {
+        case "screenshot": return "photo"
+        case "recording": return "video"
+        case "highlight": return "quote.opening"
+        case "note": return "square.and.pencil"
+        case "file": return "doc"
+        default: return highlight.isURLCopy ? "link" : "text.alignleft"
+        }
+    }
+
+    private var iconColor: Color {
+        switch highlight.highlightType {
+        case "highlight": return .orange.opacity(0.85)
+        case "note": return .blue.opacity(0.8)
+        default:
+            return highlight.isURLCopy ? .blue.opacity(0.75) : .secondary
+        }
+    }
+
+    private var iconBackground: Color {
+        switch highlight.highlightType {
+        case "highlight": return .orange.opacity(0.1)
+        case "note": return .blue.opacity(0.08)
+        default:
+            return highlight.isURLCopy ? Color.blue.opacity(0.07) : UITokens.chipFill
+        }
+    }
+
+    private func loadImageIfNeeded() async {
+        guard image == nil else { return }
+        let type = highlight.highlightType
+        let path = highlight.contentText
+        if type == "screenshot" || type == "recording" || type == "file" {
+            let direct = await Task.detached(priority: .utility) {
+                NSImage(contentsOfFile: path)
+            }.value
+            if let direct {
+                self.image = direct
+                return
+            }
+            if let live = await LiveThumbnail.generate(for: URL(fileURLWithPath: path)) {
+                self.image = live
+                return
+            }
+            if let fileId = highlight.fileId,
+               let rec = DatabaseManager.shared.fileRecord(byId: fileId),
+               let thumbPath = rec.thumbnailPath {
+                let thumb = await Task.detached(priority: .utility) {
+                    NSImage(contentsOfFile: thumbPath)
+                }.value
+                if let thumb {
+                    self.image = thumb
+                }
+            }
+        }
+    }
+}

@@ -11,6 +11,7 @@ struct CaptureFilterSidebar: View {
     @Binding var selectedFilter: CaptureFilter
     @Binding var selectedTagIds: Set<String>
     @Binding var showSettings: Bool
+    @Binding var showStacks: Bool
     @State private var emojiPickerTagId: String?
     @State private var renamingTagId: String?
     @State private var renameText: String = ""
@@ -23,6 +24,9 @@ struct CaptureFilterSidebar: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    // Stacks — provisional, lightweight grouping
+                    stacksRow
+
                     // Collections (tags) — first, only those with items
                     if !allTags.isEmpty {
                         collectionsSection
@@ -41,7 +45,7 @@ struct CaptureFilterSidebar: View {
 
             Divider()
 
-            Button(action: { cancelRename(); showSettings.toggle() }) {
+            Button(action: { cancelRename(); showSettings.toggle(); if showSettings { showStacks = false } }) {
                 HStack(spacing: 8) {
                     Image(systemName: "gear")
                         .font(.caption)
@@ -60,6 +64,39 @@ struct CaptureFilterSidebar: View {
             .foregroundStyle(showSettings ? .primary : .secondary)
         }
         .frame(width: 200)
+    }
+
+    // MARK: - Stacks
+
+    private var stacksRow: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "rectangle.stack")
+                .font(.caption)
+                .frame(width: 16)
+            Text("Stacks")
+                .font(.callout)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(showStacks ? Color.accentColor.opacity(0.15) : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .contentShape(Rectangle())
+        .foregroundStyle(showStacks ? .primary : .secondary)
+        .onTapGesture { selectStacks() }
+    }
+
+    private func selectStacks() {
+        cancelRename()
+        NSApp.keyWindow?.makeFirstResponder(nil)
+        showStacks.toggle()
+        if showStacks {
+            showSettings = false
+            selectedFilter = .all
+            selectedApp = nil
+            selectedTagIds = []
+        }
     }
 
     // MARK: - Collections (Tags)
@@ -216,6 +253,7 @@ struct CaptureFilterSidebar: View {
         selectedFilter = .all
         selectedApp = nil
         showSettings = false
+        showStacks = false
     }
 
     // MARK: - Type Filters
@@ -277,6 +315,7 @@ struct CaptureFilterSidebar: View {
         selectedApp = nil
         selectedTagIds = []
         showSettings = false
+        showStacks = false
     }
 
     // MARK: - Source Apps
@@ -326,6 +365,7 @@ struct CaptureFilterSidebar: View {
         selectedFilter = .all
         selectedTagIds = []
         showSettings = false
+        showStacks = false
     }
 
     @ViewBuilder

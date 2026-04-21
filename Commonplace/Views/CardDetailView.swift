@@ -2,6 +2,7 @@ import SwiftUI
 import AVKit
 import PDFKit
 import Quartz
+import Combine
 
 // MARK: - Card Detail View
 
@@ -9,7 +10,11 @@ struct CardDetailView: View {
     let highlight: Highlight
     var onDismiss: (() -> Void)?
     var onTagNavigation: ((Highlight, Tag) -> Void)?
+    var onStackNavigation: ((Stack) -> Void)?
+    var onImageFullscreen: ((NSImage) -> Void)?
     @State private var image: NSImage?
+    @State private var screenshotHovered = false
+    @State private var fileImageHovered = false
     @State private var notes: [HighlightNote] = []
     @State private var newNoteText = ""
     @State private var tags: [Tag] = []
@@ -18,6 +23,9 @@ struct CardDetailView: View {
     @State private var collectionInput = ""
     @State private var allCollections: [Tag] = DatabaseManager.shared.allTags()
     @State private var pickerSelection: Int = 0
+
+    // Stack organization
+    @State private var stacks: [Stack] = []
 
     private var isScreenshot: Bool { highlight.highlightType == "screenshot" }
     private var isRecording: Bool { highlight.highlightType == "recording" }
@@ -46,6 +54,15 @@ struct CardDetailView: View {
                                 .resizable()
                                 .aspectRatio(contentMode: .fit)
                                 .clipShape(RoundedRectangle(cornerRadius: 8))
+                                .overlay(alignment: .topTrailing) {
+                                    if let onImageFullscreen {
+                                        ExpandImageButton(isHovered: screenshotHovered) {
+                                            onImageFullscreen(image)
+                                        }
+                                    }
+                                }
+                                .onHover { screenshotHovered = $0 }
+                                .onTapGesture { onImageFullscreen?(image) }
                         }
                     } else if isRecording {
                         recordingDetailContent
@@ -101,6 +118,10 @@ struct CardDetailView: View {
                        let embeddedURL = Self.firstEmbeddedURL(in: highlight.contentText) {
                         embeddedLinkPreviewSection(url: embeddedURL.absoluteString)
                     }
+
+                    stackSection
+
+                    sourceSection
                 }
                 .padding(20)
             }
@@ -120,6 +141,10 @@ struct CardDetailView: View {
             loadNotes()
             tags = DatabaseManager.shared.tagsForHighlight(id: highlight.id)
             allCollections = DatabaseManager.shared.allTags()
+            reloadStacks()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .stackDataDidChange).receive(on: DispatchQueue.main)) { _ in
+            reloadStacks()
         }
     }
 
@@ -147,6 +172,10 @@ struct CardDetailView: View {
                 Spacer(minLength: 12)
 
                 HStack(spacing: 16) {
+                    InstantTooltipButton(icon: "rectangle.stack.badge.plus", label: "Add to stack") {
+                        _ = DatabaseManager.shared.addHighlightToPinnedOrNewStack(highlight.id)
+                        showConfirmation("Added to stack")
+                    }
                     InstantTooltipButton(icon: "doc.on.doc", label: "Copy content") {
                         copyContent(); showConfirmation("Copied")
                     }
@@ -442,6 +471,63 @@ struct CardDetailView: View {
     }
 
     // MARK: - Collections (moved to header bar — see collectionChips)
+
+    // MARK: - Stacks
+
+    /// Bottom-of-card section surfacing every stack this item belongs to.
+    /// Hidden when the item isn't in any stacks — items get added from the
+    /// stack surfaces themselves (pinned stacks or newly created ones), not
+    /// from this detail view.
+    @ViewBuilder
+    private var stackSection: some View {
+        if !stacks.isEmpty {
+            VStack(alignment: .leading, spacing: 12) {
+                SectionLabel(
+                    text: "In \(stacks.count) stack\(stacks.count == 1 ? "" : "s")"
+                )
+
+                VStack(spacing: 8) {
+                    ForEach(stacks) { stack in
+                        StackDetailRow(
+                            stack: stack,
+                            onTap: onStackNavigation.map { handler in
+                                { handler(stack) }
+                            },
+                            onRemove: { removeStack(stack) }
+                        )
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func removeStack(_ stack: Stack) {
+        DatabaseManager.shared.removeHighlight(highlight.id, fromStack: stack.id)
+    }
+
+    // MARK: - Source
+
+    /// Renders the page this item was captured from, when there's a
+    /// sourceUrl to surface. Hidden for URL copies (the URL is already
+    /// the main content) and for items captured outside the browser.
+    @ViewBuilder
+    private var sourceSection: some View {
+        if let url = highlight.sourceUrl,
+           !url.isEmpty,
+           URL(string: url) != nil,
+           !highlight.isURLCopy {
+            VStack(alignment: .leading, spacing: 8) {
+                SectionLabel(text: "Source")
+                EmbeddedLinkPreview(urlString: url)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func reloadStacks() {
+        stacks = DatabaseManager.shared.stacksForHighlight(id: highlight.id)
+    }
 
     // MARK: - Notes
 
@@ -739,6 +825,15 @@ struct CardDetailView: View {
                 .aspectRatio(contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
                 .frame(maxHeight: 400)
+                .overlay(alignment: .topTrailing) {
+                    if let onImageFullscreen {
+                        ExpandImageButton(isHovered: fileImageHovered) {
+                            onImageFullscreen(img)
+                        }
+                    }
+                }
+                .onHover { fileImageHovered = $0 }
+                .onTapGesture { onImageFullscreen?(img) }
         } else if ct == "video" {
             // Owns its AVPlayer in @State so typing in the note field (which
             // re-runs CardDetailView.body) doesn't rebuild the player and blink.
@@ -802,5 +897,106 @@ struct StableVideoPlayer: View {
             .onChange(of: url) { _, newURL in
                 player.replaceCurrentItem(with: AVPlayerItem(url: newURL))
             }
+    }
+}
+
+/// Row in the card-detail Stacks section. Wraps a compact StackCard (same
+/// visual treatment as the bottom-center pinned floater in BrowseView)
+/// with a framed container + hover-to-remove affordance.
+private struct StackDetailRow: View {
+    let stack: Stack
+    var onTap: (() -> Void)?
+    var onRemove: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 8) {
+            StackCard(
+                stack: stack,
+                isPinned: stack.isPinned,
+                onTap: onTap
+            )
+
+            Spacer(minLength: 0)
+
+            if isHovered {
+                Button(action: onRemove) {
+                    Image(systemName: "minus.circle.fill")
+                        .font(.system(size: 14))
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .help("Remove from this stack")
+                .transition(.opacity)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color.primary.opacity(isHovered ? 0.05 : 0.025))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+        )
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.15)) { isHovered = hovering }
+        }
+    }
+}
+
+/// Inline chip rendering a stack's identity in the item detail view —
+/// visually distinguished from FlatTag (tags use `#name`; stacks use a
+/// stack icon + name). Hover reveals an X for removing the item from the stack.
+struct StackChip: View {
+    let stack: Stack
+    var onRemove: (() -> Void)?
+    var onTap: (() -> Void)?
+    @State private var isHovered = false
+
+    private var labelColor: Color {
+        if onTap != nil && isHovered { return Color.accentColor }
+        return isHovered ? Color.primary.opacity(0.85) : Color.primary.opacity(0.55)
+    }
+
+    private var displayName: String {
+        stack.isNamed ? (stack.name ?? "Unnamed") : "Unnamed stack"
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: stack.isPinned ? "pin.fill" : "rectangle.stack")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(stack.isPinned ? Color.accentColor : labelColor)
+            Text(displayName)
+                .font(.system(size: 12, weight: stack.isNamed ? .medium : .regular))
+                .foregroundStyle(labelColor)
+                .italic(!stack.isNamed)
+            if isHovered, let onRemove {
+                Button(action: onRemove) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+                .transition(.opacity)
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color.primary.opacity(isHovered && onTap != nil ? 0.06 : 0.03))
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            onTap?()
+        }
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.1)) { isHovered = hovering }
+            guard onTap != nil else { return }
+            if hovering { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+        }
     }
 }

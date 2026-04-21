@@ -453,5 +453,30 @@ struct AppMigrations {
                 t.add(column: "emoji", .text)
             }
         }
+
+        migrator.registerMigration("v16_stacks") { db in
+            try db.create(table: "stack", ifNotExists: true) { t in
+                t.primaryKey("id", .text)
+                t.column("name", .text)
+                t.column("description", .text)
+                t.column("createdAt", .double).notNull()
+                t.column("updatedAt", .double).notNull()
+                t.column("isPinned", .boolean).notNull().defaults(to: false)
+            }
+
+            try db.create(table: "highlight_stack", ifNotExists: true) { t in
+                t.column("stackId", .text).notNull()
+                    .references("stack", onDelete: .cascade)
+                t.column("highlightId", .text).notNull()
+                    .references("highlight", onDelete: .cascade)
+                t.column("addedAt", .double).notNull()
+                t.primaryKey(["stackId", "highlightId"])
+            }
+            try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_highlight_stack_highlightId ON highlight_stack(highlightId)")
+            try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_highlight_stack_stackId ON highlight_stack(stackId)")
+            try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_stack_updatedAt ON stack(updatedAt)")
+            // Partial unique index: enforce the "only one pinned stack" invariant at the DB level
+            try db.execute(sql: "CREATE UNIQUE INDEX IF NOT EXISTS idx_stack_single_pin ON stack(isPinned) WHERE isPinned = 1")
+        }
     }
 }

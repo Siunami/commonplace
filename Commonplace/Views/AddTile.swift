@@ -32,14 +32,14 @@ struct AddTile: View {
         .frame(height: 180)
         .frame(maxWidth: .infinity)
         .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color.primary.opacity(0.04))
+            RoundedRectangle(cornerRadius: UITokens.radiusCard)
+                .fill(UITokens.surfaceCard.opacity(0.6))
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5)
+            RoundedRectangle(cornerRadius: UITokens.radiusCard)
+                .strokeBorder(UITokens.surfaceBorderStrong, style: StrokeStyle(lineWidth: 0.75, dash: [4, 3]))
         )
-        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .contentShape(RoundedRectangle(cornerRadius: UITokens.radiusCard))
         .onTapGesture {
             if !isEditing {
                 isEditing = true

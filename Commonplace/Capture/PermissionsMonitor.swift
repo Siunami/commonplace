@@ -64,6 +64,8 @@ final class PermissionsMonitor: ObservableObject {
 
         if axChanged && nextAX {
             ScreenshotShortcutHandler.shared.start()
+        } else if axChanged && !nextAX {
+            ScreenshotShortcutHandler.shared.stop()
         }
 
         let preflight = CGPreflightScreenCaptureAccess()

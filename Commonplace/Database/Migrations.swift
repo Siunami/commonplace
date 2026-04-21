@@ -478,5 +478,27 @@ struct AppMigrations {
             // Partial unique index: enforce the "only one pinned stack" invariant at the DB level
             try db.execute(sql: "CREATE UNIQUE INDEX IF NOT EXISTS idx_stack_single_pin ON stack(isPinned) WHERE isPinned = 1")
         }
+
+        migrator.registerMigration("v17_note_video_timestamp") { db in
+            try db.alter(table: "highlight_note") { t in
+                t.add(column: "timestampSeconds", .double)
+            }
+        }
+
+        migrator.registerMigration("v18_image_dimensions") { db in
+            // Store intrinsic image dimensions on file_record (for image/video
+            // thumbnails) and link_preview (hero images) so masonry cards can
+            // reserve aspect-ratio space before the bitmap loads. Without
+            // these, cards measure at a fallback ratio and resize when the
+            // image arrives, cascading into masonry overlaps.
+            try db.alter(table: "file_record") { t in
+                t.add(column: "imageWidth", .integer)
+                t.add(column: "imageHeight", .integer)
+            }
+            try db.alter(table: "link_preview") { t in
+                t.add(column: "imageWidth", .integer)
+                t.add(column: "imageHeight", .integer)
+            }
+        }
     }
 }

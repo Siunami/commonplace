@@ -12,6 +12,8 @@ struct CaptureApp: App {
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
+    private var permissionsObserver: NSObjectProtocol?
+    private var didStartCaptureServices = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Prime accessory activation policy explicitly. LSUIElement=YES sets
@@ -65,8 +67,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // drives the user through granting; no system prompts fire here.
         PermissionsMonitor.shared.start()
         PermissionsWindowController.shared.startWatchingForRevocation()
+        permissionsObserver = NotificationCenter.default.addObserver(
+            forName: .permissionsDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.startCaptureServicesIfPossible()
+        }
 
         // Menu bar status item — click opens Browse, right-click shows menu
+        configureStatusItem()
+
+        startCaptureServicesIfPossible()
+
+        // First-run: show permissions setup if needed
+        PermissionsWindowController.shared.showIfNeeded()
+    }
+
+    private func configureStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem?.button {
             button.image = NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: "Commonplace")
@@ -74,8 +92,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             button.target = self
         }
+    }
 
-        // Start each subsystem independently so one failure doesn't block the rest
+    private func startCaptureServicesIfPossible() {
+        guard !didStartCaptureServices else { return }
+        guard PermissionsMonitor.shared.allGranted else { return }
+
+        didStartCaptureServices = true
+
         ClipboardMonitor.shared.start()
         CaptureLog.info("Clipboard monitor started")
 
@@ -101,10 +125,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         FileMonitor.shared.start()
         CaptureLog.info("File monitor started")
 
-        CaptureLog.info("All systems started")
-
-        // First-run: show permissions setup if needed
-        PermissionsWindowController.shared.showIfNeeded()
+        CaptureLog.info("All capture systems started")
     }
 
     @objc private func statusItemClicked() {
@@ -155,6 +176,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if let permissionsObserver {
+            NotificationCenter.default.removeObserver(permissionsObserver)
+            self.permissionsObserver = nil
+        }
         if !AppEnvironment.isRunningUITests {
             FileMonitor.shared.stop()
             ScreenshotShortcutHandler.shared.stop()

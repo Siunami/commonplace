@@ -27,9 +27,28 @@ struct CardDetailView: View {
     // Stack organization
     @State private var stacks: [Stack] = []
 
+    // Video playback — controller is shared with whichever video player
+    // renders (recording vs. file-video). Used to capture the current time
+    // when composing a note and to seek when tapping a timestamped note.
+    @StateObject private var videoController = VideoPlaybackController()
+
     private var isScreenshot: Bool { highlight.highlightType == "screenshot" }
     private var isRecording: Bool { highlight.highlightType == "recording" }
     private var isFile: Bool { highlight.highlightType == "file" }
+
+    private var fileRecordIfAny: FileRecord? {
+        if let fileId = highlight.fileId,
+           let r = DatabaseManager.shared.fileRecord(byId: fileId) {
+            return r
+        }
+        return DatabaseManager.shared.fileRecordByPath(highlight.contentText)
+    }
+
+    private var isVideoHighlight: Bool {
+        if isRecording { return true }
+        if isFile, fileRecordIfAny?.contentType == "video" { return true }
+        return false
+    }
 
     private func showConfirmation(_ text: String) {
         withAnimation(.easeInOut(duration: 0.15)) { confirmationText = text }
@@ -76,31 +95,21 @@ struct CardDetailView: View {
                             linkDetailContent
                         }
                     } else {
-                        // Copied text — styled as a clipping
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack(spacing: 5) {
-                                Image(systemName: "doc.on.clipboard")
-                                    .font(.system(size: 10))
-                                Text("Copied text")
-                                    .font(.system(size: 11, weight: .medium))
-                                if let app = highlight.sourceApp {
-                                    Text("from \(app)")
-                                        .font(.system(size: 11))
-                                }
-                            }
-                            .foregroundStyle(.tertiary)
+                        // Copied text — styled as a clipping, sized to read as
+                        // the primary content. Everything else on the page is
+                        // deliberately quieter so this stays center stage.
+                        HStack(alignment: .top, spacing: 14) {
+                            RoundedRectangle(cornerRadius: 1.5)
+                                .fill(Color.primary.opacity(0.15))
+                                .frame(width: 3)
 
-                            HStack(alignment: .top, spacing: 12) {
-                                RoundedRectangle(cornerRadius: 1)
-                                    .fill(Color.primary.opacity(0.12))
-                                    .frame(width: 2.5)
-
-                                Text(highlight.contentText)
-                                    .font(.system(.body))
-                                    .textSelection(.enabled)
-                                    .fixedSize(horizontal: false, vertical: true)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
+                            Text(highlight.contentText)
+                                .font(.system(size: 18, design: .serif))
+                                .lineSpacing(4)
+                                .foregroundStyle(.primary.opacity(0.92))
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
 
@@ -207,34 +216,15 @@ struct CardDetailView: View {
     @ViewBuilder
     private var headerMetaLine: some View {
         let hasTitle = highlight.windowTitle?.isEmpty == false
-        let host = CardMetadata.domain(from: highlight.sourceUrl)
 
         HStack(spacing: 0) {
-            // Provenance group
+            // Provenance group — just date/time. App + URL live in the Source card below.
             Group {
                 if hasTitle {
                     Text(highlight.date, style: .date)
                     dot
                 }
                 Text(highlight.date, style: .time)
-                if let app = highlight.sourceApp {
-                    dot
-                    Text(app)
-                }
-                if let host, let url = highlight.sourceUrl {
-                    dot
-                    InlineLink(text: host, url: url) {
-                        openURL(url); showConfirmation("Opened \(host)")
-                    }
-                    .contextMenu {
-                        Button("Copy URL") {
-                            let pb = NSPasteboard.general
-                            pb.clearContents()
-                            pb.setString(url, forType: .string)
-                            showConfirmation("Copied URL")
-                        }
-                    }
-                }
             }
             .font(.system(size: 12))
             .foregroundStyle(.secondary)
@@ -514,13 +504,25 @@ struct CardDetailView: View {
     /// the main content) and for items captured outside the browser.
     @ViewBuilder
     private var sourceSection: some View {
-        if let url = highlight.sourceUrl,
-           !url.isEmpty,
-           URL(string: url) != nil,
-           !highlight.isURLCopy {
+        let url = highlight.sourceUrl.flatMap { raw -> String? in
+            guard !raw.isEmpty, URL(string: raw) != nil else { return nil }
+            return raw
+        }
+        let showURL = url != nil && !highlight.isURLCopy
+        let app = highlight.sourceApp
+        let showApp = (app?.isEmpty == false)
+
+        if showURL || showApp {
             VStack(alignment: .leading, spacing: 8) {
                 SectionLabel(text: "Source")
-                EmbeddedLinkPreview(urlString: url)
+                VStack(alignment: .leading, spacing: 8) {
+                    if showURL, let url {
+                        EmbeddedLinkPreview(urlString: url)
+                    }
+                    if showApp, let app {
+                        AppSourceBadge(appName: app, bundleId: highlight.bundleId)
+                    }
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -540,7 +542,13 @@ struct CardDetailView: View {
 
                 VStack(alignment: .leading, spacing: 10) {
                     ForEach(notes) { note in
-                        NoteRow(note: note) { deleteNote(note) }
+                        NoteRow(
+                            note: note,
+                            onDelete: { deleteNote(note) },
+                            onTimestampTap: isVideoHighlight ? { seconds in
+                                videoController.seek(to: seconds)
+                            } : nil
+                        )
                     }
                 }
             }
@@ -565,6 +573,15 @@ struct CardDetailView: View {
                     return .handled
                 }
 
+            Button(action: clearNote) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 18))
+                    .foregroundStyle(noteIsEmpty ? Color.gray.opacity(0.25) : Color.secondary)
+            }
+            .buttonStyle(.plain)
+            .disabled(noteIsEmpty)
+            .help("Clear")
+
             Button(action: submitNote) {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.system(size: 20))
@@ -573,9 +590,14 @@ struct CardDetailView: View {
             .buttonStyle(.plain)
             .disabled(noteIsEmpty)
             .keyboardShortcut(.return, modifiers: .command)
+            .help("Add")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
+    }
+
+    private func clearNote() {
+        newNoteText = ""
     }
 
     private var noteIsEmpty: Bool {
@@ -591,7 +613,12 @@ struct CardDetailView: View {
     private func submitNote() {
         let body = newNoteText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { return }
-        DatabaseManager.shared.addNoteToHighlight(highlightId: highlight.id, body: body)
+        let timestamp: Double? = isVideoHighlight ? videoController.currentTime : nil
+        DatabaseManager.shared.addNoteToHighlight(
+            highlightId: highlight.id,
+            body: body,
+            timestampSeconds: timestamp
+        )
         newNoteText = ""
         loadNotes()
         NotificationCenter.default.post(name: .highlightDidSave, object: nil)
@@ -631,7 +658,7 @@ struct CardDetailView: View {
 
         VStack(alignment: .leading, spacing: 12) {
             if exists {
-                InlineVideoPlayer(url: fileURL)
+                InlineVideoPlayer(url: fileURL, controller: videoController)
                     .aspectRatio(16/9, contentMode: .fit)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
 
@@ -838,7 +865,7 @@ struct CardDetailView: View {
         } else if ct == "video" {
             // Owns its AVPlayer in @State so typing in the note field (which
             // re-runs CardDetailView.body) doesn't rebuild the player and blink.
-            StableVideoPlayer(url: url)
+            StableVideoPlayer(url: url, controller: videoController)
                 .frame(height: 300)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
         } else if let thumbPath = fileRec.thumbnailPath,
@@ -886,18 +913,99 @@ struct CardDetailView: View {
 
 struct StableVideoPlayer: View {
     let url: URL
+    var controller: VideoPlaybackController?
     @State private var player: AVPlayer
+    @State private var timeObserverToken: Any?
 
-    init(url: URL) {
+    init(url: URL, controller: VideoPlaybackController? = nil) {
         self.url = url
+        self.controller = controller
         self._player = State(initialValue: AVPlayer(url: url))
     }
 
     var body: some View {
         VideoPlayer(player: player)
+            .onAppear {
+                attachController()
+            }
+            .onDisappear {
+                removeTimeObserver()
+            }
             .onChange(of: url) { _, newURL in
                 player.replaceCurrentItem(with: AVPlayerItem(url: newURL))
             }
+    }
+
+    private func attachController() {
+        guard let controller else { return }
+        controller.attach(player)
+        removeTimeObserver()
+        let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
+        timeObserverToken = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { time in
+            Task { @MainActor in
+                controller.updateCurrentTime(time.seconds)
+            }
+        }
+    }
+
+    private func removeTimeObserver() {
+        if let token = timeObserverToken {
+            player.removeTimeObserver(token)
+            timeObserverToken = nil
+        }
+    }
+}
+
+/// Compact "from AppName" badge in the Source card. Mirrors the visual
+/// treatment of EmbeddedLinkPreview so both source types compose into a
+/// cohesive stack in the Source section.
+private struct AppSourceBadge: View {
+    let appName: String
+    let bundleId: String?
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            appIcon
+                .frame(width: 40, height: 40)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            VStack(alignment: .leading, spacing: 3) {
+                Text("App")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(appName)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.secondary.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.secondary.opacity(0.12), lineWidth: 0.5)
+        )
+    }
+
+    @ViewBuilder
+    private var appIcon: some View {
+        if let bundleId,
+           let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) {
+            Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+        } else {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.secondary.opacity(0.15))
+                .overlay {
+                    Image(systemName: "app")
+                        .font(.system(size: 18))
+                        .foregroundStyle(.tertiary)
+                }
+        }
     }
 }
 

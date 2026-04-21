@@ -9,6 +9,8 @@ final class ScreenshotShortcutHandler {
     private var isCapturing = false
     private var retryTimer: Timer?
 
+    var isInstalled: Bool { eventTap != nil }
+
     // MARK: - CGEvent Tap Callback
 
     private let eventTapCallback: CGEventTapCallBack = { proxy, type, event, userInfo in

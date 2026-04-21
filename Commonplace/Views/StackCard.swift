@@ -38,7 +38,7 @@ struct StackCard: View {
             labelRow
         }
         .padding(10)
-        .fixedSize(horizontal: true, vertical: false)
+        .frame(width: 196)
         .background(UITokens.surfaceCard)
         .clipShape(RoundedRectangle(cornerRadius: UITokens.radiusCard))
         .overlay(
@@ -62,8 +62,9 @@ struct StackCard: View {
             Text(stack.isNamed ? (stack.name ?? "") : "Unnamed stack")
                 .font(.system(size: 12, weight: stack.isNamed ? .semibold : .regular))
                 .foregroundStyle(stack.isNamed ? .primary : .secondary)
-                .lineLimit(1)
+                .lineLimit(2)
                 .truncationMode(.tail)
+                .fixedSize(horizontal: false, vertical: true)
             Text("\(totalCount) item\(totalCount == 1 ? "" : "s")")
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
@@ -208,6 +209,42 @@ struct StackUnpinBadge: View {
             }
         }
         .help("Unpin this stack")
+    }
+}
+
+/// Compact icon-only pin button for stacks that aren't currently pinned.
+/// Paired with StackUnpinBadge so every stack card can be pinned/unpinned
+/// in place without opening the detail view.
+struct StackPinBadge: View {
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "pin.fill")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(isHovered ? Color.white : Color.white.opacity(0.85))
+                .frame(width: 18, height: 18)
+                .background(
+                    Circle().fill(
+                        isHovered
+                            ? Color.accentColor
+                            : Color.black.opacity(0.45)
+                    )
+                )
+                .shadow(color: .black.opacity(0.25), radius: 1.5, y: 0.5)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.12)) { isHovered = hovering }
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+            }
+        }
+        .help("Pin this stack")
     }
 }
 

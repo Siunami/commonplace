@@ -197,7 +197,12 @@ final class HighlightCapture {
 
     // MARK: - File Detection
 
-    func captureFromFileDetection(fileRecord: FileRecord, thumbnailImage: NSImage?, tagIds: [String] = []) {
+    func captureFromFileDetection(
+        fileRecord: FileRecord,
+        thumbnailImage: NSImage?,
+        tagIds: [String] = [],
+        sourceUrl: String? = nil
+    ) {
         let entryId = UUID().uuidString
         let filePath = fileRecord.filePath
         let fileName = fileRecord.fileName
@@ -207,7 +212,7 @@ final class HighlightCapture {
             timestamp: fileRecord.timestamp,
             contentText: filePath,
             sourceApp: nil,
-            sourceUrl: nil,
+            sourceUrl: sourceUrl,
             userNote: nil,
             highlightType: "file",
             screenshotId: nil,

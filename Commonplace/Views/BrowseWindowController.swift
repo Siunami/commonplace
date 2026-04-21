@@ -42,7 +42,14 @@ final class BrowseWindowController: NSObject, NSWindowDelegate, ManagedWindowCon
         }
     }
 
-    func show() {
+    @discardableResult
+    func show() -> Bool {
+        if !AppEnvironment.isRunningUITests,
+           PermissionsWindowController.shared.needsSetup {
+            PermissionsWindowController.shared.show()
+            return false
+        }
+
         // Create the window once. After that, just show/hide it.
         // The SwiftUI view hierarchy is never destroyed, preventing
         // the use-after-free crash that occurs during NSHostingController teardown.
@@ -80,11 +87,12 @@ final class BrowseWindowController: NSObject, NSWindowDelegate, ManagedWindowCon
 
         // Tell BrowseView to refresh its data
         NotificationCenter.default.post(name: Self.windowDidShowNotification, object: nil)
+        return true
     }
 
     /// Opens the browse window and shows a specific highlight's detail view.
     func showHighlight(_ highlightId: String) {
-        show()
+        guard show() else { return }
         // Give SwiftUI a moment to set up, then post the detail notification
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             NotificationCenter.default.post(
@@ -99,7 +107,7 @@ final class BrowseWindowController: NSObject, NSWindowDelegate, ManagedWindowCon
     }
 
     func showSettings() {
-        show()
+        guard show() else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             NotificationCenter.default.post(name: Self.showSettingsNotification, object: nil)
         }

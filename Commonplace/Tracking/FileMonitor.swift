@@ -114,7 +114,10 @@ final class FileMonitor {
 
         await MainActor.run {
             HighlightCapture.shared.captureFromFileDetection(
-                fileRecord: record, thumbnailImage: thumbImage, tagIds: tagIds
+                fileRecord: record,
+                thumbnailImage: thumbImage,
+                tagIds: tagIds,
+                sourceUrl: record.originalUrl
             )
         }
     }
@@ -208,6 +211,14 @@ final class FileMonitor {
             nil
         }
 
+        let dims = await Self.readIntrinsicDimensions(at: persistentPath, contentType: contentType)
+
+        // If caller didn't supply an originalUrl (drag-and-drop, Downloads folder watcher),
+        // fall back to the download-provenance xattr the browser wrote. Gives us "from pinterest.com"
+        // context even when the user moved a file in by hand.
+        let effectiveOriginalUrl = originalUrl
+            ?? Self.preferredSourceUrl(from: Self.readWhereFroms(path: persistentPath))
+
         var record = FileRecord(
             id: nil,
             timestamp: now.timeIntervalSince1970,
@@ -222,7 +233,9 @@ final class FileMonitor {
             creationDate: creationDate,
             fileExtension: ext.isEmpty ? nil : ext,
             pageCount: pageCount,
-            originalUrl: originalUrl
+            originalUrl: effectiveOriginalUrl,
+            imageWidth: dims?.0,
+            imageHeight: dims?.1
         )
 
         db.insertFileRecord(&record)
@@ -284,27 +297,39 @@ final class FileMonitor {
             nil
         }
 
-        var record = FileRecord(
-            id: nil,
-            timestamp: now.timeIntervalSince1970,
-            dayString: dayString,
-            filePath: persistentPath,
-            fileName: fileName,
-            fileSize: fileSize,
-            uti: uti,
-            contentType: contentType,
-            thumbnailPath: nil,
-            sourceFolder: sourceFolder,
-            creationDate: creationDate,
-            fileExtension: ext.isEmpty ? nil : ext,
-            pageCount: pageCount
-        )
-
-        db.insertFileRecord(&record)
-
-        // Generate thumbnail from the persistent copy, then hand off to HighlightCapture
+        // Generate thumbnail from the persistent copy, then hand off to HighlightCapture.
+        // Insert happens inside the Task so intrinsic dimensions can be read
+        // async (video metadata is async-only) and persisted with the row —
+        // that way the masonry card reserves an aspect-correct frame the
+        // first time it renders.
         let thumbSourceURL = URL(fileURLWithPath: persistentPath)
         Task {
+            let dims = await Self.readIntrinsicDimensions(at: persistentPath, contentType: contentType)
+
+            // Pull download provenance from the xattr the browser wrote (kMDItemWhereFroms).
+            // Gives us "from pinterest.com" context for files that land in watched folders.
+            let whereFromsUrl = Self.preferredSourceUrl(from: Self.readWhereFroms(path: persistentPath))
+
+            var record = FileRecord(
+                id: nil,
+                timestamp: now.timeIntervalSince1970,
+                dayString: dayString,
+                filePath: persistentPath,
+                fileName: fileName,
+                fileSize: fileSize,
+                uti: uti,
+                contentType: contentType,
+                thumbnailPath: nil,
+                sourceFolder: sourceFolder,
+                creationDate: creationDate,
+                fileExtension: ext.isEmpty ? nil : ext,
+                pageCount: pageCount,
+                originalUrl: whereFromsUrl,
+                imageWidth: dims?.0,
+                imageHeight: dims?.1
+            )
+            db.insertFileRecord(&record)
+
             let thumbPath = await generateThumbnail(for: thumbSourceURL, dayString: dayString)
             if let thumbPath, let recordId = record.id {
                 db.updateFileRecordThumbnail(id: recordId, thumbnailPath: thumbPath)
@@ -314,7 +339,11 @@ final class FileMonitor {
             let thumbImage: NSImage? = if let thumbPath { NSImage(contentsOfFile: thumbPath) } else { nil }
 
             await MainActor.run {
-                HighlightCapture.shared.captureFromFileDetection(fileRecord: record, thumbnailImage: thumbImage)
+                HighlightCapture.shared.captureFromFileDetection(
+                    fileRecord: record,
+                    thumbnailImage: thumbImage,
+                    sourceUrl: whereFromsUrl
+                )
             }
         }
 
@@ -423,6 +452,44 @@ final class FileMonitor {
         }
     }
 
+    /// Reads intrinsic pixel dimensions from a file on disk. Returns nil
+    /// if the file isn't an image/PDF/video or can't be introspected.
+    /// Used by ingest to persist dims so masonry cards reserve an
+    /// aspect-correct frame before the thumbnail is decoded.
+    private static func readIntrinsicDimensions(at path: String, contentType: String?) async -> (Int, Int)? {
+        let url = URL(fileURLWithPath: path)
+        switch contentType {
+        case "pdf":
+            if let doc = PDFDocument(url: url), let page = doc.page(at: 0) {
+                let r = page.bounds(for: .mediaBox)
+                if r.width > 0 && r.height > 0 { return (Int(r.width.rounded()), Int(r.height.rounded())) }
+            }
+            return nil
+        case "video":
+            let asset = AVURLAsset(url: url)
+            do {
+                let tracks = try await asset.loadTracks(withMediaType: .video)
+                guard let track = tracks.first else { return nil }
+                let size = try await track.load(.naturalSize)
+                let transform = try await track.load(.preferredTransform)
+                let oriented = size.applying(transform)
+                let w = abs(oriented.width), h = abs(oriented.height)
+                if w > 0 && h > 0 { return (Int(w.rounded()), Int(h.rounded())) }
+            } catch {
+                return nil
+            }
+            return nil
+        default:
+            // Image & generic — use ImageIO to read metadata without decoding.
+            guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+                  let w = props[kCGImagePropertyPixelWidth] as? Int,
+                  let h = props[kCGImagePropertyPixelHeight] as? Int,
+                  w > 0, h > 0 else { return nil }
+            return (w, h)
+        }
+    }
+
     private func saveCGImage(_ cgImage: CGImage, to directory: URL) -> String? {
         let thumbFile = directory.appendingPathComponent(UUID().uuidString + ".jpg")
         guard let dest = CGImageDestinationCreateWithURL(
@@ -431,6 +498,44 @@ final class FileMonitor {
         CGImageDestinationAddImage(dest, cgImage, [kCGImageDestinationLossyCompressionQuality: 0.85] as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return nil }
         return thumbFile.path
+    }
+
+    // MARK: - WhereFroms (download provenance)
+
+    /// Read `com.apple.metadata:kMDItemWhereFroms` — the extended attribute
+    /// browsers write to downloaded files. Typically an array of two strings:
+    /// `[directDownloadURL, referrerPageURL]`. Returns an empty array if the
+    /// attribute is missing or can't be decoded.
+    private static func readWhereFroms(path: String) -> [String] {
+        let attrName = "com.apple.metadata:kMDItemWhereFroms"
+        let size = getxattr(path, attrName, nil, 0, 0, 0)
+        guard size > 0 else { return [] }
+        var buffer = Data(count: size)
+        let read = buffer.withUnsafeMutableBytes { ptr -> ssize_t in
+            guard let base = ptr.baseAddress else { return -1 }
+            return getxattr(path, attrName, base, size, 0, 0)
+        }
+        guard read > 0 else { return [] }
+        do {
+            let decoded = try PropertyListSerialization.propertyList(
+                from: buffer, options: [], format: nil
+            )
+            if let arr = decoded as? [String] {
+                return arr.filter { !$0.isEmpty }
+            }
+        } catch {
+            CaptureLog.info("FileMonitor: kMDItemWhereFroms plist decode failed for \(path)")
+        }
+        return []
+    }
+
+    /// Pick the most human-meaningful provenance URL from a whereFroms array.
+    /// Browsers typically write `[directDownloadURL, referrerPageURL]` — the
+    /// second entry is usually the page the user was actually on (e.g., the
+    /// Pinterest pin), which is more useful than a CDN URL.
+    static func preferredSourceUrl(from whereFroms: [String]) -> String? {
+        if whereFroms.count >= 2, !whereFroms[1].isEmpty { return whereFroms[1] }
+        return whereFroms.first
     }
 
     // MARK: - Content Type Mapping

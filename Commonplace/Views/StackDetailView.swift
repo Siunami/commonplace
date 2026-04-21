@@ -90,6 +90,7 @@ struct StackDetailView: View {
                 Spacer()
 
                 HStack(spacing: 8) {
+                    exportButton
                     pinToggleButton
                     closeButton
                 }
@@ -144,6 +145,26 @@ struct StackDetailView: View {
         }
     }
 
+    private var exportButton: some View {
+        Button(action: exportStack) {
+            HStack(spacing: 4) {
+                Image(systemName: "square.and.arrow.up")
+                    .font(.system(size: 10))
+                Text("Export")
+                    .font(.system(size: 11, weight: .medium))
+            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(
+                Capsule().fill(Color.primary.opacity(0.06))
+            )
+        }
+        .buttonStyle(.plain)
+        .help("Export stack as markdown + media")
+        .disabled(items.isEmpty)
+    }
+
     private var pinToggleButton: some View {
         Button(action: togglePin) {
             HStack(spacing: 4) {
@@ -181,7 +202,7 @@ struct StackDetailView: View {
             emptyState
         } else {
             ScrollView {
-                LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 16) {
+                LazyVGrid(columns: gridColumns, spacing: 14) {
                     ForEach(items) { item in
                         StackDetailItemCell(
                             highlight: item,
@@ -193,6 +214,7 @@ struct StackDetailView: View {
                                 onOpenHighlight(item)
                             }
                         )
+                        .aspectRatio(1, contentMode: .fit)
                     }
                 }
                 .padding(.horizontal, 20)
@@ -201,11 +223,12 @@ struct StackDetailView: View {
         }
     }
 
-    /// Responsive grid: cells hold a minimum floor so thumbnails stay
-    /// legible, and a ceiling so they don't balloon on wide windows.
-    /// Columns flow to fill available width.
+    /// Adaptive square cells — column count scales with the window,
+    /// but every cell shares the same width and (via the aspectRatio
+    /// modifier above) the same height, producing the clean uniform
+    /// grid the stack view had originally.
     private var gridColumns: [GridItem] {
-        [GridItem(.adaptive(minimum: 200, maximum: 260), spacing: 16)]
+        [GridItem(.adaptive(minimum: 200, maximum: 260), spacing: 14)]
     }
 
     private var emptyState: some View {
@@ -230,11 +253,14 @@ struct StackDetailView: View {
     // MARK: - Actions
 
     private func reload() {
-        if let refreshed = db.stack(byId: currentStack.id) {
-            currentStack = refreshed
+        guard let refreshed = db.stack(byId: currentStack.id) else {
+            DispatchQueue.main.async(execute: onDismiss)
+            return
         }
+        currentStack = refreshed
         items = db.highlightsForStack(stackId: currentStack.id)
-        noteCounts = db.noteCountsForHighlights(ids: items.map(\.id))
+        let ids = items.map(\.id)
+        noteCounts = db.noteCountsForHighlights(ids: ids)
     }
 
     private func commitName() {
@@ -256,15 +282,49 @@ struct StackDetailView: View {
             db.setPinnedStack(id: currentStack.id)
         }
     }
+
+    private func exportStack() {
+        let panel = NSOpenPanel()
+        panel.title = "Export Stack"
+        panel.message = "Choose a location to save the exported stack folder."
+        panel.prompt = "Export Here"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        if let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first {
+            panel.directoryURL = downloads
+        }
+
+        guard panel.runModal() == .OK, let parent = panel.url else { return }
+
+        do {
+            let result = try StackExporter.export(stack: currentStack, into: parent)
+            NSWorkspace.shared.activateFileViewerSelecting([result.folderURL])
+        } catch StackExporter.ExportError.targetExists(let existing) {
+            let alert = NSAlert()
+            alert.messageText = "Folder already exists"
+            alert.informativeText = "A folder named “\(existing.lastPathComponent)” already exists in the chosen location. Move or rename it and try again."
+            alert.alertStyle = .warning
+            alert.runModal()
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Export failed"
+            alert.informativeText = error.localizedDescription
+            alert.alertStyle = .warning
+            alert.runModal()
+        }
+    }
 }
 
 // MARK: - Grid cell
 //
-// Mirrors MasonryCard from the archive: a single unified card surface
-// (background + rounded corners + border + shadow) wraps a typed
-// thumbnail and a CardFooterRow-style footer (AddToStackButton +
-// timeAgo). Aspect-ratio thumbnail keeps the grid uniform; everything
-// else matches the mosaic visual language.
+// The justified grid assigns each cell a fixed (width × height) box —
+// all cells in a row share the same height, widths flex with the
+// per-item aspect ratio. The cell fills that box: image-like types
+// use aspect-fill so the thumbnail covers the whole card, text-like
+// types show inline readable text. No internal aspect constraint,
+// because the Layout above has already picked the box.
 
 private struct StackDetailItemCell: View {
     let highlight: Highlight
@@ -274,21 +334,14 @@ private struct StackDetailItemCell: View {
 
     @State private var isHovered = false
 
-    private var hasAnnotation: Bool {
-        if let note = highlight.userNote, !note.isEmpty { return true }
-        return false
-    }
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            thumbnailArea
-            footer
-            if hasAnnotation {
-                annotationBlock
-            }
+        ZStack(alignment: .bottomLeading) {
+            cellBackground
+            content
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            bottomOverlay
         }
-        .background(UITokens.surfaceCard)
-        .clipped()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipShape(RoundedRectangle(cornerRadius: UITokens.radiusCard))
         .overlay(
             RoundedRectangle(cornerRadius: UITokens.radiusCard)
@@ -307,71 +360,109 @@ private struct StackDetailItemCell: View {
         }
     }
 
-    private var annotationBlock: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(highlight.userNote ?? "")
-                .font(.system(.callout, design: .serif))
-                .foregroundStyle(.primary.opacity(0.85))
-                .lineLimit(4)
-
-            if noteCount > 1 {
-                Text("+\(noteCount - 1) more")
-                    .font(.caption2)
-                    .foregroundStyle(.orange.opacity(0.8))
-            }
+    @ViewBuilder
+    private var cellBackground: some View {
+        if isMediaLike {
+            Color.black.opacity(0.35)
+        } else {
+            UITokens.surfaceCard
         }
-        .padding(.leading, 12)
-        .overlay(alignment: .leading) {
-            RoundedRectangle(cornerRadius: 0.5)
-                .fill(Color.orange.opacity(0.7))
-                .frame(width: 2)
-        }
-        .padding(.horizontal, 12)
-        .padding(.bottom, 12)
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
-    private var thumbnailArea: some View {
-        Color.clear
-            .aspectRatio(3.0 / 2.0, contentMode: .fit)
-            .frame(maxWidth: .infinity)
-            .overlay {
-                thumbnail
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .clipped()
-            }
-    }
-
-    private var footer: some View {
-        HStack(spacing: 6) {
-            AddToStackButton(highlightId: highlight.id)
-            Spacer(minLength: 4)
-            Text(CardMetadata.timeAgo(from: highlight.date))
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-    }
-
-    @ViewBuilder
-    private var thumbnail: some View {
+    private var content: some View {
         switch highlight.highlightType {
         case "screenshot", "recording":
             ImageThumbnail(highlight: highlight)
         case "file":
             FileThumbnail(highlight: highlight)
         case "highlight":
-            TextThumbnail(highlight: highlight, accent: Color.orange.opacity(0.8))
+            TextBody(highlight: highlight, accent: Color.orange.opacity(0.8))
         case "note":
-            NoteThumbnail(highlight: highlight)
+            TextBody(highlight: highlight, accent: nil)
         default:
             if highlight.isURLCopy {
                 LinkThumbnail(highlight: highlight)
             } else {
-                TextThumbnail(highlight: highlight, accent: Color.primary.opacity(0.14))
+                TextBody(highlight: highlight, accent: Color.primary.opacity(0.14))
             }
+        }
+    }
+
+    /// Footer row that floats over every card, with a subtle gradient
+    /// scrim for media cards so the timestamp stays legible. Shows the
+    /// most-recent userNote for any item that has one — media OR text —
+    /// so a stack always surfaces whatever commentary the user attached.
+    @ViewBuilder
+    private var bottomOverlay: some View {
+        VStack(spacing: 4) {
+            if let annotation = highlight.userNote,
+               !annotation.isEmpty,
+               !annotationDuplicatesContent {
+                Text(annotation)
+                    .font(.system(size: 11, design: .serif))
+                    .foregroundStyle(annotationForeground)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            HStack(spacing: 6) {
+                AddToStackButton(highlightId: highlight.id)
+                    .colorScheme(isMediaLike ? .dark : .light)
+                Spacer(minLength: 4)
+                Text(CardMetadata.timeAgo(from: highlight.date))
+                    .font(.caption2)
+                    .foregroundStyle(isMediaLike ? Color.white.opacity(0.85) : Color.secondary.opacity(0.7))
+                if noteCount > 1 {
+                    Text("+\(noteCount - 1)")
+                        .font(.caption2)
+                        .foregroundStyle(isMediaLike ? .white.opacity(0.8) : .orange.opacity(0.8))
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+        .background(footerBackground)
+    }
+
+    private var annotationForeground: Color {
+        isMediaLike ? Color.white.opacity(0.95) : Color.primary.opacity(0.78)
+    }
+
+    /// For note/highlight/text captures the contentText IS the user's
+    /// writing — we already render it in the body, so repeating it in
+    /// the footer would just waste the whole bottom of the card.
+    private var annotationDuplicatesContent: Bool {
+        switch highlight.highlightType {
+        case "highlight", "note":
+            return true
+        case "screenshot", "recording", "file":
+            return false
+        default:
+            return !highlight.isURLCopy
+        }
+    }
+
+    @ViewBuilder
+    private var footerBackground: some View {
+        if isMediaLike {
+            LinearGradient(
+                colors: [.clear, .black.opacity(0.55)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        } else {
+            Color.clear
+        }
+    }
+
+    private var isMediaLike: Bool {
+        switch highlight.highlightType {
+        case "screenshot", "recording", "file":
+            return true
+        default:
+            return highlight.isURLCopy
         }
     }
 
@@ -386,28 +477,48 @@ private struct StackDetailItemCell: View {
     }
 }
 
-// MARK: - Per-type thumbnails (grid scale)
+// MARK: - Per-type content (fill whatever cell the grid provides)
 
 private struct ImageThumbnail: View {
     let highlight: Highlight
     @State private var image: NSImage?
 
     var body: some View {
-        ZStack {
-            Color.primary.opacity(0.05)
-            if let image {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-            } else {
-                Image(systemName: highlight.highlightType == "recording" ? "video" : "photo")
-                    .font(.system(size: 28, weight: .light))
-                    .foregroundStyle(.tertiary)
+        GeometryReader { geo in
+            ZStack {
+                Color.black.opacity(0.35)
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipShape(Rectangle())
+                } else {
+                    Image(systemName: highlight.highlightType == "recording" ? "video" : "photo")
+                        .font(.system(size: 28, weight: .light))
+                        .foregroundStyle(.white.opacity(0.65))
+                }
+                if highlight.highlightType == "recording" && image != nil {
+                    Image(systemName: "play.circle.fill")
+                        .font(.system(size: 36))
+                        .foregroundStyle(.white.opacity(0.9))
+                        .shadow(color: .black.opacity(0.4), radius: 3, y: 1)
+                }
             }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .clipShape(Rectangle())
         }
         .task(id: highlight.id) {
             let path = highlight.contentText
-            image = await Task.detached { NSImage(contentsOfFile: path) }.value
+            if let direct = await Task.detached(priority: .utility, operation: {
+                NSImage(contentsOfFile: path)
+            }).value {
+                image = direct
+                return
+            }
+            // Recordings / PDFs don't decode via NSImage; fall through
+            // to the shared loader used by the history timeline.
+            image = await HighlightThumbnailLoader.load(for: highlight)
         }
     }
 }
@@ -417,29 +528,46 @@ private struct FileThumbnail: View {
     @State private var image: NSImage?
 
     var body: some View {
-        ZStack {
-            Color.primary.opacity(0.05)
-            if let image {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-            } else {
-                Image(systemName: "doc")
-                    .font(.system(size: 28, weight: .light))
-                    .foregroundStyle(.tertiary)
+        GeometryReader { geo in
+            ZStack {
+                Color.black.opacity(0.35)
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipShape(Rectangle())
+                } else {
+                    VStack(spacing: 6) {
+                        Image(systemName: "doc")
+                            .font(.system(size: 28, weight: .light))
+                            .foregroundStyle(.white.opacity(0.65))
+                        if let name = fileName {
+                            Text(name)
+                                .font(.caption2)
+                                .foregroundStyle(.white.opacity(0.75))
+                                .lineLimit(1)
+                                .padding(.horizontal, 8)
+                        }
+                    }
+                }
             }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .clipShape(Rectangle())
         }
         .task(id: highlight.id) {
-            guard let fileId = highlight.fileId,
-                  let rec = DatabaseManager.shared.fileRecord(byId: fileId),
-                  let thumbPath = rec.thumbnailPath else { return }
-            image = await Task.detached { NSImage(contentsOfFile: thumbPath) }.value
+            image = await HighlightThumbnailLoader.load(for: highlight)
         }
+    }
+
+    private var fileName: String? {
+        let name = (highlight.contentText as NSString).lastPathComponent
+        return name.isEmpty ? nil : name
     }
 }
 
-/// Mirrors LinkCard from the archive: hero image if available, otherwise
-/// a favicon + host fallback on a neutral background.
+/// Link preview: hero image fills the cell when available, falls back
+/// to favicon + host label on a neutral background.
 private struct LinkThumbnail: View {
     let highlight: Highlight
     @State private var heroImage: NSImage?
@@ -456,34 +584,40 @@ private struct LinkThumbnail: View {
     }
 
     var body: some View {
-        ZStack {
-            Color.primary.opacity(0.05)
+        GeometryReader { geo in
+            ZStack {
+                Color.black.opacity(0.3)
 
-            if let heroImage {
-                Image(nsImage: heroImage)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .overlay(alignment: .bottomLeading) { hostBadge }
-            } else {
-                VStack(spacing: 8) {
-                    if let favicon {
-                        Image(nsImage: favicon)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .frame(width: 36, height: 36)
-                            .clipShape(RoundedRectangle(cornerRadius: 6))
-                    } else {
-                        Image(systemName: "link")
-                            .font(.system(size: 26, weight: .light))
-                            .foregroundStyle(.secondary)
+                if let heroImage {
+                    Image(nsImage: heroImage)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipShape(Rectangle())
+                        .overlay(alignment: .topLeading) { hostBadge }
+                } else {
+                    VStack(spacing: 8) {
+                        if let favicon {
+                            Image(nsImage: favicon)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(width: 36, height: 36)
+                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                        } else {
+                            Image(systemName: "link")
+                                .font(.system(size: 26, weight: .light))
+                                .foregroundStyle(.white.opacity(0.7))
+                        }
+                        Text(host ?? fallbackHost)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.85))
+                            .lineLimit(1)
+                            .padding(.horizontal, 8)
                     }
-                    Text(host ?? fallbackHost)
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .padding(.horizontal, 8)
                 }
             }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .clipShape(Rectangle())
         }
         .task(id: highlight.id) {
             guard !didLoad else { return }
@@ -520,44 +654,38 @@ private struct LinkThumbnail: View {
     }
 }
 
-/// Mirrors HighlightCard / TextCard: serif text with a colored accent
-/// bar on the leading edge.
-private struct TextThumbnail: View {
+/// Inline readable text for `highlight`, `note`, and text captures.
+/// The card fills whatever box the grid gives it; the text fits as
+/// many lines as will fit, truncating with an ellipsis. The leading
+/// accent bar mirrors the mosaic TextCard / HighlightCard styling so
+/// the two surfaces read as the same family.
+private struct TextBody: View {
     let highlight: Highlight
-    let accent: Color
+    let accent: Color?
 
     var body: some View {
         HStack(alignment: .top, spacing: 0) {
-            RoundedRectangle(cornerRadius: 1)
-                .fill(accent)
-                .frame(width: 3)
-
-            Text(highlight.contentText)
-                .font(.system(size: 12, design: .serif))
-                .foregroundStyle(.primary.opacity(0.85))
-                .lineLimit(9)
-                .truncationMode(.tail)
+            if let accent {
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(accent)
+                    .frame(width: 3)
+            }
+            Text(text)
+                .font(.system(size: 13, design: .serif))
+                .foregroundStyle(.primary.opacity(0.88))
                 .multilineTextAlignment(.leading)
-                .padding(10)
+                .fixedSize(horizontal: false, vertical: false)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .padding(.horizontal, 12)
+                .padding(.top, 12)
+                .padding(.bottom, 38)  // leave room for footer overlay
         }
-        .background(UITokens.surfaceCard)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var text: String {
+        let trimmed = highlight.contentText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "(empty)" : trimmed
     }
 }
 
-/// Mirrors NoteCard: serif text, no accent bar.
-private struct NoteThumbnail: View {
-    let highlight: Highlight
-
-    var body: some View {
-        Text(highlight.contentText)
-            .font(.system(size: 12, design: .serif))
-            .foregroundStyle(.primary.opacity(0.9))
-            .lineLimit(9)
-            .truncationMode(.tail)
-            .multilineTextAlignment(.leading)
-            .padding(12)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .background(UITokens.surfaceCard)
-    }
-}

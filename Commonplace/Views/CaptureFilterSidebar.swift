@@ -305,7 +305,11 @@ struct CaptureFilterSidebar: View {
     }
 
     private func isTypeSelected(_ filter: CaptureFilter) -> Bool {
-        selectedFilter == filter && selectedApp == nil && selectedTagIds.isEmpty
+        !showStacks
+            && !showSettings
+            && selectedFilter == filter
+            && selectedApp == nil
+            && selectedTagIds.isEmpty
     }
 
     private func selectType(_ filter: CaptureFilter) {

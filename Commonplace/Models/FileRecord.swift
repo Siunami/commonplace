@@ -18,6 +18,11 @@ struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord, Identifia
     /// Source URL for files that came from a copied link (URLFileDownloader).
     /// Used to dedup re-copies of the same URL. Nil for drag-and-drop / folder-watched files.
     var originalUrl: String? = nil
+    /// Intrinsic image/video pixel dimensions, captured at ingest. Enables
+    /// masonry cards to reserve aspect-ratio space before the thumbnail
+    /// loads, so neighbour cards don't shift when it arrives.
+    var imageWidth: Int? = nil
+    var imageHeight: Int? = nil
 
     static let databaseTableName = "file_record"
 

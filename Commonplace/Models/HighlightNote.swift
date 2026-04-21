@@ -6,6 +6,7 @@ struct HighlightNote: Codable, FetchableRecord, PersistableRecord, Identifiable 
     var highlightId: String
     var body: String
     var createdAt: Double
+    var timestampSeconds: Double?
 
     static let databaseTableName = "highlight_note"
 

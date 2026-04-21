@@ -239,6 +239,7 @@ struct OCRTextBlock: View {
 struct NoteRow: View {
     let note: HighlightNote
     var onDelete: () -> Void
+    var onTimestampTap: ((Double) -> Void)? = nil
     @State private var isHovered = false
 
     var body: some View {
@@ -251,9 +252,29 @@ struct NoteRow: View {
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
-                Text(CardMetadata.timeAgo(from: note.date))
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                HStack(spacing: 8) {
+                    if let seconds = note.timestampSeconds, let onTimestampTap {
+                        Button(action: { onTimestampTap(seconds) }) {
+                            HStack(spacing: 3) {
+                                Image(systemName: "play.fill")
+                                    .font(.system(size: 8, weight: .semibold))
+                                Text(VideoTimestampFormatter.format(seconds))
+                                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            }
+                            .foregroundStyle(Color.accentColor)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(
+                                Capsule().fill(Color.accentColor.opacity(0.12))
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .help("Jump to this moment in the video")
+                    }
+                    Text(CardMetadata.timeAgo(from: note.date))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
             }
             .padding(.leading, 14)
             .overlay(alignment: .leading) {
@@ -293,8 +314,14 @@ struct BrowseView: View {
     @State private var selectedHighlight: Highlight?
     @State private var highlights: [Highlight] = []
     @State private var highlightsOffset = 0
+    @State private var browseLoadTask: Task<Void, Never>? = nil
+    @State private var browseLoadGeneration = 0
+    @State private var sidebarRefreshTask: Task<Void, Never>? = nil
+    @State private var sidebarRefreshGeneration = 0
+    @State private var isReloadingCaptures = false
     @State private var noteCounts: [String: Int] = [:]
     @State private var highlightTags: [String: [Tag]] = [:]
+    @State private var aspectRatios: [String: CGFloat] = [:]
     @State private var selectedFilter: CaptureFilter = .all
     @State private var selectedApp: String? = nil
     @State private var selectedTagIds: Set<String> = []
@@ -308,9 +335,13 @@ struct BrowseView: View {
     @State private var showSettings = false
     @State private var hasMore = false
     @State private var pinnedStack: Stack? = nil
+    /// Ids of highlights currently in the pinned stack — drives the
+    /// "already added" visual state on AddToStackButton.
+    @State private var pinnedStackMembers: Set<String> = []
     @State private var selectedStack: Stack? = nil
     @State private var showStacks = false
     @State private var fullScreenImage: NSImage?
+    @State private var footerBarFrame: CGRect = .zero
     @AppStorage("browseViewMode") private var viewMode: BrowseViewMode = .mosaic
     private let pageSize = 50
 
@@ -357,6 +388,7 @@ struct BrowseView: View {
                     highlight: pinned.highlight,
                     noteCount: noteCounts[pinned.highlight.id] ?? 0,
                     cardTags: highlightTags[pinned.highlight.id] ?? [],
+                    preferredAspectRatio: aspectRatios[pinned.highlight.id],
                     onTagTap: { tag in
                         navigateToTag(from: pinned.highlight, tag: tag)
                     }
@@ -382,12 +414,12 @@ struct BrowseView: View {
     }
 
     /// The pinned stack rendered as a compact, intrinsic-sized floating tile
-    /// at the bottom-center of the archive. Sized by content (small square
-    /// mosaic + label row) so it never dominates the window. The floater
-    /// The pinned stack lives just above the archive floor. It reuses the
-    /// same card surface as every other StackCard (no accent border, no
-    /// glow) and leans on the isPinned-driven stronger shadow plus the
-    /// pin-off badge to signal that it's the active container.
+    /// anchored to the browse window's bottom-right corner. Sized by content
+    /// (small square mosaic + label row) so it never dominates the window.
+    /// The floater lives just above the footer bar, reuses the same card
+    /// surface as every other StackCard, and leans on the isPinned-driven
+    /// stronger shadow plus the pin-off badge to signal that it's the active
+    /// container.
     @ViewBuilder
     private func pinnedStackFloater(_ pinned: Stack) -> some View {
         StackCard(
@@ -560,6 +592,7 @@ struct BrowseView: View {
                                             highlight: highlight,
                                             noteCount: noteCounts[highlight.id] ?? 0,
                                             cardTags: highlightTags[highlight.id] ?? [],
+                                            preferredAspectRatio: aspectRatios[highlight.id],
                                             onTagTap: { tag in
                                                 navigateToTag(from: highlight, tag: tag)
                                             },
@@ -588,9 +621,21 @@ struct BrowseView: View {
                                 )
                             }
                         }
+                        // Force a clean unmount/remount when the user toggles
+                        // between mosaic and history. Without it, SwiftUI
+                        // preserves the ScrollView subtree and async-loading
+                        // cards re-enter with stale measurement caches, which
+                        // is what was producing the overlap after a mode
+                        // switch.
+                        .id(viewMode)
                         // Reserve clearance below the last card so the floating
                         // pinned stack doesn't obscure content at the bottom.
+                        // `.animation(nil, …)` suppresses the implicit animation
+                        // when the floater appears — without it, the 220pt
+                        // change would animate alongside other pinnedStack
+                        // transitions, re-flowing every masonry card.
                         .padding(.bottom, pinnedStack != nil ? 220 : 0)
+                        .animation(nil, value: pinnedStack)
                     }
                     .onScrollGeometryChange(for: Bool.self) { geo in
                         // True when scrolled within 400pt of the bottom of the content
@@ -623,10 +668,22 @@ struct BrowseView: View {
                     Text("\(filteredHighlights.count) captures")
                         .font(.caption)
                         .foregroundStyle(.tertiary)
+                    if isReloadingCaptures {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
                     BrowseViewModeToggle(viewMode: $viewMode)
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
+                .background {
+                    GeometryReader { proxy in
+                        Color.clear.preference(
+                            key: BrowseFooterBarFramePreferenceKey.self,
+                            value: proxy.frame(in: .named("BrowseRootSpace"))
+                        )
+                    }
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .contentShape(Rectangle())
@@ -657,13 +714,23 @@ struct BrowseView: View {
             } // end else (showSettings)
             } // end ZStack
         }
+        .coordinateSpace(name: "BrowseRootSpace")
+        .onPreferenceChange(BrowseFooterBarFramePreferenceKey.self) { footerBarFrame = $0 }
         .onAppear {
             isActive = true
             loadCaptures(reset: true)
             refreshSidebarData()
             pinnedStack = DatabaseManager.shared.pinnedStack()
+            pinnedStackMembers = DatabaseManager.shared.highlightIdsInPinnedStack()
         }
-        .onDisappear { isActive = false }
+        .onDisappear {
+            isActive = false
+            browseLoadTask?.cancel()
+            browseLoadTask = nil
+            sidebarRefreshTask?.cancel()
+            sidebarRefreshTask = nil
+            isReloadingCaptures = false
+        }
         .onReceive(NotificationCenter.default.publisher(for: BrowseWindowController.windowDidShowNotification)) { _ in
             isActive = true
             loadCaptures(reset: true)
@@ -715,11 +782,15 @@ struct BrowseView: View {
             showSettings = true
         }
         .onReceive(NotificationCenter.default.publisher(for: .stackDataDidChange).receive(on: DispatchQueue.main)) { _ in
+            // @State dedupes equal writes (Stack, Set<String> are Equatable),
+            // so direct assignment won't re-render when nothing changed.
             pinnedStack = DatabaseManager.shared.pinnedStack()
-            // Keep selectedStack in sync if the active one was renamed/updated
+            pinnedStackMembers = DatabaseManager.shared.highlightIdsInPinnedStack()
             if let sel = selectedStack,
                let refreshed = DatabaseManager.shared.stack(byId: sel.id) {
                 selectedStack = refreshed
+            } else if selectedStack != nil {
+                selectedStack = nil
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: BrowseWindowController.showTagFilterNotification)) { notification in
@@ -817,22 +888,21 @@ struct BrowseView: View {
         }
         // Pinned stack floater — rendered as the topmost overlay so it's
         // always reachable, even when a highlight or stack detail view
-        // is open on top of the archive. Anchored to the bottom of the
-        // masonry area (right side of the HStack), not the full window —
-        // Anchored to the bottom-right corner with fixed padding from
-        // both edges. Because StackCard is intrinsic-sized, adding more
-        // items to the mosaic grows the card up and to the left — the
-        // bottom-right anchor point stays put.
-        // Hidden only when the pinned stack's own detail view is
-        // showing (to avoid a duplicate).
+        // is open on top of the archive. Anchored to the window's
+        // bottom-right corner with explicit clearance above the footer.
         .overlay(alignment: .bottomTrailing) {
-            if let pinned = pinnedStack, selectedStack?.id != pinned.id {
+            if let pinned = pinnedStack {
                 pinnedStackFloater(pinned)
-                    .padding(.trailing, 24)
-                    .padding(.bottom, 36)
+                    .padding(.trailing, 16)
+                    .padding(.bottom, footerBarFrame.height + 16)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
+        // Membership of the pinned stack flows through the environment so
+        // every AddToStackButton below — in masonry, history, pinned
+        // origin breadcrumb, card detail, stack detail — renders its
+        // "in stack" state without needing the set threaded as a prop.
+        .environment(\.pinnedStackMembers, pinnedStackMembers)
     }
 
     // MARK: - Data Loading
@@ -840,44 +910,62 @@ struct BrowseView: View {
     private func loadCaptures(reset: Bool) {
         guard isActive else { return }
         if reset {
-            highlightsOffset = 0
-            highlights = []
+            browseLoadGeneration += 1
+            browseLoadTask?.cancel()
             hasMore = false
+            isReloadingCaptures = true
+        } else if browseLoadTask != nil {
+            return
         }
 
         let request = browseLoadRequest
-        let offset = highlightsOffset
+        let generation = browseLoadGeneration
+        let offset = reset ? 0 : highlightsOffset
         let limit = pageSize
         let shouldRefreshFacets = reset
 
-        Task.detached(priority: .userInitiated) {
+        let task = Task.detached(priority: .userInitiated) {
             let db = DatabaseManager.shared
             let batch = db.browseHighlights(request, offset: offset, limit: limit)
             let newCounts = db.noteCountsForHighlights(ids: batch.map(\.id))
             let newTags = db.tagsForHighlights(ids: batch.map(\.id))
+            let newRatios = db.aspectRatiosForHighlights(ids: batch.map(\.id))
             let facets: [(appName: String, bundleId: String?, count: Int)]? =
                 shouldRefreshFacets ? db.appFacets() : nil
 
+            guard !Task.isCancelled else { return }
+
             await MainActor.run {
+                guard generation == browseLoadGeneration else { return }
+
                 // Dedupe by id: an in-flight paginated load can race with a
                 // reset triggered by .highlightDidSave / .highlightDataDidChange,
                 // and real-time inserts can shift rows so the same id appears
                 // on consecutive OFFSET pages. Either way, duplicate ids in
                 // ForEach give undefined layout (overlapping masonry cards).
-                let existingIds = Set(highlights.map(\.id))
-                let newRows = batch.filter { !existingIds.contains($0.id) }
-                highlights.append(contentsOf: newRows)
-                highlightsOffset += batch.count
+                if reset {
+                    highlights = batch
+                    highlightsOffset = batch.count
+                } else {
+                    let existingIds = Set(highlights.map(\.id))
+                    let newRows = batch.filter { !existingIds.contains($0.id) }
+                    highlights.append(contentsOf: newRows)
+                    highlightsOffset += batch.count
+                }
                 hasMore = batch.count == limit
                 noteCounts.merge(newCounts) { _, new in new }
                 highlightTags.merge(newTags) { _, new in new }
+                aspectRatios.merge(newRatios) { _, new in new }
                 if let facets {
                     appFacets = facets.map {
                         AppFacet(appName: $0.appName, bundleId: $0.bundleId, count: $0.count)
                     }
                 }
+                isReloadingCaptures = false
+                browseLoadTask = nil
             }
         }
+        browseLoadTask = task
     }
 
     private func clearFocus() {
@@ -885,7 +973,11 @@ struct BrowseView: View {
     }
 
     private func refreshSidebarData() {
-        Task.detached(priority: .userInitiated) {
+        sidebarRefreshGeneration += 1
+        let generation = sidebarRefreshGeneration
+        sidebarRefreshTask?.cancel()
+
+        let task = Task.detached(priority: .userInitiated) {
             let db = DatabaseManager.shared
             db.pruneEmptyTags()
             let tags = db.allTags()
@@ -896,12 +988,17 @@ struct BrowseView: View {
             counts["_videos"] = db.videoHighlightCount()
             counts["_filesNoVideo"] = db.fileExcludingVideoCount()
 
+            guard !Task.isCancelled else { return }
+
             await MainActor.run {
+                guard generation == sidebarRefreshGeneration else { return }
                 allTags = tags
                 tagCounts = tCounts
                 typeCounts = counts
+                sidebarRefreshTask = nil
             }
         }
+        sidebarRefreshTask = task
     }
 
     // MARK: - Drag & Drop Import
@@ -951,6 +1048,17 @@ struct BrowseView: View {
 
 // MARK: - Masonry Layout
 
+private struct BrowseFooterBarFramePreferenceKey: PreferenceKey {
+    static var defaultValue: CGRect = .zero
+
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+        let next = nextValue()
+        if next != .zero {
+            value = next
+        }
+    }
+}
+
 private struct MasonryLayout: Layout {
     let minColumnWidth: CGFloat
     let spacing: CGFloat
@@ -993,19 +1101,14 @@ private struct MasonryLayout: Layout {
         subviews: Subviews,
         cache: inout CacheData
     ) {
+        // Always re-measure and re-layout. The previous "structureChanged"
+        // short-circuit could stick with stale assignments when a card's
+        // intrinsic height changed mid-transition (async image/link-preview
+        // loads, mode-switch animations). layout() is O(n·cols) on
+        // already-measured heights — cheap enough to run unconditionally.
         let columns = columnCount(for: totalWidth)
         let colWidth = columnWidth(for: totalWidth, columns: columns)
         let heights = measureHeights(subviews: subviews, colWidth: colWidth)
-
-        let widthChanged = abs(cache.measuredWidth - totalWidth) > 0.5
-        let structureChanged =
-            widthChanged ||
-            cache.columns != columns ||
-            cache.heights != heights ||
-            cache.assignments.count != subviews.count
-
-        guard structureChanged else { return }
-
         let (colHeights, assignments) = layout(columns: columns, colWidth: colWidth, heights: heights)
         cache.measuredWidth = totalWidth
         cache.columns = columns
@@ -1057,14 +1160,29 @@ private struct MasonryLayout: Layout {
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout CacheData) {
-        refreshCache(for: bounds.width, subviews: subviews, cache: &cache)
+        // Re-measure inline and compute placements from scratch. Using the
+        // cache here would hold assignments from `sizeThatFits` that can be
+        // stale by the time we place — async image/link-preview loads
+        // between the two calls change card natural heights. Those stale
+        // Y offsets caused the visible overlap. Propose `height: nil` so
+        // each subview renders at its natural height and neither we nor
+        // SwiftUI try to squeeze a view smaller than its content requires.
+        let columns = columnCount(for: bounds.width)
+        let colWidth = columnWidth(for: bounds.width, columns: columns)
+        let heights = measureHeights(subviews: subviews, colWidth: colWidth)
+        let (_, assignments) = layout(columns: columns, colWidth: colWidth, heights: heights)
+        cache.measuredWidth = bounds.width
+        cache.columns = columns
+        cache.columnWidth = colWidth
+        cache.heights = heights
+        cache.assignments = assignments
         for (i, subview) in subviews.enumerated() {
-            let a = cache.assignments[i]
-            let x = bounds.minX + CGFloat(a.col) * (cache.columnWidth + spacing)
+            let a = assignments[i]
+            let x = bounds.minX + CGFloat(a.col) * (colWidth + spacing)
             let y = bounds.minY + a.y
             subview.place(
                 at: CGPoint(x: x, y: y),
-                proposal: .init(width: cache.columnWidth, height: cache.heights[i])
+                proposal: .init(width: colWidth, height: nil)
             )
         }
     }
@@ -1076,6 +1194,11 @@ private struct MasonryCard: View {
     let highlight: Highlight
     var noteCount: Int = 0
     var cardTags: [Tag] = []
+    /// Pre-resolved intrinsic aspect ratio (width/height) for this highlight's
+    /// media, loaded in a batch by BrowseView. Passing it down lets the cover
+    /// preview reserve aspect-correct space before any image/video decodes,
+    /// which keeps neighbour cards from re-flowing when the bitmap arrives.
+    var preferredAspectRatio: CGFloat? = nil
     var onTagTap: ((Tag) -> Void)? = nil
     var onImageFullscreen: ((NSImage) -> Void)? = nil
     @State private var isHovered = false
@@ -1102,29 +1225,32 @@ private struct MasonryCard: View {
         VStack(spacing: 0) {
             cardContent
 
-            if hasAnnotation {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(highlight.userNote ?? "")
-                        .font(.system(.callout, design: .serif))
-                        .foregroundStyle(.primary.opacity(0.85))
-                        .lineLimit(6)
+            // Annotation slot: always rendered so the card's total
+            // height never changes when a note is added, edited, or
+            // removed via notification. reservesSpace: true holds the
+            // 6-line vertical budget even when the text is empty,
+            // which is what keeps masonry neighbours from re-packing.
+            VStack(alignment: .leading, spacing: 5) {
+                Text(highlight.userNote ?? "")
+                    .font(.system(.callout, design: .serif))
+                    .foregroundStyle(.primary.opacity(0.85))
+                    .lineLimit(6, reservesSpace: true)
 
-                    if noteCount > 1 {
-                        Text("+\(noteCount - 1) more")
-                            .font(.caption2)
-                            .foregroundStyle(.orange.opacity(0.8))
-                    }
+                if noteCount > 1 {
+                    Text("+\(noteCount - 1) more")
+                        .font(.caption2)
+                        .foregroundStyle(.orange.opacity(0.8))
                 }
-                .padding(.leading, 14)
-                .overlay(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 0.5)
-                        .fill(Color.orange.opacity(0.7))
-                        .frame(width: 2)
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 14)
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .padding(.leading, 14)
+            .overlay(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 0.5)
+                    .fill(hasAnnotation ? Color.orange.opacity(0.7) : Color.clear)
+                    .frame(width: 2)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 14)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(UITokens.surfaceCard)
         .clipped()
@@ -1175,6 +1301,10 @@ private struct MasonryCard: View {
                 .transition(.opacity)
             }
         }
+        .overlay(alignment: .bottomTrailing) {
+            AddToStackButton(highlightId: highlight.id, style: .overlay)
+                .padding(8)
+        }
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.15)) {
                 isHovered = hovering
@@ -1187,18 +1317,18 @@ private struct MasonryCard: View {
     private var cardContent: some View {
         switch highlight.highlightType {
         case "screenshot":
-            ScreenshotCard(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap, onImageFullscreen: onImageFullscreen)
+            ScreenshotCard(highlight: highlight, cardTags: cardTags, preferredAspectRatio: preferredAspectRatio, onTagTap: onTagTap, onImageFullscreen: onImageFullscreen)
         case "recording":
-            ScreenshotCard(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap, onImageFullscreen: nil)
+            ScreenshotCard(highlight: highlight, cardTags: cardTags, preferredAspectRatio: preferredAspectRatio, onTagTap: onTagTap, onImageFullscreen: nil)
         case "highlight":
             HighlightCard(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
         case "note":
             NoteCard(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
         case "file":
-            FileCard(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap, onImageFullscreen: onImageFullscreen)
+            FileCard(highlight: highlight, cardTags: cardTags, preferredAspectRatio: preferredAspectRatio, onTagTap: onTagTap, onImageFullscreen: onImageFullscreen)
         default:
             if highlight.isURLCopy {
-                LinkCard(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
+                LinkCard(highlight: highlight, cardTags: cardTags, preferredAspectRatio: preferredAspectRatio, onTagTap: onTagTap)
             } else {
                 TextCard(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
             }
@@ -1225,6 +1355,14 @@ private struct CardCoverPreview<Placeholder: View, Overlay: View>: View {
     let placeholder: Placeholder
     let overlay: Overlay
 
+    /// Aspect-ratio bucket committed on first appearance. Masonry is
+    /// single-pass: once a card reports a height, neighbours pack
+    /// against it, and a later bucket change would cause overlap. This
+    /// @State captures the bucket exactly once and ignores subsequent
+    /// `preferredAspectRatio` arrivals — the cover reserves a stable
+    /// frame from first render through the whole card's lifetime.
+    @State private var lockedAspect: CGFloat?
+
     init(
         image: NSImage?,
         fallbackAspectRatio: CGFloat = 1.3,
@@ -1241,16 +1379,15 @@ private struct CardCoverPreview<Placeholder: View, Overlay: View>: View {
         self.overlay = overlay()
     }
 
-    private var targetAspectRatio: CGFloat {
+    private var resolvedAspectRatio: CGFloat {
+        if let lockedAspect { return lockedAspect }
+        return computeAspectRatio()
+    }
+
+    private func computeAspectRatio() -> CGFloat {
         let buckets = aspectRatioBuckets.isEmpty ? [fallbackAspectRatio] : aspectRatioBuckets.sorted()
-        let seededRatio = preferredAspectRatio ?? fallbackAspectRatio
-        guard let image else { return nearestAspectRatio(to: seededRatio, buckets: buckets) }
-        let size = image.size
-        guard size.width > 0, size.height > 0 else {
-            return nearestAspectRatio(to: seededRatio, buckets: buckets)
-        }
-        let rawAspectRatio = size.width / size.height
-        return nearestAspectRatio(to: rawAspectRatio, buckets: buckets)
+        let reference = preferredAspectRatio ?? fallbackAspectRatio
+        return nearestAspectRatio(to: reference, buckets: buckets)
     }
 
     private func nearestAspectRatio(to rawValue: CGFloat, buckets: [CGFloat]) -> CGFloat {
@@ -1258,23 +1395,37 @@ private struct CardCoverPreview<Placeholder: View, Overlay: View>: View {
     }
 
     var body: some View {
-        ZStack(alignment: .bottomTrailing) {
-            if let image {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                placeholder
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
+        GeometryReader { geo in
+            ZStack(alignment: .bottomTrailing) {
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipShape(Rectangle())
+                } else {
+                    placeholder
+                        .frame(width: geo.size.width, height: geo.size.height)
+                }
 
-            overlay
+                overlay
+            }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .clipShape(Rectangle())
         }
-        .aspectRatio(targetAspectRatio, contentMode: .fit)
+        .aspectRatio(resolvedAspectRatio, contentMode: .fit)
         .frame(maxWidth: .infinity)
         .background(.quaternary.opacity(0.12))
-        .clipped()
+        .onAppear {
+            if lockedAspect == nil {
+                lockedAspect = computeAspectRatio()
+            }
+        }
+        .onChange(of: preferredAspectRatio) { _, _ in
+            if lockedAspect == nil {
+                lockedAspect = computeAspectRatio()
+            }
+        }
     }
 }
 
@@ -1300,20 +1451,15 @@ private extension CardCoverPreview where Overlay == EmptyView {
 private struct ScreenshotCard: View {
     let highlight: Highlight
     var cardTags: [Tag] = []
+    /// Intrinsic aspect ratio pre-resolved by BrowseView's batch map. Passed
+    /// down instead of re-queried here so the cover can reserve an
+    /// aspect-correct frame before `image` finishes loading — without this
+    /// the card resizes when the bitmap arrives and neighbours shift.
+    var preferredAspectRatio: CGFloat? = nil
     var onTagTap: ((Tag) -> Void)? = nil
     var onImageFullscreen: ((NSImage) -> Void)? = nil
     @State private var image: NSImage?
     @State private var imageHovered = false
-
-    private var preferredAspectRatio: CGFloat? {
-        guard let screenshotId = highlight.screenshotId,
-              let record = DatabaseManager.shared.screenshot(byId: screenshotId),
-              let width = record.imageWidth,
-              let height = record.imageHeight,
-              width > 0,
-              height > 0 else { return nil }
-        return CGFloat(width) / CGFloat(height)
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1339,7 +1485,6 @@ private struct ScreenshotCard: View {
             }
             .onHover { imageHovered = $0 }
 
-            CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
         }
         .task {
             if image == nil {
@@ -1371,7 +1516,7 @@ private struct ScreenshotCard: View {
 /// `thumbnailPath` is missing or the file at that path cannot be loaded.
 /// Used by RecordingCard and FileCard so the masonry always shows a real
 /// preview instead of an icon placeholder.
-private enum LiveThumbnail {
+enum LiveThumbnail {
     static func generate(for fileURL: URL) async -> NSImage? {
         let ext = fileURL.pathExtension.lowercased()
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
@@ -1436,6 +1581,7 @@ private enum LiveThumbnail {
 
 struct InlineVideoPlayer: NSViewRepresentable {
     let url: URL
+    var controller: VideoPlaybackController?
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -1448,6 +1594,9 @@ struct InlineVideoPlayer: NSViewRepresentable {
         playerView.showsFullScreenToggleButton = true
         context.coordinator.player = player
         context.coordinator.playerView = playerView
+        if let controller {
+            context.coordinator.attach(controller: controller, player: player)
+        }
         player.play()
         return playerView
     }
@@ -1461,8 +1610,25 @@ struct InlineVideoPlayer: NSViewRepresentable {
     class Coordinator {
         var player: AVPlayer?
         var playerView: AVPlayerView?
+        private var timeObserverToken: Any?
+
+        func attach(controller: VideoPlaybackController, player: AVPlayer) {
+            Task { @MainActor in
+                controller.attach(player)
+            }
+            let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
+            timeObserverToken = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { time in
+                Task { @MainActor in
+                    controller.updateCurrentTime(time.seconds)
+                }
+            }
+        }
 
         func tearDown() {
+            if let token = timeObserverToken {
+                player?.removeTimeObserver(token)
+                timeObserverToken = nil
+            }
             player?.pause()
             player?.replaceCurrentItem(with: nil)
             if let pv = playerView, pv.window != nil, !pv.isHidden {
@@ -1473,6 +1639,9 @@ struct InlineVideoPlayer: NSViewRepresentable {
         }
 
         deinit {
+            if let token = timeObserverToken, let player {
+                player.removeTimeObserver(token)
+            }
             player?.pause()
             player?.replaceCurrentItem(with: nil)
         }
@@ -1480,6 +1649,44 @@ struct InlineVideoPlayer: NSViewRepresentable {
 }
 
 // MARK: - Text Card
+
+/// Length-driven typographic style for the text-only cards. Short snippets
+/// scale up so they read as pull-quotes (à la mymind/Pinterest); long
+/// snippets drop to a reading size and clamp to a generous line limit.
+private enum TextCardStyle {
+    struct Style {
+        let font: Font
+        let lineLimit: Int
+        let verticalPadding: CGFloat
+        let horizontalPadding: CGFloat
+    }
+
+    static func style(for text: String) -> Style {
+        let count = text.count
+        if count < 60 {
+            return Style(
+                font: .system(size: 22, weight: .medium, design: .serif),
+                lineLimit: 8,
+                verticalPadding: 18,
+                horizontalPadding: 16
+            )
+        }
+        if count < 200 {
+            return Style(
+                font: .system(size: 15, design: .serif),
+                lineLimit: 12,
+                verticalPadding: 14,
+                horizontalPadding: 14
+            )
+        }
+        return Style(
+            font: .system(size: 13, design: .serif),
+            lineLimit: 16,
+            verticalPadding: 12,
+            horizontalPadding: 14
+        )
+    }
+}
 
 private struct TextCard: View {
     let highlight: Highlight
@@ -1490,23 +1697,20 @@ private struct TextCard: View {
         if TextHighlightRouter.isImageFilePath(highlight.contentText) {
             ScreenshotCard(highlight: highlight)
         } else {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(alignment: .top, spacing: 0) {
-                    RoundedRectangle(cornerRadius: 0.5)
-                        .fill(Color.primary.opacity(0.12))
-                        .frame(width: 2)
+            let style = TextCardStyle.style(for: highlight.contentText)
+            HStack(alignment: .top, spacing: 0) {
+                RoundedRectangle(cornerRadius: 0.5)
+                    .fill(Color.primary.opacity(0.12))
+                    .frame(width: 2)
 
-                    Text(highlight.contentText)
-                        .font(.system(.callout, design: .serif))
-                        .foregroundStyle(.primary.opacity(0.85))
-                        .lineLimit(12)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 12)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
+                Text(highlight.contentText)
+                    .font(style.font)
+                    .foregroundStyle(.primary.opacity(0.85))
+                    .lineLimit(style.lineLimit, reservesSpace: true)
+                    .padding(.horizontal, style.horizontalPadding)
+                    .padding(.vertical, style.verticalPadding)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
@@ -1522,23 +1726,20 @@ private struct HighlightCard: View {
         if TextHighlightRouter.isImageFilePath(highlight.contentText) {
             ScreenshotCard(highlight: highlight)
         } else {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(alignment: .top, spacing: 0) {
-                    RoundedRectangle(cornerRadius: 0.5)
-                        .fill(Color.orange.opacity(0.8))
-                        .frame(width: 2)
+            let style = TextCardStyle.style(for: highlight.contentText)
+            HStack(alignment: .top, spacing: 0) {
+                RoundedRectangle(cornerRadius: 0.5)
+                    .fill(Color.orange.opacity(0.8))
+                    .frame(width: 2)
 
-                    Text(highlight.contentText)
-                        .font(.system(.callout, design: .serif))
-                        .foregroundStyle(.primary.opacity(0.85))
-                        .lineLimit(12)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 12)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
+                Text(highlight.contentText)
+                    .font(style.font)
+                    .foregroundStyle(.primary.opacity(0.85))
+                    .lineLimit(style.lineLimit, reservesSpace: true)
+                    .padding(.horizontal, style.horizontalPadding)
+                    .padding(.vertical, style.verticalPadding)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
@@ -1569,18 +1770,14 @@ private struct NoteCard: View {
     var onTagTap: ((Tag) -> Void)? = nil
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(highlight.contentText)
-                .font(.system(.body, design: .serif))
-                .foregroundStyle(.primary.opacity(0.85))
-                .lineLimit(12)
-                .padding(.horizontal, 16)
-                .padding(.top, 14)
-                .padding(.bottom, 10)
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-            CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
-        }
+        let style = TextCardStyle.style(for: highlight.contentText)
+        Text(highlight.contentText)
+            .font(style.font)
+            .foregroundStyle(.primary.opacity(0.85))
+            .lineLimit(style.lineLimit, reservesSpace: true)
+            .padding(.horizontal, style.horizontalPadding)
+            .padding(.vertical, style.verticalPadding)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -1589,6 +1786,9 @@ private struct NoteCard: View {
 private struct FileCard: View {
     let highlight: Highlight
     var cardTags: [Tag] = []
+    /// Pre-resolved intrinsic aspect ratio from BrowseView's batch map. See
+    /// ScreenshotCard for the rationale — same problem, same fix.
+    var preferredAspectRatio: CGFloat? = nil
     var onTagTap: ((Tag) -> Void)? = nil
     var onImageFullscreen: ((NSImage) -> Void)? = nil
     @State private var thumbnail: NSImage?
@@ -1604,6 +1804,7 @@ private struct FileCard: View {
             CardCoverPreview(
                 image: thumbnail,
                 fallbackAspectRatio: 1.28,
+                preferredAspectRatio: preferredAspectRatio,
                 aspectRatioBuckets: [1.0, 1.28, 1.58]
             ) {
                 Rectangle()
@@ -1650,14 +1851,13 @@ private struct FileCard: View {
 
             Text(fileRecord?.fileName ?? URL(fileURLWithPath: highlight.contentText).lastPathComponent)
                 .font(.caption)
-                .lineLimit(2)
+                .lineLimit(2, reservesSpace: true)
                 .truncationMode(.middle)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 10)
                 .padding(.top, 8)
                 .padding(.bottom, 2)
 
-            CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
         }
         .task {
             // Resolve the FileRecord: prefer foreign key, but fall back to
@@ -1704,6 +1904,9 @@ private struct FileCard: View {
 private struct LinkCard: View {
     let highlight: Highlight
     var cardTags: [Tag] = []
+    /// Pre-resolved intrinsic aspect ratio for the link's hero image, from
+    /// BrowseView's batch map. See ScreenshotCard for the rationale.
+    var preferredAspectRatio: CGFloat? = nil
     var onTagTap: ((Tag) -> Void)? = nil
     @State private var preview: LinkPreview?
     @State private var heroImage: NSImage?
@@ -1735,25 +1938,24 @@ private struct LinkCard: View {
         VStack(alignment: .leading, spacing: 0) {
             Button(action: openURL) {
                 VStack(alignment: .leading, spacing: 0) {
-                    if heroImage != nil || !didLoad {
-                        CardCoverPreview(
-                            image: heroImage,
-                            fallbackAspectRatio: 1.45,
-                            aspectRatioBuckets: [1.33, 1.58, 1.82]
-                        ) {
-                            Rectangle()
-                                .fill(.quaternary.opacity(0.15))
-                                .overlay {
-                                    if !didLoad {
-                                        ProgressView()
-                                            .controlSize(.small)
-                                    } else {
-                                        Image(systemName: "link")
-                                            .font(.system(size: 20, weight: .medium))
-                                            .foregroundStyle(.tertiary)
-                                    }
+                    CardCoverPreview(
+                        image: heroImage,
+                        fallbackAspectRatio: 1.45,
+                        preferredAspectRatio: preferredAspectRatio,
+                        aspectRatioBuckets: [1.33, 1.58, 1.82]
+                    ) {
+                        Rectangle()
+                            .fill(.quaternary.opacity(0.15))
+                            .overlay {
+                                if !didLoad {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                } else {
+                                    Image(systemName: "link")
+                                        .font(.system(size: 20, weight: .medium))
+                                        .foregroundStyle(.tertiary)
                                 }
-                        }
+                            }
                     }
 
                     VStack(alignment: .leading, spacing: 6) {
@@ -1783,7 +1985,7 @@ private struct LinkCard: View {
                         Text(displayTitle)
                             .font(.callout.weight(.semibold))
                             .foregroundStyle(.primary)
-                            .lineLimit(3)
+                            .lineLimit(3, reservesSpace: true)
                             .truncationMode(.tail)
                             .multilineTextAlignment(.leading)
 
@@ -1801,7 +2003,6 @@ private struct LinkCard: View {
             }
             .buttonStyle(.plain)
 
-            CardFooterRow(highlight: highlight, cardTags: cardTags, onTagTap: onTagTap)
         }
         .task {
             let fetched = await LinkPreviewStore.shared.preview(for: urlString)
@@ -2154,46 +2355,6 @@ enum CardMetadata {
     }
 }
 
-/// Standard bottom row for every masonry card: the persistent
-/// AddToStackButton on the leading edge, tag chips in the middle,
-/// timestamp on the trailing edge.
-///
-/// The row uses a fixed minHeight so adding a tag doesn't change the
-/// card's overall height — which would otherwise reshuffle the masonry.
-private struct CardFooterRow: View {
-    let highlight: Highlight
-    var cardTags: [Tag] = []
-    var onTagTap: ((Tag) -> Void)? = nil
-
-    var body: some View {
-        HStack(spacing: 6) {
-            AddToStackButton(highlightId: highlight.id)
-            if !cardTags.isEmpty {
-                HStack(spacing: 4) {
-                    ForEach(cardTags.prefix(2)) { tag in
-                        TagChip(name: tag.name, onTap: onTagTap.map { handler in
-                            { handler(tag) }
-                        })
-                    }
-                    if cardTags.count > 2 {
-                        Text("+\(cardTags.count - 2)")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-                .lineLimit(1)
-            }
-            Spacer(minLength: 4)
-            Text(CardMetadata.timeAgo(from: highlight.date))
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .frame(minHeight: 32)
-    }
-}
-
 private struct CardMetadataFooter: View {
     let highlight: Highlight
 
@@ -2320,8 +2481,61 @@ struct HistoryDay: Identifiable {
     var allHighlightIds: [String] { clusters.flatMap { $0.highlights.map(\.id) } }
 }
 
+// Inline preview categories. Screenshots, recordings, and files all render
+// a real thumbnail, so they collapse into the same "media" bucket for strip
+// grouping. Everything else stays a compact row.
+private extension Highlight {
+    var isMediaType: Bool {
+        highlightType == "screenshot" || highlightType == "recording" || highlightType == "file"
+    }
+}
+
+// One entry in the vertical timeline inside a cluster. A run of consecutive
+// media items collapses into `.strip` so a burst of screenshots reads as
+// one visual unit rather than N stacked tiles.
+enum HistoryTimelineItem: Identifiable {
+    case row(Highlight)
+    case media(Highlight)
+    case strip([Highlight])
+
+    var id: String {
+        switch self {
+        case .row(let h): return "row-\(h.id)"
+        case .media(let h): return "media-\(h.id)"
+        case .strip(let hs): return "strip-\(hs.first?.id ?? "")-\(hs.count)"
+        }
+    }
+}
+
 enum HistoryGrouping {
     static let burstGap: TimeInterval = 30 * 60  // 30 minutes
+
+    /// Within a single cluster, merge consecutive media highlights into
+    /// strips while leaving text-like items as their own rows.
+    static func timelineItems(_ highlights: [Highlight]) -> [HistoryTimelineItem] {
+        var items: [HistoryTimelineItem] = []
+        var mediaRun: [Highlight] = []
+
+        func flushMedia() {
+            if mediaRun.count == 1 {
+                items.append(.media(mediaRun[0]))
+            } else if mediaRun.count >= 2 {
+                items.append(.strip(mediaRun))
+            }
+            mediaRun = []
+        }
+
+        for h in highlights {
+            if h.isMediaType {
+                mediaRun.append(h)
+            } else {
+                flushMedia()
+                items.append(.row(h))
+            }
+        }
+        flushMedia()
+        return items
+    }
 
     static func group(_ highlights: [Highlight]) -> [HistoryDay] {
         guard !highlights.isEmpty else { return [] }
@@ -2402,19 +2616,32 @@ private struct HistoryListView: View {
                 Section {
                     ForEach(Array(day.clusters.enumerated()), id: \.element.id) { _, cluster in
                         HistoryClusterHeader(cluster: cluster)
-                        ForEach(Array(cluster.highlights.enumerated()), id: \.element.id) { idx, h in
-                            HistoryRow(
-                                highlight: h,
-                                noteCount: noteCounts[h.id] ?? 0,
-                                cardTags: highlightTags[h.id] ?? [],
-                                onTagTap: { onTagTap(h, $0) }
-                            )
-                            .contentShape(Rectangle())
-                            .onTapGesture { onSelect(h) }
-                            if idx < cluster.highlights.count - 1 {
-                                Divider()
-                                    .opacity(0.4)
-                                    .padding(.leading, 76)
+                        ForEach(HistoryGrouping.timelineItems(cluster.highlights)) { item in
+                            Group {
+                                switch item {
+                                case .row(let h):
+                                    HistoryRow(
+                                        highlight: h,
+                                        noteCount: noteCounts[h.id] ?? 0,
+                                        cardTags: highlightTags[h.id] ?? [],
+                                        onTagTap: { onTagTap(h, $0) }
+                                    )
+                                    .contentShape(Rectangle())
+                                    .onTapGesture { onSelect(h) }
+                                case .media(let h):
+                                    HistoryMediaRow(
+                                        highlight: h,
+                                        cardTags: highlightTags[h.id] ?? [],
+                                        noteCount: noteCounts[h.id] ?? 0,
+                                        onTagTap: { onTagTap(h, $0) },
+                                        onSelect: { onSelect(h) }
+                                    )
+                                case .strip(let hs):
+                                    HistoryMediaStrip(
+                                        highlights: hs,
+                                        onSelect: onSelect
+                                    )
+                                }
                             }
                         }
                     }
@@ -2571,7 +2798,7 @@ private struct HistoryRow: View {
                 Text(primaryText)
                     .font(.system(.callout, design: .serif))
                     .foregroundStyle(.primary.opacity(0.88))
-                    .lineLimit(2)
+                    .lineLimit(2, reservesSpace: true)
                     .multilineTextAlignment(.leading)
                     .fixedSize(horizontal: false, vertical: true)
 
@@ -2579,7 +2806,7 @@ private struct HistoryRow: View {
                     Text(annotation)
                         .font(.caption)
                         .foregroundStyle(.orange.opacity(0.85))
-                        .lineLimit(1)
+                        .lineLimit(1, reservesSpace: true)
                 }
 
                 HStack(spacing: 6) {
@@ -2666,6 +2893,35 @@ private struct HistoryRow: View {
     }
 }
 
+// MARK: - Highlight Thumbnail Loader
+//
+// Shared image-loading pipeline for history-view previews. Tries the raw
+// content path first (screenshots land there verbatim), falls back to
+// LiveThumbnail for recordings/PDFs/other file types, then the persisted
+// thumbnailPath on FileRecord. Returns nil for text-like highlights.
+
+enum HighlightThumbnailLoader {
+    static func load(for highlight: Highlight) async -> NSImage? {
+        let path = highlight.contentText
+        if let direct = await Task.detached(priority: .utility, operation: {
+            NSImage(contentsOfFile: path)
+        }).value {
+            return direct
+        }
+        if let live = await LiveThumbnail.generate(for: URL(fileURLWithPath: path)) {
+            return live
+        }
+        if let fileId = highlight.fileId,
+           let rec = DatabaseManager.shared.fileRecord(byId: fileId),
+           let thumbPath = rec.thumbnailPath {
+            return await Task.detached(priority: .utility, operation: {
+                NSImage(contentsOfFile: thumbPath)
+            }).value
+        }
+        return nil
+    }
+}
+
 // MARK: - History Row Thumbnail
 
 private struct HistoryRowThumbnail: View {
@@ -2673,22 +2929,29 @@ private struct HistoryRowThumbnail: View {
     @State private var image: NSImage?
 
     var body: some View {
-        Group {
-            if let image {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-            } else {
-                ZStack {
-                    Rectangle().fill(iconBackground)
-                    Image(systemName: iconName)
-                        .font(.system(size: 16, weight: .regular))
-                        .foregroundStyle(iconColor)
+        GeometryReader { geo in
+            ZStack {
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipShape(Rectangle())
+                } else {
+                    ZStack {
+                        Rectangle().fill(iconBackground)
+                        Image(systemName: iconName)
+                            .font(.system(size: 16, weight: .regular))
+                            .foregroundStyle(iconColor)
+                    }
                 }
             }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .clipShape(Rectangle())
         }
         .task(id: highlight.id) {
-            await loadImageIfNeeded()
+            guard image == nil, highlight.isMediaType else { return }
+            image = await HighlightThumbnailLoader.load(for: highlight)
         }
     }
 
@@ -2720,33 +2983,250 @@ private struct HistoryRowThumbnail: View {
             return highlight.isURLCopy ? Color.blue.opacity(0.07) : UITokens.chipFill
         }
     }
+}
 
-    private func loadImageIfNeeded() async {
-        guard image == nil else { return }
-        let type = highlight.highlightType
-        let path = highlight.contentText
-        if type == "screenshot" || type == "recording" || type == "file" {
-            let direct = await Task.detached(priority: .utility) {
-                NSImage(contentsOfFile: path)
-            }.value
-            if let direct {
-                self.image = direct
-                return
+// MARK: - History Media Row (single wide inline preview)
+
+private struct HistoryMediaRow: View {
+    let highlight: Highlight
+    var cardTags: [Tag] = []
+    var noteCount: Int = 0
+    var onTagTap: ((Tag) -> Void)? = nil
+    var onSelect: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HistoryMediaPreview(highlight: highlight, contentMode: .fit)
+                .frame(maxWidth: 360, alignment: .leading)
+                .frame(minHeight: 110, maxHeight: 200)
+                .background(UITokens.surfaceBackground)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(UITokens.surfaceBorder, lineWidth: 0.5)
+                )
+                .overlay(alignment: .center) {
+                    if highlight.highlightType == "recording" {
+                        Image(systemName: "play.circle.fill")
+                            .font(.system(size: 36))
+                            .foregroundStyle(.white.opacity(0.92))
+                            .shadow(color: .black.opacity(0.45), radius: 4, y: 2)
+                    }
+                }
+
+            HStack(spacing: 8) {
+                Text(primaryLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let meta = secondaryMeta {
+                    Text(meta)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+                if !cardTags.isEmpty {
+                    HStack(spacing: 4) {
+                        ForEach(cardTags.prefix(3)) { tag in
+                            TagChip(name: tag.name, onTap: onTagTap.map { handler in
+                                { handler(tag) }
+                            })
+                        }
+                        if cardTags.count > 3 {
+                            Text("+\(cardTags.count - 3)")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                }
+                if noteCount > 0 {
+                    HStack(spacing: 3) {
+                        Image(systemName: "text.bubble")
+                            .font(.system(size: 9))
+                        Text("\(noteCount)")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .foregroundStyle(.tertiary)
+                }
+                Spacer(minLength: 8)
+                Text(timeString)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .monospacedDigit()
+                AddToStackButton(highlightId: highlight.id)
+                    .opacity(isHovered ? 1 : 0)
             }
-            if let live = await LiveThumbnail.generate(for: URL(fileURLWithPath: path)) {
-                self.image = live
-                return
+            .padding(.horizontal, 2)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .background(isHovered ? Color.primary.opacity(0.03) : Color.clear)
+        .contentShape(Rectangle())
+        .onTapGesture { onSelect() }
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.1)) { isHovered = hovering }
+        }
+    }
+
+    private var primaryLabel: String {
+        switch highlight.highlightType {
+        case "screenshot": return "Screenshot"
+        case "recording": return "Recording"
+        case "file":
+            let name = (highlight.contentText as NSString).lastPathComponent
+            return name.isEmpty ? "File" : name
+        default: return "Media"
+        }
+    }
+
+    private var secondaryMeta: String? {
+        var parts: [String] = []
+        if let app = highlight.sourceApp, !app.isEmpty { parts.append(app) }
+        if let short = CardMetadata.shortURL(from: highlight.sourceUrl) {
+            parts.append(short)
+        }
+        return parts.isEmpty ? nil : "· " + parts.joined(separator: " · ")
+    }
+
+    private var timeString: String {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        return f.string(from: highlight.date)
+    }
+}
+
+// MARK: - History Media Strip (2+ consecutive media items)
+
+private struct HistoryMediaStrip: View {
+    let highlights: [Highlight]
+    let onSelect: (Highlight) -> Void
+
+    var body: some View {
+        LazyVGrid(
+            columns: [GridItem(.adaptive(minimum: 150, maximum: 220), spacing: 10, alignment: .top)],
+            alignment: .leading,
+            spacing: 10
+        ) {
+            ForEach(highlights) { h in
+                HistoryMediaTile(highlight: h)
+                    .onTapGesture { onSelect(h) }
             }
-            if let fileId = highlight.fileId,
-               let rec = DatabaseManager.shared.fileRecord(byId: fileId),
-               let thumbPath = rec.thumbnailPath {
-                let thumb = await Task.detached(priority: .utility) {
-                    NSImage(contentsOfFile: thumbPath)
-                }.value
-                if let thumb {
-                    self.image = thumb
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 8)
+    }
+}
+
+private struct HistoryMediaTile: View {
+    let highlight: Highlight
+    @State private var isHovered = false
+
+    private let tileHeight: CGFloat = 110
+
+    var body: some View {
+        // Fixed-size container — no scaleEffect, so hover can't bleed into
+        // neighbour cells. Hover state shifts the border/shadow only.
+        ZStack(alignment: .bottom) {
+            HistoryMediaPreview(highlight: highlight, contentMode: .fill)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            LinearGradient(
+                colors: [.clear, .black.opacity(0.55)],
+                startPoint: .center,
+                endPoint: .bottom
+            )
+            .frame(height: 40)
+            .frame(maxWidth: .infinity, alignment: .bottom)
+
+            HStack(spacing: 4) {
+                if highlight.highlightType == "recording" {
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.white)
+                }
+                Text(timeString)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.white)
+                    .monospacedDigit()
+                Spacer(minLength: 0)
+                AddToStackButton(highlightId: highlight.id)
+                    .opacity(isHovered ? 1 : 0)
+                    .colorScheme(.dark)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+
+            if highlight.highlightType == "recording" {
+                Image(systemName: "play.circle.fill")
+                    .font(.system(size: 28))
+                    .foregroundStyle(.white.opacity(0.9))
+                    .shadow(color: .black.opacity(0.4), radius: 3, y: 1)
+                    .frame(maxHeight: .infinity)
+            }
+        }
+        .frame(height: tileHeight)
+        .frame(maxWidth: .infinity)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .strokeBorder(
+                    isHovered ? Color.accentColor.opacity(0.5) : UITokens.surfaceBorder,
+                    lineWidth: isHovered ? 1 : 0.5
+                )
+        )
+        .shadow(color: isHovered ? UITokens.shadowCard : .clear, radius: 4, y: 2)
+        .contentShape(Rectangle())
+        .animation(.easeInOut(duration: 0.12), value: isHovered)
+        .onHover { hovering in isHovered = hovering }
+    }
+
+    private var timeString: String {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        return f.string(from: highlight.date)
+    }
+}
+
+// MARK: - History Media Preview (shared thumbnail view)
+
+private struct HistoryMediaPreview: View {
+    let highlight: Highlight
+    let contentMode: ContentMode
+    @State private var image: NSImage?
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: contentMode)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipShape(Rectangle())
+                } else {
+                    ZStack {
+                        Rectangle().fill(UITokens.chipFill)
+                        Image(systemName: fallbackIcon)
+                            .font(.system(size: 28))
+                            .foregroundStyle(.tertiary)
+                    }
                 }
             }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .clipShape(Rectangle())
+        }
+        .task(id: highlight.id) {
+            guard image == nil else { return }
+            image = await HighlightThumbnailLoader.load(for: highlight)
+        }
+    }
+
+    private var fallbackIcon: String {
+        switch highlight.highlightType {
+        case "screenshot": return "photo"
+        case "recording": return "video"
+        case "file": return "doc"
+        default: return "photo"
         }
     }
 }

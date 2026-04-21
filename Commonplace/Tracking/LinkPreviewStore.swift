@@ -104,24 +104,34 @@ final class LinkPreviewStore {
 
         let title = metadata.title
         let siteName = url.host?.replacingOccurrences(of: "www.", with: "")
-        let imagePath = await Self.saveImage(provider: metadata.imageProvider, urlString: urlString, suffix: "hero")
-        let faviconPath = await Self.saveImage(provider: metadata.iconProvider, urlString: urlString, suffix: "icon")
+        let hero = await Self.saveImage(provider: metadata.imageProvider, urlString: urlString, suffix: "hero")
+        let favicon = await Self.saveImage(provider: metadata.iconProvider, urlString: urlString, suffix: "icon")
 
         var preview = LinkPreview(
             url: urlString,
             title: title,
             siteName: siteName,
-            imagePath: imagePath,
-            faviconPath: faviconPath,
+            imagePath: hero?.path,
+            faviconPath: favicon?.path,
             fetchedAt: Date().timeIntervalSince1970,
-            fetchError: nil
+            fetchError: nil,
+            imageWidth: hero?.width,
+            imageHeight: hero?.height
         )
         db.insertLinkPreview(&preview)
         CaptureLog.info("[LinkPreviewStore] cached preview for \(siteName ?? urlString)")
         return preview
     }
 
-    private static func saveImage(provider: NSItemProvider?, urlString: String, suffix: String) async -> String? {
+    /// Persists a provider-loaded NSImage as JPEG and returns its path +
+    /// intrinsic pixel dimensions. Dimensions flow back so the LinkPreview
+    /// row can persist them — otherwise the masonry card has no way to
+    /// reserve an aspect-correct frame before the hero decodes.
+    private static func saveImage(
+        provider: NSItemProvider?,
+        urlString: String,
+        suffix: String
+    ) async -> (path: String, width: Int, height: Int)? {
         guard let provider, provider.canLoadObject(ofClass: NSImage.self) else { return nil }
 
         let image: NSImage? = await withCheckedContinuation { cont in
@@ -136,11 +146,17 @@ final class LinkPreviewStore {
               let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85])
         else { return nil }
 
+        // pixelsWide/pixelsHigh reflect the bitmap's true pixel count;
+        // image.size would return points (scaled by the default 72 DPI
+        // representation), which is wrong for our use.
+        let width = rep.pixelsWide
+        let height = rep.pixelsHigh
+
         let hash = String(format: "%x", UInt(bitPattern: urlString.hashValue))
         let path = storageURL.appendingPathComponent("\(hash)-\(suffix).jpg")
         do {
             try jpeg.write(to: path, options: .atomic)
-            return path.path
+            return (path.path, width, height)
         } catch {
             CaptureLog.warning("[LinkPreviewStore] failed to save \(suffix) image: \(error.localizedDescription)")
             return nil

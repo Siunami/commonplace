@@ -105,6 +105,23 @@ extension DatabaseManager {
         }) ?? [:]
     }
 
+    /// The set of highlight ids currently in the pinned stack (or empty
+    /// when nothing is pinned). BrowseView uses this to visually flag
+    /// items that are already members, so the "add" button becomes a
+    /// proper toggle.
+    func highlightIdsInPinnedStack() -> Set<String> {
+        guard let dbQueue else { return [] }
+        let ids: [String] = (try? dbQueue.read { db in
+            try String.fetchAll(db, sql: """
+                SELECT hs.highlightId
+                FROM highlight_stack hs
+                JOIN stack s ON s.id = hs.stackId
+                WHERE s.isPinned = 1
+                """)
+        }) ?? []
+        return Set(ids)
+    }
+
     /// Stacks that contain the given highlight — used to surface "pivot" stacks
     /// when viewing a single item.
     func stacksForHighlight(id: String) -> [Stack] {
@@ -300,6 +317,13 @@ extension DatabaseManager {
         guard let created = createStack(name: nil, pinned: true) else { return nil }
         addHighlight(highlightId, toStack: created.id)
         return stack(byId: created.id)
+    }
+
+    /// Opposite of `addHighlightToPinnedOrNewStack`: removes the highlight from
+    /// the currently pinned stack (if any). No-op when nothing is pinned.
+    func removeHighlightFromPinnedStack(_ highlightId: String) {
+        guard let pinned = pinnedStack() else { return }
+        removeHighlight(highlightId, fromStack: pinned.id)
     }
 
     /// Bulk variant of `addHighlightToPinnedOrNewStack`. All inserts run

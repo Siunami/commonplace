@@ -499,13 +499,14 @@ final class DatabaseManager {
         }) ?? []
     }
 
-    func addNoteToHighlight(highlightId: String, body: String) {
+    func addNoteToHighlight(highlightId: String, body: String, timestampSeconds: Double? = nil) {
         guard let dbQueue else { return }
         let note = HighlightNote(
             id: UUID().uuidString,
             highlightId: highlightId,
             body: body,
-            createdAt: Date().timeIntervalSince1970
+            createdAt: Date().timeIntervalSince1970,
+            timestampSeconds: timestampSeconds
         )
         do {
             try dbQueue.write { db in
@@ -566,6 +567,38 @@ final class DatabaseManager {
                    let cnt: Int = row["cnt"] {
                     result[hid] = cnt
                 }
+            }
+            return result
+        }) ?? [:]
+    }
+
+    /// Returns intrinsic width/height ratios for a batch of highlights. The
+    /// ratio is the media's pixel width divided by pixel height, pulled from
+    /// whichever source the highlight points to (screenshot, file_record, or
+    /// — for URL copies — the matching link_preview hero). Missing rows mean
+    /// the card should fall back to its default bucket.
+    func aspectRatiosForHighlights(ids: [String]) -> [String: CGFloat] {
+        guard let dbQueue, !ids.isEmpty else { return [:] }
+        return (try? dbQueue.read { db in
+            let placeholders = ids.map { _ in "?" }.joined(separator: ",")
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT
+                    h.id AS hid,
+                    COALESCE(s.imageWidth, f.imageWidth, lp.imageWidth) AS w,
+                    COALESCE(s.imageHeight, f.imageHeight, lp.imageHeight) AS h
+                FROM highlight h
+                LEFT JOIN screenshot s ON s.id = h.screenshotId
+                LEFT JOIN file_record f ON f.id = h.fileId
+                LEFT JOIN link_preview lp ON lp.url = h.contentText
+                WHERE h.id IN (\(placeholders))
+                """, arguments: StatementArguments(ids))
+            var result: [String: CGFloat] = [:]
+            for row in rows {
+                guard let hid: String = row["hid"],
+                      let w: Int = row["w"],
+                      let h: Int = row["h"],
+                      w > 0, h > 0 else { continue }
+                result[hid] = CGFloat(w) / CGFloat(h)
             }
             return result
         }) ?? [:]

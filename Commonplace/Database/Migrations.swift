@@ -500,5 +500,53 @@ struct AppMigrations {
                 t.add(column: "imageHeight", .integer)
             }
         }
+
+        migrator.registerMigration("v19_stack_item_position") { db in
+            // User-driven ordering of items within a stack. Default ranks
+            // match the historical "newest first" behavior, so nothing
+            // visibly changes at first launch; drag-to-reorder overwrites
+            // these values as the user arranges cells.
+            try db.alter(table: "highlight_stack") { t in
+                t.add(column: "position", .integer).notNull().defaults(to: 0)
+            }
+            try db.execute(sql: """
+                UPDATE highlight_stack
+                SET position = rowid_rank.rank
+                FROM (
+                    SELECT rowid,
+                           (ROW_NUMBER() OVER (
+                               PARTITION BY stackId
+                               ORDER BY addedAt DESC
+                           )) - 1 AS rank
+                    FROM highlight_stack
+                ) AS rowid_rank
+                WHERE highlight_stack.rowid = rowid_rank.rowid
+                """)
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_highlight_stack_stack_position
+                ON highlight_stack(stackId, position)
+                """)
+        }
+
+        migrator.registerMigration("v20_link_preview_og") { db in
+            // Extended Open Graph fields beyond what `LPMetadataProvider`
+            // exposes — description, author, publish date, and og:type —
+            // scraped from the page's <head> in a supplementary fetch.
+            try db.alter(table: "link_preview") { t in
+                t.add(column: "ogDescription", .text)
+                t.add(column: "ogAuthor", .text)
+                t.add(column: "ogPublishedAt", .double)
+                t.add(column: "ogType", .text)
+            }
+        }
+
+        migrator.registerMigration("v21_source_context") { db in
+            // JSON-encoded [SourceContextEntry] produced by per-app enrichers
+            // at capture time (chat name, permalink, etc.). Nullable so
+            // existing rows render unchanged; backfill handled separately.
+            try db.alter(table: "highlight") { t in
+                t.add(column: "sourceContext", .text)
+            }
+        }
     }
 }

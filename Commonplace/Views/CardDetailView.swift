@@ -249,20 +249,24 @@ struct CardDetailView: View {
     @ViewBuilder
     private var stackSection: some View {
         if !stacks.isEmpty {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 10) {
                 SectionLabel(
                     text: "In \(stacks.count) stack\(stacks.count == 1 ? "" : "s")"
                 )
 
-                VStack(spacing: 8) {
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 140), spacing: 8)],
+                    alignment: .leading,
+                    spacing: 8
+                ) {
                     ForEach(stacks) { stack in
-                        StackDetailRow(
+                        StackChip(
                             stack: stack,
                             onTap: onStackNavigation.map { handler in
                                 { handler(stack) }
-                            },
-                            onRemove: { removeStack(stack) }
+                            }
                         )
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
             }
@@ -288,8 +292,10 @@ struct CardDetailView: View {
         let showURL = url != nil && !highlight.isURLCopy
         let app = highlight.sourceApp
         let showApp = (app?.isEmpty == false)
+        // `page_url` is already rendered via EmbeddedLinkPreview.
+        let contextEntries = highlight.decodedSourceContext.filter { $0.key != "page_url" }
 
-        if showURL || showApp {
+        if showURL || showApp || !contextEntries.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 SectionLabel(text: "Source")
                 VStack(alignment: .leading, spacing: 8) {
@@ -298,6 +304,9 @@ struct CardDetailView: View {
                     }
                     if showApp, let app {
                         AppSourceBadge(appName: app, bundleId: highlight.bundleId)
+                    }
+                    ForEach(contextEntries, id: \.key) { entry in
+                        ContextualSourceRow(entry: entry)
                     }
                 }
             }
@@ -783,6 +792,77 @@ private struct AppSourceBadge: View {
                         .foregroundStyle(.tertiary)
                 }
         }
+    }
+}
+
+/// Per-app provenance row — chat name, permalink, channel, etc. —
+/// produced by a SourceEnricher at capture time. Mirrors AppSourceBadge so
+/// rows compose cohesively in the Source stack.
+private struct ContextualSourceRow: View {
+    let entry: SourceContextEntry
+    @State private var isHovered = false
+
+    private var isTappable: Bool {
+        guard let urlString = entry.url, let _ = URL(string: urlString) else { return false }
+        return true
+    }
+
+    var body: some View {
+        Group {
+            if isTappable {
+                Button(action: openURL) {
+                    rowContent
+                }
+                .buttonStyle(.plain)
+                .onHover { isHovered = $0 }
+            } else {
+                rowContent
+            }
+        }
+    }
+
+    private var rowContent: some View {
+        HStack(alignment: .center, spacing: 10) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color.secondary.opacity(0.15))
+                    .frame(width: 40, height: 40)
+                Image(systemName: entry.icon ?? "info.circle")
+                    .font(.system(size: 16))
+                    .foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(entry.label)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(entry.value)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            Spacer(minLength: 0)
+            if isTappable {
+                Image(systemName: "arrow.up.right")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.secondary.opacity(isHovered ? 0.1 : 0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.secondary.opacity(0.12), lineWidth: 0.5)
+        )
+        .contentShape(Rectangle())
+    }
+
+    private func openURL() {
+        guard let urlString = entry.url, let url = URL(string: urlString) else { return }
+        NSWorkspace.shared.open(url)
     }
 }
 

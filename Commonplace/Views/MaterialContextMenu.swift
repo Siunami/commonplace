@@ -90,6 +90,7 @@ enum MaterialAction {
 
 struct MaterialContextMenuModifier: ViewModifier {
     let highlight: Highlight
+    var onShowDetails: (() -> Void)?
 
     func body(content: Content) -> some View {
         content.contextMenu {
@@ -110,6 +111,11 @@ struct MaterialContextMenuModifier: ViewModifier {
             }
 
             shareButton
+
+            if let onShowDetails {
+                Divider()
+                Button("Show Details", action: onShowDetails)
+            }
         }
     }
 
@@ -127,8 +133,11 @@ struct MaterialContextMenuModifier: ViewModifier {
 }
 
 extension View {
-    func materialContextMenu(for highlight: Highlight) -> some View {
-        modifier(MaterialContextMenuModifier(highlight: highlight))
+    func materialContextMenu(
+        for highlight: Highlight,
+        onShowDetails: (() -> Void)? = nil
+    ) -> some View {
+        modifier(MaterialContextMenuModifier(highlight: highlight, onShowDetails: onShowDetails))
     }
 }
 

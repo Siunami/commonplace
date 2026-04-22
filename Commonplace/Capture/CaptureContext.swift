@@ -17,16 +17,52 @@ struct CaptureContext {
     let appearanceMode: String?
     let wifiNetwork: String?
 
+    // v21 per-app enricher output (JSON-encoded [SourceContextEntry])
+    let sourceContext: String?
+
     static func current(frontApp: NSRunningApplication? = nil, captureClipboardTypes: Bool = false) -> CaptureContext {
         let frontApp = frontApp ?? NSWorkspace.shared.frontmostApplication
         let bundleId = frontApp?.bundleIdentifier
         let appName = frontApp?.localizedName
+        let pid = frontApp?.processIdentifier
         let windowTitle = activeWindowTitle()
-        let (documentPath, documentUrl) = activeDocumentInfo(pid: frontApp?.processIdentifier)
+        let (documentPath, documentUrl) = activeDocumentInfo(pid: pid)
 
-        // Source URL: try browser AppleScript first, then fall back to document URL
-        var sourceUrl: String? = nil
-        if let bid = bundleId {
+        // Pasteboard flavors — only read when this capture originates from
+        // a clipboard/paste event. Reading pasteboard contents outside of a
+        // copy event returns stale data which would just confuse enrichers.
+        var pasteboardTypesRaw: [String] = []
+        var pasteboardHTML: String? = nil
+        var pasteboardRTF: String? = nil
+        var pasteboardText: String? = nil
+        if captureClipboardTypes {
+            pasteboardTypesRaw = NSPasteboard.general.types?.map({ $0.rawValue }) ?? []
+            pasteboardHTML = NSPasteboard.general.string(forType: .html)
+            pasteboardText = NSPasteboard.general.string(forType: .string)
+            if let rtfData = NSPasteboard.general.data(forType: .rtf),
+               let attr = try? NSAttributedString(data: rtfData, options: [:], documentAttributes: nil) {
+                pasteboardRTF = attr.string
+            }
+        }
+
+        // Run the enricher registry before resolving sourceUrl so a
+        // browser-enricher-supplied page_url can seed the field.
+        let rawInputs = RawCaptureInputs(
+            bundleId: bundleId,
+            appName: appName,
+            windowTitle: windowTitle,
+            pid: pid,
+            pasteboardTypes: pasteboardTypesRaw,
+            pasteboardHTML: pasteboardHTML,
+            pasteboardRTF: pasteboardRTF,
+            pasteboardText: pasteboardText
+        )
+        let entries = SourceEnricherRegistry.shared.enrich(inputs: rawInputs)
+
+        // Source URL precedence: enricher page_url → BrowserURLExtractor
+        // (legacy path, still populated for caches) → AX document URL.
+        var sourceUrl: String? = entries.first(where: { $0.key == "page_url" })?.url
+        if sourceUrl == nil, let bid = bundleId {
             sourceUrl = BrowserURLExtractor.shared.extractURL(bundleId: bid)
         }
         if sourceUrl == nil {
@@ -34,12 +70,17 @@ struct CaptureContext {
         }
 
         var clipboardTypesJSON: String? = nil
-        if captureClipboardTypes {
-            if let types = NSPasteboard.general.types?.map({ $0.rawValue }),
-               let data = try? JSONSerialization.data(withJSONObject: types),
-               let json = String(data: data, encoding: .utf8) {
-                clipboardTypesJSON = json
-            }
+        if captureClipboardTypes, !pasteboardTypesRaw.isEmpty,
+           let data = try? JSONSerialization.data(withJSONObject: pasteboardTypesRaw),
+           let json = String(data: data, encoding: .utf8) {
+            clipboardTypesJSON = json
+        }
+
+        var sourceContextJSON: String? = nil
+        if !entries.isEmpty,
+           let data = try? JSONEncoder().encode(entries),
+           let json = String(data: data, encoding: .utf8) {
+            sourceContextJSON = json
         }
 
         // Environment snapshot
@@ -65,7 +106,8 @@ struct CaptureContext {
             displayName: displayName,
             displayResolution: displayResolution,
             appearanceMode: appearanceMode,
-            wifiNetwork: wifiNetwork
+            wifiNetwork: wifiNetwork,
+            sourceContext: sourceContextJSON
         )
     }
 

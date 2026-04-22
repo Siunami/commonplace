@@ -21,6 +21,21 @@ struct StackDetailView: View {
     @State private var isEditingName = false
     @State private var isEditingDescription = false
 
+    // Drag-to-reorder. The in-flow cell for the dragged item becomes
+    // invisible while a floating preview — rendered as a sibling of the
+    // grid in the same "stackGrid" coordinate space — follows the
+    // cursor via `.position`. Decoupling the preview from the grid's
+    // layout means cursor-tracking is instant and doesn't fight the
+    // spring animation that reshuffles neighbour cells.
+    @State private var cellFrames: [String: CGRect] = [:]
+    @State private var slotSize: CGSize = .zero
+    @State private var draggingId: String? = nil
+    @State private var dragCursor: CGPoint = .zero
+    @State private var dragCursorOffsetInCell: CGSize = .zero
+    /// Set briefly on drag end so the concurrent `onTapGesture` in the
+    /// cell doesn't fire `onOpen()` as a side-effect of the release.
+    @State private var didJustDrag = false
+
     init(stack: Stack, onDismiss: @escaping () -> Void, onOpenHighlight: @escaping (Highlight) -> Void = { _ in }) {
         self.stack = stack
         self.onDismiss = onDismiss
@@ -202,25 +217,137 @@ struct StackDetailView: View {
             emptyState
         } else {
             ScrollView {
-                LazyVGrid(columns: gridColumns, spacing: 14) {
-                    ForEach(items) { item in
-                        StackDetailItemCell(
-                            highlight: item,
-                            noteCount: noteCounts[item.id] ?? 0,
-                            onRemove: {
-                                db.removeHighlight(item.id, fromStack: currentStack.id)
-                            },
-                            onOpen: {
-                                onOpenHighlight(item)
-                            }
-                        )
-                        .aspectRatio(1, contentMode: .fit)
+                ZStack(alignment: .topLeading) {
+                    LazyVGrid(columns: gridColumns, spacing: 14) {
+                        ForEach(items) { item in
+                            cellWrapper(for: item)
+                        }
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 20)
+
+                    if let id = draggingId,
+                       let draggedItem = items.first(where: { $0.id == id }) {
+                        floatingDragPreview(for: draggedItem)
                     }
                 }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 20)
+                .coordinateSpace(name: "stackGrid")
+                .onPreferenceChange(CellFramesKey.self) { frames in
+                    var dict: [String: CGRect] = [:]
+                    for frame in frames { dict[frame.id] = frame.frame }
+                    cellFrames = dict
+                    if let any = frames.first?.frame.size, any != .zero {
+                        slotSize = any
+                    }
+                }
             }
         }
+    }
+
+    @ViewBuilder
+    private func cellWrapper(for item: Highlight) -> some View {
+        let isDragging = draggingId == item.id
+        StackDetailItemCell(
+            highlight: item,
+            noteCount: noteCounts[item.id] ?? 0,
+            isBeingDragged: isDragging,
+            didJustDrag: didJustDrag,
+            onRemove: {
+                db.removeHighlight(item.id, fromStack: currentStack.id)
+            },
+            onOpen: {
+                onOpenHighlight(item)
+            }
+        )
+        .aspectRatio(1, contentMode: .fit)
+        .background(
+            GeometryReader { geo in
+                Color.clear.preference(
+                    key: CellFramesKey.self,
+                    value: [CellFrame(id: item.id, frame: geo.frame(in: .named("stackGrid")))]
+                )
+            }
+        )
+        .opacity(isDragging ? 0 : 1)
+        .simultaneousGesture(dragGesture(for: item))
+    }
+
+    /// Floats above the grid in the same coordinate space. `.position`
+    /// is a pure-layout modifier that reads `dragCursor` directly — no
+    /// animation, no dependency on the cell's natural slot origin, so
+    /// it tracks the cursor 1:1 on every drag tick.
+    @ViewBuilder
+    private func floatingDragPreview(for item: Highlight) -> some View {
+        StackDetailItemCell(
+            highlight: item,
+            noteCount: noteCounts[item.id] ?? 0,
+            isBeingDragged: true,
+            didJustDrag: false,
+            onRemove: {},
+            onOpen: {}
+        )
+        .frame(width: slotSize.width, height: slotSize.height)
+        .scaleEffect(1.04)
+        .shadow(color: .black.opacity(0.3), radius: 18, y: 8)
+        .rotationEffect(.degrees(1.2))
+        .position(
+            x: dragCursor.x - dragCursorOffsetInCell.width + slotSize.width / 2,
+            y: dragCursor.y - dragCursorOffsetInCell.height + slotSize.height / 2
+        )
+        .allowsHitTesting(false)
+        .transition(.opacity)
+    }
+
+    private func dragGesture(for item: Highlight) -> some Gesture {
+        // Short minimumDistance keeps drag engagement feeling
+        // immediate while still letting a pure click reach the cell's
+        // onTapGesture (open-in-detail).
+        DragGesture(minimumDistance: 3, coordinateSpace: .named("stackGrid"))
+            .onChanged { value in
+                if draggingId == nil {
+                    let origin = cellFrames[item.id]?.origin ?? .zero
+                    dragCursorOffsetInCell = CGSize(
+                        width: value.startLocation.x - origin.x,
+                        height: value.startLocation.y - origin.y
+                    )
+                    dragCursor = value.location
+                    draggingId = item.id
+                } else {
+                    dragCursor = value.location
+                }
+                guard let targetId = cellIDContainingPoint(value.location),
+                      targetId != item.id,
+                      let from = items.firstIndex(where: { $0.id == item.id }),
+                      let to = items.firstIndex(where: { $0.id == targetId }) else {
+                    return
+                }
+                let destination = to > from ? to + 1 : to
+                withAnimation(.interactiveSpring(response: 0.18, dampingFraction: 0.86)) {
+                    items.move(fromOffsets: IndexSet(integer: from), toOffset: destination)
+                }
+            }
+            .onEnded { _ in
+                guard draggingId == item.id else { return }
+                let order = items.map(\.id)
+                let stackId = currentStack.id
+                Task.detached(priority: .userInitiated) {
+                    DatabaseManager.shared.reorderHighlightsInStack(stackId: stackId, orderedIds: order)
+                }
+                draggingId = nil
+                didJustDrag = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                    didJustDrag = false
+                }
+            }
+    }
+
+    private func cellIDContainingPoint(_ point: CGPoint) -> String? {
+        // Require containment (not nearest-center) so cursors in the
+        // gutter between cells don't thrash neighbouring cells.
+        for (id, frame) in cellFrames where frame.contains(point) {
+            return id
+        }
+        return nil
     }
 
     /// Adaptive square cells — column count scales with the window,
@@ -326,9 +453,23 @@ struct StackDetailView: View {
 // types show inline readable text. No internal aspect constraint,
 // because the Layout above has already picked the box.
 
+struct CellFrame: Equatable {
+    let id: String
+    let frame: CGRect
+}
+
+struct CellFramesKey: PreferenceKey {
+    static let defaultValue: [CellFrame] = []
+    static func reduce(value: inout [CellFrame], nextValue: () -> [CellFrame]) {
+        value.append(contentsOf: nextValue())
+    }
+}
+
 private struct StackDetailItemCell: View {
     let highlight: Highlight
     var noteCount: Int = 0
+    var isBeingDragged: Bool = false
+    var didJustDrag: Bool = false
     var onRemove: () -> Void
     var onOpen: () -> Void
 
@@ -349,12 +490,15 @@ private struct StackDetailItemCell: View {
         )
         .shadow(color: UITokens.shadowCard, radius: isHovered ? 8 : 6, y: 2)
         .overlay(alignment: .topTrailing) {
-            if isHovered {
+            if isHovered && !isBeingDragged {
                 removeButton.padding(6).transition(.opacity)
             }
         }
         .contentShape(Rectangle())
-        .onTapGesture { onOpen() }
+        .onTapGesture {
+            guard !isBeingDragged, !didJustDrag else { return }
+            onOpen()
+        }
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.15)) { isHovered = hovering }
         }

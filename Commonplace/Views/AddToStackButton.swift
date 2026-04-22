@@ -68,7 +68,7 @@ struct AddToStackButton: View {
             Image(systemName: iconName)
                 .font(.system(size: expanded ? 11 : 10, weight: .medium))
             if expanded {
-                Text(isInStack ? "In stack" : "Add to stack")
+                Text(expandedLabel)
                     .font(.system(size: 11, weight: .medium))
             }
         }
@@ -105,28 +105,38 @@ struct AddToStackButton: View {
     }
 
     private var iconName: String {
-        isInStack ? "checkmark.circle.fill" : "rectangle.stack.badge.plus"
+        if isInStack {
+            return isHovered ? "xmark.circle.fill" : "checkmark.circle.fill"
+        }
+        return "rectangle.stack.badge.plus"
+    }
+
+    private var expandedLabel: String {
+        if isInStack { return isHovered ? "Remove" : "In stack" }
+        return "Add to stack"
     }
 
     private var pillForeground: Color {
-        if isInStack { return Color.accentColor }
+        if isInStack {
+            return isHovered ? Color.red : Color.accentColor
+        }
         return isHovered ? .primary : Color.secondary.opacity(0.7)
     }
 
     private var pillBackground: Color {
         if isInStack {
-            return isHovered ? Color.accentColor.opacity(0.18) : Color.accentColor.opacity(0.12)
+            return isHovered ? Color.red.opacity(0.14) : Color.accentColor.opacity(0.12)
         }
         return isHovered ? Color.primary.opacity(0.08) : Color.clear
     }
 
     private var overlayForeground: Color {
-        isInStack ? .white : .white
+        .white
     }
 
     private var overlayBackground: Color {
         if isInStack {
-            return Color.accentColor.opacity(isHovered ? 0.95 : 0.9)
+            return isHovered ? Color.red.opacity(0.9) : Color.accentColor.opacity(0.9)
         }
         return Color.black.opacity(isHovered ? 0.65 : 0.45)
     }

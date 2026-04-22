@@ -45,7 +45,8 @@ final class HighlightCapture {
             displayName: result.context.displayName,
             displayResolution: result.context.displayResolution,
             appearanceMode: result.context.appearanceMode,
-            wifiNetwork: result.context.wifiNetwork
+            wifiNetwork: result.context.wifiNetwork,
+            sourceContext: result.context.sourceContext
         )
         db.insertHighlight(highlight)
         NotificationCenter.default.post(name: .highlightDidSave, object: nil)
@@ -185,7 +186,8 @@ final class HighlightCapture {
             displayName: context.displayName,
             displayResolution: context.displayResolution,
             appearanceMode: context.appearanceMode,
-            wifiNetwork: context.wifiNetwork
+            wifiNetwork: context.wifiNetwork,
+            sourceContext: context.sourceContext
         )
         db.insertHighlight(highlight)
 
@@ -226,7 +228,8 @@ final class HighlightCapture {
             displayName: nil,
             displayResolution: nil,
             appearanceMode: nil,
-            wifiNetwork: nil
+            wifiNetwork: nil,
+            sourceContext: nil
         )
         db.insertHighlight(highlight)
         for tagId in tagIds {
@@ -299,7 +302,8 @@ final class HighlightCapture {
             displayName: nil,
             displayResolution: nil,
             appearanceMode: nil,
-            wifiNetwork: nil
+            wifiNetwork: nil,
+            sourceContext: nil
         )
         db.insertHighlight(highlight)
         NotificationCenter.default.post(name: .highlightDidSave, object: nil)

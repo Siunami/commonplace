@@ -412,14 +412,11 @@ struct BrowseView: View {
                                         MasonryCard(
                                             highlight: highlight,
                                             noteCount: noteCounts[highlight.id] ?? 0,
-                                            preferredAspectRatio: aspectRatios[highlight.id],
-                                            onImageFullscreen: { image in
-                                                withAnimation(.easeInOut(duration: 0.2)) { fullScreenImage = image }
-                                            }
+                                            preferredAspectRatio: aspectRatios[highlight.id]
                                         )
                                         .id(highlight.id)
                                         .onTapGesture {
-                                            withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = highlight }
+                                            routeCardTap(highlight)
                                         }
                                     }
                                 }
@@ -429,7 +426,7 @@ struct BrowseView: View {
                                     highlights: filteredHighlights,
                                     noteCounts: noteCounts,
                                     onSelect: { highlight in
-                                        withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = highlight }
+                                        routeCardTap(highlight)
                                     }
                                 )
                             }
@@ -701,6 +698,12 @@ struct BrowseView: View {
         // origin breadcrumb, card detail, stack detail — renders its
         // "in stack" state without needing the set threaded as a prop.
         .environment(\.pinnedStackMembers, pinnedStackMembers)
+    }
+
+    // MARK: - Card tap routing
+
+    private func routeCardTap(_ highlight: Highlight) {
+        withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = highlight }
     }
 
     // MARK: - Data Loading
@@ -975,6 +978,43 @@ private struct MasonryLayout: Layout {
     }
 }
 
+// MARK: - Source Link
+
+/// Openable reference attached to a card's hover-revealed top-right pill.
+/// Ranked so enricher-extracted deeplinks and web URLs win over weaker
+/// fallbacks (file path, then bare app-launch) — see `MasonryCard.sourceLink`.
+enum CardSourceLink {
+    case url(String, label: String)
+    case file(URL, label: String)
+    case app(bundleId: String, label: String)
+
+    var label: String {
+        switch self {
+        case .url(_, let l), .file(_, let l), .app(_, let l): return l
+        }
+    }
+
+    var iconName: String {
+        switch self {
+        case .url, .file: return "arrow.up.forward.square.fill"
+        case .app: return "arrow.up.forward.app.fill"
+        }
+    }
+
+    func open() {
+        switch self {
+        case .url(let s, _):
+            if let url = URL(string: s) { NSWorkspace.shared.open(url) }
+        case .file(let url, _):
+            NSWorkspace.shared.open(url)
+        case .app(let bundleId, _):
+            if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId) {
+                NSWorkspace.shared.open(appURL)
+            }
+        }
+    }
+}
+
 // MARK: - Masonry Card
 
 private struct MasonryCard: View {
@@ -985,7 +1025,6 @@ private struct MasonryCard: View {
     /// preview reserve aspect-correct space before any image/video decodes,
     /// which keeps neighbour cards from re-flowing when the bitmap arrives.
     var preferredAspectRatio: CGFloat? = nil
-    var onImageFullscreen: ((NSImage) -> Void)? = nil
     @State private var isHovered = false
     @State private var isLinkHovered = false
 
@@ -994,48 +1033,93 @@ private struct MasonryCard: View {
         return false
     }
 
-    private var hasSourceUrl: Bool {
-        guard let url = highlight.sourceUrl, !url.isEmpty else { return false }
-        return URL(string: url) != nil
+    /// Best "open outside the app" target for this card, picked by strength.
+    /// Enricher URLs (Slack permalinks, browser page URL) > `sourceUrl` >
+    /// URL-copy `contentText` > file path > bare app launch via `bundleId`.
+    private var sourceLink: CardSourceLink? {
+        if let entry = highlight.decodedSourceContext.first(where: { $0.url != nil }),
+           let urlString = entry.url, let parsed = URL(string: urlString) {
+            return .url(urlString, label: hostLabel(from: parsed, fallback: urlString))
+        }
+
+        if let urlString = highlight.sourceUrl, !urlString.isEmpty,
+           let parsed = URL(string: urlString), parsed.scheme?.hasPrefix("http") == true {
+            return .url(urlString, label: hostLabel(from: parsed, fallback: urlString))
+        }
+
+        if highlight.isURLCopy {
+            let trimmed = highlight.contentText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let parsed = URL(string: trimmed) {
+                return .url(trimmed, label: hostLabel(from: parsed, fallback: trimmed))
+            }
+        }
+
+        if let path = highlight.sourceUrl, path.hasPrefix("/"),
+           FileManager.default.fileExists(atPath: path) {
+            let url = URL(fileURLWithPath: path)
+            return .file(url, label: url.lastPathComponent)
+        }
+        if let path = highlight.documentPath, !path.isEmpty,
+           FileManager.default.fileExists(atPath: path) {
+            let url = URL(fileURLWithPath: path)
+            return .file(url, label: url.lastPathComponent)
+        }
+
+        if let bid = highlight.bundleId, !bid.isEmpty,
+           let name = highlight.sourceApp, !name.isEmpty {
+            return .app(bundleId: bid, label: name)
+        }
+        return nil
     }
 
-    private var sourceDomain: String? {
-        guard let urlString = highlight.sourceUrl,
-              let url = URL(string: urlString),
-              let host = url.host else { return nil }
-        return host.replacingOccurrences(of: "www.", with: "")
+    private func hostLabel(from url: URL, fallback: String) -> String {
+        if let host = url.host, !host.isEmpty {
+            return host.replacingOccurrences(of: "www.", with: "")
+        }
+        return fallback
+    }
+
+    private func linkHelp(_ link: CardSourceLink) -> String {
+        switch link {
+        case .url(let s, _): return "Open \(s)"
+        case .file(let u, _): return "Open \(u.lastPathComponent)"
+        case .app(_, let name): return "Open in \(name)"
+        }
     }
 
     var body: some View {
         VStack(spacing: 0) {
             cardContent
-
-            // Annotation slot: always rendered so the card's total
-            // height never changes when a note is added, edited, or
-            // removed via notification. reservesSpace: true holds the
-            // 6-line vertical budget even when the text is empty,
-            // which is what keeps masonry neighbours from re-packing.
-            VStack(alignment: .leading, spacing: 5) {
-                Text(highlight.userNote ?? "")
-                    .font(.system(.callout, design: .serif))
-                    .foregroundStyle(.primary.opacity(0.85))
-                    .lineLimit(6, reservesSpace: true)
-
-                if noteCount > 1 {
-                    Text("+\(noteCount - 1) more")
-                        .font(.caption2)
-                        .foregroundStyle(.orange.opacity(0.8))
+                .overlay(alignment: .bottomTrailing) {
+                    AddToStackButton(highlightId: highlight.id, style: .overlay)
+                        .padding(8)
                 }
+
+            if hasAnnotation || noteCount > 1 {
+                VStack(alignment: .leading, spacing: 5) {
+                    if hasAnnotation {
+                        Text(highlight.userNote ?? "")
+                            .font(.system(.callout, design: .serif))
+                            .foregroundStyle(.primary.opacity(0.85))
+                            .lineLimit(6)
+                    }
+
+                    if noteCount > 1 {
+                        Text("+\(noteCount - 1) more")
+                            .font(.caption2)
+                            .foregroundStyle(.orange.opacity(0.8))
+                    }
+                }
+                .padding(.leading, 14)
+                .overlay(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 0.5)
+                        .fill(hasAnnotation ? Color.orange.opacity(0.7) : Color.clear)
+                        .frame(width: 2)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 14)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.leading, 14)
-            .overlay(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 0.5)
-                    .fill(hasAnnotation ? Color.orange.opacity(0.7) : Color.clear)
-                    .frame(width: 2)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 14)
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(UITokens.surfaceCard)
         .clipped()
@@ -1046,25 +1130,19 @@ private struct MasonryCard: View {
         )
         .shadow(color: UITokens.shadowCard, radius: 6, y: 2)
         .overlay(alignment: .topTrailing) {
-            if hasSourceUrl && isHovered {
-                Button(action: {
-                    if let url = highlight.sourceUrl, let parsed = URL(string: url) {
-                        NSWorkspace.shared.open(parsed)
-                    }
-                }) {
+            if let link = sourceLink, isHovered {
+                Button(action: { link.open() }) {
                     HStack(spacing: 0) {
-                        if let domain = sourceDomain {
-                            Text(domain)
-                                .font(.system(size: 10, weight: .medium))
-                                .foregroundStyle(.white)
-                                .lineLimit(1)
-                                .fixedSize()
-                                .frame(width: isLinkHovered ? nil : 0, alignment: .trailing)
-                                .clipped()
-                                .padding(.leading, isLinkHovered ? 8 : 0)
-                                .padding(.trailing, isLinkHovered ? 4 : 0)
-                        }
-                        Image(systemName: "arrow.up.forward.square.fill")
+                        Text(link.label)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                            .fixedSize()
+                            .frame(width: isLinkHovered ? nil : 0, alignment: .trailing)
+                            .clipped()
+                            .padding(.leading, isLinkHovered ? 8 : 0)
+                            .padding(.trailing, isLinkHovered ? 4 : 0)
+                        Image(systemName: link.iconName)
                             .font(.system(size: 14))
                             .foregroundStyle(.white)
                     }
@@ -1077,6 +1155,7 @@ private struct MasonryCard: View {
                     .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
                 }
                 .buttonStyle(.plain)
+                .help(linkHelp(link))
                 .padding(8)
                 .onHover { hovering in
                     withAnimation(.easeInOut(duration: 0.2)) {
@@ -1085,10 +1164,6 @@ private struct MasonryCard: View {
                 }
                 .transition(.opacity)
             }
-        }
-        .overlay(alignment: .bottomTrailing) {
-            AddToStackButton(highlightId: highlight.id, style: .overlay)
-                .padding(8)
         }
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.15)) {
@@ -1102,15 +1177,15 @@ private struct MasonryCard: View {
     private var cardContent: some View {
         switch highlight.highlightType {
         case "screenshot":
-            ScreenshotCard(highlight: highlight, preferredAspectRatio: preferredAspectRatio, onImageFullscreen: onImageFullscreen)
+            ScreenshotCard(highlight: highlight, preferredAspectRatio: preferredAspectRatio)
         case "recording":
-            ScreenshotCard(highlight: highlight, preferredAspectRatio: preferredAspectRatio, onImageFullscreen: nil)
+            ScreenshotCard(highlight: highlight, preferredAspectRatio: preferredAspectRatio)
         case "highlight":
             HighlightCard(highlight: highlight)
         case "note":
             NoteCard(highlight: highlight)
         case "file":
-            FileCard(highlight: highlight, preferredAspectRatio: preferredAspectRatio, onImageFullscreen: onImageFullscreen)
+            FileCard(highlight: highlight, preferredAspectRatio: preferredAspectRatio)
         default:
             if highlight.isURLCopy {
                 LinkCard(highlight: highlight, preferredAspectRatio: preferredAspectRatio)
@@ -1240,9 +1315,7 @@ private struct ScreenshotCard: View {
     /// aspect-correct frame before `image` finishes loading — without this
     /// the card resizes when the bitmap arrives and neighbours shift.
     var preferredAspectRatio: CGFloat? = nil
-    var onImageFullscreen: ((NSImage) -> Void)? = nil
     @State private var image: NSImage?
-    @State private var imageHovered = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1259,15 +1332,6 @@ private struct ScreenshotCard: View {
                             .foregroundStyle(.tertiary)
                     }
             }
-            .overlay(alignment: .topTrailing) {
-                if let image, let onImageFullscreen {
-                    ExpandImageButton(isHovered: imageHovered) {
-                        onImageFullscreen(image)
-                    }
-                }
-            }
-            .onHover { imageHovered = $0 }
-
         }
         .task {
             if image == nil {
@@ -1448,25 +1512,25 @@ private enum TextCardStyle {
         let count = text.count
         if count < 60 {
             return Style(
-                font: .system(size: 22, weight: .medium, design: .serif),
-                lineLimit: 8,
-                verticalPadding: 18,
-                horizontalPadding: 16
+                font: .system(size: 20, weight: .medium, design: .serif),
+                lineLimit: 6,
+                verticalPadding: 12,
+                horizontalPadding: 14
             )
         }
         if count < 200 {
             return Style(
-                font: .system(size: 15, design: .serif),
-                lineLimit: 12,
-                verticalPadding: 14,
-                horizontalPadding: 14
+                font: .system(size: 14, design: .serif),
+                lineLimit: 10,
+                verticalPadding: 10,
+                horizontalPadding: 12
             )
         }
         return Style(
             font: .system(size: 13, design: .serif),
-            lineLimit: 16,
-            verticalPadding: 12,
-            horizontalPadding: 14
+            lineLimit: 14,
+            verticalPadding: 10,
+            horizontalPadding: 12
         )
     }
 }
@@ -1487,7 +1551,7 @@ private struct TextCard: View {
                 Text(highlight.contentText)
                     .font(style.font)
                     .foregroundStyle(.primary.opacity(0.85))
-                    .lineLimit(style.lineLimit, reservesSpace: true)
+                    .lineLimit(style.lineLimit)
                     .padding(.horizontal, style.horizontalPadding)
                     .padding(.vertical, style.verticalPadding)
             }
@@ -1514,7 +1578,7 @@ private struct HighlightCard: View {
                 Text(highlight.contentText)
                     .font(style.font)
                     .foregroundStyle(.primary.opacity(0.85))
-                    .lineLimit(style.lineLimit, reservesSpace: true)
+                    .lineLimit(style.lineLimit)
                     .padding(.horizontal, style.horizontalPadding)
                     .padding(.vertical, style.verticalPadding)
             }
@@ -1551,7 +1615,7 @@ private struct NoteCard: View {
         Text(highlight.contentText)
             .font(style.font)
             .foregroundStyle(.primary.opacity(0.85))
-            .lineLimit(style.lineLimit, reservesSpace: true)
+            .lineLimit(style.lineLimit)
             .padding(.horizontal, style.horizontalPadding)
             .padding(.vertical, style.verticalPadding)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1565,14 +1629,8 @@ private struct FileCard: View {
     /// Pre-resolved intrinsic aspect ratio from BrowseView's batch map. See
     /// ScreenshotCard for the rationale — same problem, same fix.
     var preferredAspectRatio: CGFloat? = nil
-    var onImageFullscreen: ((NSImage) -> Void)? = nil
     @State private var thumbnail: NSImage?
     @State private var fileRecord: FileRecord?
-    @State private var imageHovered = false
-
-    private var isImageFile: Bool {
-        fileRecord?.contentType == "image"
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1609,21 +1667,6 @@ private struct FileCard: View {
                         .padding(6)
                 }
             }
-            .overlay(alignment: .topTrailing) {
-                if isImageFile, let thumbnail, let onImageFullscreen {
-                    ExpandImageButton(isHovered: imageHovered) {
-                        // Prefer the original image over the thumbnail.
-                        if let rec = fileRecord,
-                           let full = NSImage(contentsOfFile: rec.filePath) {
-                            onImageFullscreen(full)
-                        } else {
-                            onImageFullscreen(thumbnail)
-                        }
-                    }
-                }
-            }
-            .onHover { imageHovered = $0 }
-
             Text(fileRecord?.fileName ?? URL(fileURLWithPath: highlight.contentText).lastPathComponent)
                 .font(.caption)
                 .lineLimit(2, reservesSpace: true)
@@ -1701,81 +1744,78 @@ private struct LinkCard: View {
         return urlString
     }
 
-    private func openURL() {
-        if let url = URL(string: urlString) {
-            NSWorkspace.shared.open(url)
-        }
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button(action: openURL) {
-                VStack(alignment: .leading, spacing: 0) {
-                    CardCoverPreview(
-                        image: heroImage,
-                        fallbackAspectRatio: 1.45,
-                        preferredAspectRatio: preferredAspectRatio,
-                        aspectRatioBuckets: [1.33, 1.58, 1.82]
-                    ) {
-                        Rectangle()
-                            .fill(.quaternary.opacity(0.15))
-                            .overlay {
-                                if !didLoad {
-                                    ProgressView()
-                                        .controlSize(.small)
-                                } else {
-                                    Image(systemName: "link")
-                                        .font(.system(size: 20, weight: .medium))
-                                        .foregroundStyle(.tertiary)
-                                }
-                            }
-                    }
-
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack(spacing: 6) {
-                            if let faviconImage {
-                                Image(nsImage: faviconImage)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fit)
-                                    .frame(width: 14, height: 14)
-                            } else {
-                                Image(systemName: "link")
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                                    .frame(width: 14, height: 14)
-                            }
-                            Text(displayHost)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                            Spacer(minLength: 0)
-                            Image(systemName: "arrow.up.right")
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundStyle(.tertiary)
-                        }
-
-                        Text(displayTitle)
-                            .font(.callout.weight(.semibold))
-                            .foregroundStyle(.primary)
-                            .lineLimit(3, reservesSpace: true)
-                            .truncationMode(.tail)
-                            .multilineTextAlignment(.leading)
-
-                        if let app = highlight.sourceApp {
-                            Text(app)
-                                .font(.caption2)
+            CardCoverPreview(
+                image: heroImage,
+                fallbackAspectRatio: 1.45,
+                preferredAspectRatio: preferredAspectRatio,
+                aspectRatioBuckets: [1.33, 1.58, 1.82]
+            ) {
+                Rectangle()
+                    .fill(.quaternary.opacity(0.15))
+                    .overlay {
+                        if !didLoad {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: "link")
+                                .font(.system(size: 20, weight: .medium))
                                 .foregroundStyle(.tertiary)
                         }
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.top, 8)
-                    .padding(.bottom, 2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    if let faviconImage {
+                        Image(nsImage: faviconImage)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 14, height: 14)
+                    } else {
+                        Image(systemName: "link")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .frame(width: 14, height: 14)
+                    }
+                    Text(displayHost)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 0)
+                    Image(systemName: "arrow.up.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+
+                Text(displayTitle)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(3)
+                    .truncationMode(.tail)
+                    .multilineTextAlignment(.leading)
+
+                if let desc = preview?.ogDescription, !desc.isEmpty {
+                    Text(desc)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.tail)
+                        .multilineTextAlignment(.leading)
+                }
+
+                if let app = highlight.sourceApp {
+                    Text(app)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                 }
             }
-            .buttonStyle(.plain)
-
+            .padding(.horizontal, 10)
+            .padding(.top, 8)
+            .padding(.bottom, 2)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .task {
             let fetched = await LinkPreviewStore.shared.preview(for: urlString)
@@ -1855,6 +1895,35 @@ struct DetailLinkPreview: View {
                         .foregroundStyle(.primary)
                         .multilineTextAlignment(.leading)
                         .fixedSize(horizontal: false, vertical: true)
+
+                    if let desc = preview?.ogDescription, !desc.isEmpty {
+                        Text(desc)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(4)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    if preview?.ogAuthor != nil || preview?.publishedDate != nil {
+                        HStack(spacing: 6) {
+                            if let author = preview?.ogAuthor, !author.isEmpty {
+                                Text(author)
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                            }
+                            if preview?.ogAuthor != nil && preview?.publishedDate != nil {
+                                Text("·")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                            }
+                            if let date = preview?.publishedDate {
+                                Text(date.formatted(date: .abbreviated, time: .omitted))
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                    }
                 }
             }
             .padding(16)

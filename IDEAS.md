@@ -138,3 +138,9 @@ Entitlements to audit: Screen Recording, Accessibility, and the CGEvent tap all 
 A CLI (`cp-ai`) that gives Claude Code full *read* access to the Commonplace archive and a structured way to propose organization — tags, collections, links, notes — without ever mutating the curated data. Two-DB split: main is opened read-only at the SQLite URI level (`?mode=ro`, a physical guarantee), while Claude writes into a separate `claude-suggestions.sqlite`. The only command that touches main is a user-invoked `accept`, so the user stays the sole writer into their own archive.
 
 Full spec: [ideas/claude-archive-cli.md](ideas/claude-archive-cli.md).
+
+## Per-app deeplink enrichers
+
+Upgrade the mosaic top-right pill so captures from Notes, Linear, Mail, Things, Notion open the *specific* note / issue / message — not just launch the source app. Infrastructure (`SourceEnricher`, `SourceContextEntry.url`, `MasonryCard.sourceLink`) already wires this up; each app just needs its own enricher. HTML-pasteboard and window-title paths are safe; AppleScript-based ones (Notes, Mail, Things) trigger macOS automation permission prompts per app — not a blocker, but the reason this is parked for now.
+
+Full spec: [ideas/per-app-deeplink-enrichers.md](ideas/per-app-deeplink-enrichers.md).

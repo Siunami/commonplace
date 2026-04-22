@@ -63,7 +63,7 @@ extension DatabaseManager {
                 SELECT h.* FROM highlight h
                 JOIN highlight_stack hs ON hs.highlightId = h.id
                 WHERE hs.stackId = ?
-                ORDER BY hs.addedAt DESC
+                ORDER BY hs.position ASC, hs.addedAt DESC
                 """, arguments: [stackId])
         }) ?? []
     }
@@ -76,7 +76,7 @@ extension DatabaseManager {
                 SELECT h.* FROM highlight h
                 JOIN highlight_stack hs ON hs.highlightId = h.id
                 WHERE hs.stackId = ?
-                ORDER BY hs.addedAt DESC
+                ORDER BY hs.position ASC, hs.addedAt DESC
                 LIMIT ?
                 """, arguments: [stackId, limit])
         }) ?? []
@@ -248,16 +248,22 @@ extension DatabaseManager {
     }
 
     /// Add an item to a stack. Bumps the stack's updatedAt so it floats
-    /// to the top of recency-ordered lists.
+    /// to the top of recency-ordered lists. New items land at the TOP
+    /// of the user-defined order (MIN(position) - 1) so captures appear
+    /// where the user expects them without disturbing existing drag
+    /// arrangements below.
     func addHighlight(_ highlightId: String, toStack stackId: String) {
         guard let dbQueue else { return }
         let now = Date().timeIntervalSince1970
         do {
             try dbQueue.write { db in
+                let nextPosition = (try Int.fetchOne(db,
+                    sql: "SELECT COALESCE(MIN(position), 0) - 1 FROM highlight_stack WHERE stackId = ?",
+                    arguments: [stackId]) ?? -1)
                 try db.execute(sql: """
-                    INSERT OR IGNORE INTO highlight_stack (stackId, highlightId, addedAt)
-                    VALUES (?, ?, ?)
-                    """, arguments: [stackId, highlightId, now])
+                    INSERT OR IGNORE INTO highlight_stack (stackId, highlightId, addedAt, position)
+                    VALUES (?, ?, ?, ?)
+                    """, arguments: [stackId, highlightId, now, nextPosition])
                 try db.execute(
                     sql: "UPDATE stack SET updatedAt = ? WHERE id = ?",
                     arguments: [now, stackId]
@@ -305,6 +311,31 @@ extension DatabaseManager {
         }
     }
 
+    /// Persist a new user-defined order for the given stack. `orderedIds`
+    /// must be the complete list of highlight ids currently in the stack;
+    /// any id present in the stack but missing from the list keeps its
+    /// prior position (shouldn't happen under normal drag-reorder flow).
+    func reorderHighlightsInStack(stackId: String, orderedIds: [String]) {
+        guard let dbQueue, !orderedIds.isEmpty else { return }
+        do {
+            try dbQueue.write { db in
+                for (index, hid) in orderedIds.enumerated() {
+                    try db.execute(sql: """
+                        UPDATE highlight_stack
+                        SET position = ?
+                        WHERE stackId = ? AND highlightId = ?
+                        """, arguments: [index, stackId, hid])
+                }
+            }
+            NotificationCenter.default.post(
+                name: .stackDataDidChange, object: nil,
+                userInfo: ["stackId": stackId, "reorder": true]
+            )
+        } catch {
+            CaptureLog.error("Failed to reorder stack items: \(error.localizedDescription)")
+        }
+    }
+
     /// Convenience used by the archive "+ to stack" button: add to the
     /// currently pinned stack if there is one; otherwise create a new
     /// unnamed stack, pin it, and add the item. Returns the stack used.
@@ -344,11 +375,19 @@ extension DatabaseManager {
         let now = Date().timeIntervalSince1970
         do {
             try dbQueue.write { db in
+                // Insert at the top. Reserve `highlightIds.count` slots
+                // below the current min so input order is preserved
+                // visually (first id in the array ends up highest).
+                let minExisting = (try Int.fetchOne(db,
+                    sql: "SELECT COALESCE(MIN(position), 0) FROM highlight_stack WHERE stackId = ?",
+                    arguments: [target.id]) ?? 0)
+                var nextPosition = minExisting - highlightIds.count
                 for hid in highlightIds {
                     try db.execute(sql: """
-                        INSERT OR IGNORE INTO highlight_stack (stackId, highlightId, addedAt)
-                        VALUES (?, ?, ?)
-                        """, arguments: [target.id, hid, now])
+                        INSERT OR IGNORE INTO highlight_stack (stackId, highlightId, addedAt, position)
+                        VALUES (?, ?, ?, ?)
+                        """, arguments: [target.id, hid, now, nextPosition])
+                    nextPosition += 1
                 }
                 try db.execute(
                     sql: "UPDATE stack SET updatedAt = ? WHERE id = ?",

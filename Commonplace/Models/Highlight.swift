@@ -26,6 +26,9 @@ struct Highlight: Codable, FetchableRecord, PersistableRecord, Identifiable, Equ
     var appearanceMode: String?
     var wifiNetwork: String?
 
+    // v21 per-app enricher output (JSON-encoded [SourceContextEntry])
+    var sourceContext: String?
+
     static let databaseTableName = "highlight"
 
     var date: Date { Date(timeIntervalSince1970: timestamp) }
@@ -35,5 +38,11 @@ struct Highlight: Codable, FetchableRecord, PersistableRecord, Identifiable, Equ
         let trimmed = contentText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://") else { return false }
         return !trimmed.contains(" ") && !trimmed.contains("\n")
+    }
+
+    var decodedSourceContext: [SourceContextEntry] {
+        guard let raw = sourceContext, !raw.isEmpty,
+              let data = raw.data(using: .utf8) else { return [] }
+        return (try? JSONDecoder().decode([SourceContextEntry].self, from: data)) ?? []
     }
 }

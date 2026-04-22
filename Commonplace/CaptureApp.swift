@@ -35,6 +35,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             CaptureLog.info("Database initialized successfully")
         }
 
+        // Per-app source enrichers. Browser first so it wins the `page_url`
+        // dispatch; chat enrichers don't overlap bundle ids so order is
+        // otherwise irrelevant.
+        SourceEnricherRegistry.shared.register(BrowserSourceEnricher())
+        SourceEnricherRegistry.shared.register(TelegramSourceEnricher())
+        SourceEnricherRegistry.shared.register(SlackSourceEnricher())
+        SourceEnricherRegistry.shared.register(DiscordSourceEnricher())
+        SourceEnricherRegistry.shared.register(MessagesSourceEnricher())
+
+        // Backfill historical rows on a background queue so launch isn't
+        // blocked; safe to re-run since it only touches rows still NULL.
+        DispatchQueue.global(qos: .utility).async {
+            DatabaseManager.shared.backfillSourceContextIfNeeded()
+        }
+
         if AppEnvironment.isRunningUITests {
             CaptureLog.info("UI test mode detected — skipping production capture services")
             BrowseWindowController.shared.show()

@@ -11,6 +11,16 @@ struct CardDetailView: View {
     var onDismiss: (() -> Void)?
     var onStackNavigation: ((Stack) -> Void)?
     var onImageFullscreen: ((NSImage) -> Void)?
+    /// Ordered list of items the user can arrow through, in the context
+    /// from which this detail was opened. When opened from a stack it's
+    /// the stack's items in their user-ordered sequence; from the Browse
+    /// archive it's the currently-filtered highlights in display order.
+    /// Empty disables navigation.
+    var siblings: [Highlight] = []
+    /// Callback invoked when the user arrows to a sibling. The caller
+    /// swaps `selectedHighlight`, preserving any origin context so back-
+    /// navigation still works. If nil, arrow keys are inert.
+    var onNavigate: ((Highlight) -> Void)?
     @State private var image: NSImage?
     @State private var screenshotHovered = false
     @State private var fileImageHovered = false
@@ -135,6 +145,7 @@ struct CardDetailView: View {
             noteInput
         }
         .frame(minWidth: 520, idealWidth: 740, maxWidth: .infinity, minHeight: 420, idealHeight: 720, maxHeight: .infinity)
+        .background(arrowNavShortcuts)
         .task {
             if isScreenshot && image == nil {
                 let path = highlight.contentText
@@ -147,6 +158,37 @@ struct CardDetailView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .stackDataDidChange).receive(on: DispatchQueue.main)) { _ in
             reloadStacks()
+        }
+    }
+
+    /// Invisible keyboard-shortcut buttons for arrow-key gallery
+    /// navigation. Rendered as a zero-size background so they
+    /// participate in the window's command table but never show up
+    /// visually or in accessibility. Disabled when there's no sibling
+    /// list or only the current item exists.
+    @ViewBuilder
+    private var arrowNavShortcuts: some View {
+        if let onNavigate, siblings.count > 1,
+           let idx = siblings.firstIndex(where: { $0.id == highlight.id }) {
+            ZStack {
+                Button("") {
+                    guard idx > 0 else { return }
+                    onNavigate(siblings[idx - 1])
+                }
+                .keyboardShortcut(.leftArrow, modifiers: [])
+                .opacity(0)
+                .accessibilityHidden(true)
+
+                Button("") {
+                    guard idx < siblings.count - 1 else { return }
+                    onNavigate(siblings[idx + 1])
+                }
+                .keyboardShortcut(.rightArrow, modifiers: [])
+                .opacity(0)
+                .accessibilityHidden(true)
+            }
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
         }
     }
 
@@ -243,9 +285,11 @@ struct CardDetailView: View {
     // MARK: - Stacks
 
     /// Bottom-of-card section surfacing every stack this item belongs to.
-    /// Hidden when the item isn't in any stacks — items get added from the
-    /// stack surfaces themselves (pinned stacks or newly created ones), not
-    /// from this detail view.
+    /// Each stack is rendered as a full StackCard — same 2x3 mosaic + label
+    /// as the stacks list — so the user sees the actual state of each stack
+    /// (not just a name). Hidden when the item isn't in any stacks — items
+    /// get added from the stack surfaces themselves, not from this detail
+    /// view.
     @ViewBuilder
     private var stackSection: some View {
         if !stacks.isEmpty {
@@ -255,18 +299,18 @@ struct CardDetailView: View {
                 )
 
                 LazyVGrid(
-                    columns: [GridItem(.adaptive(minimum: 140), spacing: 8)],
+                    columns: [GridItem(.adaptive(minimum: 220), spacing: 12)],
                     alignment: .leading,
-                    spacing: 8
+                    spacing: 12
                 ) {
                     ForEach(stacks) { stack in
-                        StackChip(
+                        StackCard(
                             stack: stack,
+                            isPinned: stack.isPinned,
                             onTap: onStackNavigation.map { handler in
                                 { handler(stack) }
                             }
                         )
-                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
             }

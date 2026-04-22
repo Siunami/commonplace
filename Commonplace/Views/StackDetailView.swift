@@ -20,6 +20,22 @@ struct StackDetailView: View {
     @State private var descriptionDraft: String = ""
     @State private var isEditingName = false
     @State private var isEditingDescription = false
+    /// Pinned stack (if any) — the candidate merge source. Kept in state
+    /// so the merge button's label and disabled state refresh whenever
+    /// the pin changes elsewhere.
+    @State private var pinnedStack: Stack? = nil
+    @State private var pinnedItemCount: Int = 0
+    @State private var showMergeConfirm = false
+
+    /// Multi-select state. Cmd-click toggles a cell, Shift-click extends
+    /// a range from `anchorSelectionIndex` to the tapped cell. A floating
+    /// action bar at the bottom surfaces bulk actions (remove, split to
+    /// new stack) while the selection is non-empty. Plain click always
+    /// opens the tapped item — selection and open coexist so the user
+    /// can build a selection without losing the ability to peek an item.
+    @State private var selectedIds: Set<String> = []
+    @State private var anchorSelectionIndex: Int? = nil
+    @State private var splitConfirmationText: String? = nil
 
     // Drag-to-reorder. The in-flow cell for the dragged item becomes
     // invisible while a floating preview — rendered as a sibling of the
@@ -55,6 +71,29 @@ struct StackDetailView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(UITokens.surfaceBackground)
+        .overlay(alignment: .bottom) {
+            if !selectedIds.isEmpty {
+                selectionActionBar
+                    .padding(.bottom, 20)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .overlay(alignment: .top) {
+            if let text = splitConfirmationText {
+                Text(text)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.primary.opacity(0.9))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(UITokens.surfaceFloater)
+                            .shadow(color: .black.opacity(0.25), radius: 10, y: 2)
+                    )
+                    .padding(.top, 70)
+                    .transition(.opacity)
+            }
+        }
         .onAppear(perform: reload)
         .onReceive(NotificationCenter.default.publisher(for: .stackDataDidChange).receive(on: DispatchQueue.main)) { _ in
             reload()
@@ -81,7 +120,16 @@ struct StackDetailView: View {
                 break
             }
         }
-        .onExitCommand(perform: onDismiss)
+        .onExitCommand {
+            if !selectedIds.isEmpty {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    selectedIds.removeAll()
+                    anchorSelectionIndex = nil
+                }
+            } else {
+                onDismiss()
+            }
+        }
     }
 
     // MARK: - Header
@@ -105,6 +153,7 @@ struct StackDetailView: View {
                 Spacer()
 
                 HStack(spacing: 8) {
+                    mergeButton
                     exportButton
                     pinToggleButton
                     closeButton
@@ -180,6 +229,67 @@ struct StackDetailView: View {
         .disabled(items.isEmpty)
     }
 
+    /// Header-level "Merge pinned here" — fuses the currently-pinned stack
+    /// into the stack on screen and deletes the pinned one. Hidden when
+    /// there's no pin to merge, or when the viewed stack *is* the pin
+    /// (self-merge is a no-op and would just delete the thing you're
+    /// looking at).
+    @ViewBuilder
+    private var mergeButton: some View {
+        if canMerge {
+            Button(action: { showMergeConfirm = true }) {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.triangle.merge")
+                        .font(.system(size: 10))
+                    Text(mergeButtonLabel)
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(
+                    Capsule().fill(Color.primary.opacity(0.06))
+                )
+            }
+            .buttonStyle(.plain)
+            .help("Merge pinned stack’s items into this one and delete the pinned stack")
+            .confirmationDialog(
+                mergeDialogTitle,
+                isPresented: $showMergeConfirm,
+                titleVisibility: .visible
+            ) {
+                Button("Merge and Delete Pinned", role: .destructive, action: performMerge)
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text(mergeDialogMessage)
+            }
+        }
+    }
+
+    private var canMerge: Bool {
+        guard let pinned = pinnedStack else { return false }
+        return pinned.id != currentStack.id
+    }
+
+    private var mergeButtonLabel: String {
+        guard let pinned = pinnedStack else { return "Merge pinned" }
+        let name = pinned.isNamed ? (pinned.name ?? "Pinned") : "Unnamed stack"
+        return "Merge ‘\(name)’ here"
+    }
+
+    private var mergeDialogTitle: String {
+        guard let pinned = pinnedStack else { return "Merge pinned stack" }
+        let source = pinned.isNamed ? (pinned.name ?? "Pinned") : "Unnamed stack"
+        let dest = currentStack.isNamed ? (currentStack.name ?? "This stack") : "Unnamed stack"
+        return "Merge ‘\(source)’ into ‘\(dest)’?"
+    }
+
+    private var mergeDialogMessage: String {
+        let n = pinnedItemCount
+        let items = "\(n) item\(n == 1 ? "" : "s")"
+        return "All \(items) in the pinned stack will be added here. The pinned stack will then be deleted. This can’t be undone."
+    }
+
     private var pinToggleButton: some View {
         Button(action: togglePin) {
             HStack(spacing: 4) {
@@ -247,16 +357,18 @@ struct StackDetailView: View {
     @ViewBuilder
     private func cellWrapper(for item: Highlight) -> some View {
         let isDragging = draggingId == item.id
+        let isSelected = selectedIds.contains(item.id)
         StackDetailItemCell(
             highlight: item,
             noteCount: noteCounts[item.id] ?? 0,
             isBeingDragged: isDragging,
             didJustDrag: didJustDrag,
+            isSelected: isSelected,
             onRemove: {
                 db.removeHighlight(item.id, fromStack: currentStack.id)
             },
             onOpen: {
-                onOpenHighlight(item)
+                handleCellTap(item)
             }
         )
         .aspectRatio(1, contentMode: .fit)
@@ -272,6 +384,38 @@ struct StackDetailView: View {
         .simultaneousGesture(dragGesture(for: item))
     }
 
+    /// Resolve a cell tap against the current modifier flags. Cmd toggles
+    /// the item in the selection and anchors a range-start; Shift selects
+    /// every cell between the anchor and the tapped index (inclusive);
+    /// plain clicks are unaffected by selection state and always open the
+    /// item, matching the "selection builds silently" pattern of Finder's
+    /// grid views.
+    private func handleCellTap(_ item: Highlight) {
+        let flags = NSEvent.modifierFlags
+        guard let tappedIndex = items.firstIndex(where: { $0.id == item.id }) else {
+            onOpenHighlight(item)
+            return
+        }
+        if flags.contains(.command) {
+            if selectedIds.contains(item.id) {
+                selectedIds.remove(item.id)
+            } else {
+                selectedIds.insert(item.id)
+            }
+            anchorSelectionIndex = tappedIndex
+            return
+        }
+        if flags.contains(.shift), let anchor = anchorSelectionIndex {
+            let lower = min(anchor, tappedIndex)
+            let upper = max(anchor, tappedIndex)
+            for i in lower...upper {
+                selectedIds.insert(items[i].id)
+            }
+            return
+        }
+        onOpenHighlight(item)
+    }
+
     /// Floats above the grid in the same coordinate space. `.position`
     /// is a pure-layout modifier that reads `dragCursor` directly — no
     /// animation, no dependency on the cell's natural slot origin, so
@@ -283,6 +427,7 @@ struct StackDetailView: View {
             noteCount: noteCounts[item.id] ?? 0,
             isBeingDragged: true,
             didJustDrag: false,
+            isSelected: false,
             onRemove: {},
             onOpen: {}
         )
@@ -388,6 +533,114 @@ struct StackDetailView: View {
         items = db.highlightsForStack(stackId: currentStack.id)
         let ids = items.map(\.id)
         noteCounts = db.noteCountsForHighlights(ids: ids)
+        let pinned = db.pinnedStack()
+        pinnedStack = pinned
+        pinnedItemCount = pinned.map { db.itemCountForStack(stackId: $0.id) } ?? 0
+        // Drop selections for items that are no longer in the stack (they
+        // may have just been removed by our own bulk action, merged away,
+        // or edited by another window).
+        let liveIds = Set(ids)
+        if !selectedIds.isSubset(of: liveIds) {
+            selectedIds = selectedIds.intersection(liveIds)
+            if selectedIds.isEmpty { anchorSelectionIndex = nil }
+        }
+        // If the merge confirmation was staged against a pin that's since
+        // changed or disappeared, close it so the user can't confirm an
+        // action that no longer matches the labels on the button.
+        if showMergeConfirm, !canMerge {
+            showMergeConfirm = false
+        }
+    }
+
+    private func performMerge() {
+        guard let pinned = pinnedStack, pinned.id != currentStack.id else { return }
+        _ = db.mergeStack(sourceId: pinned.id, into: currentStack.id)
+    }
+
+    // MARK: - Multi-select action bar
+
+    /// Floating pill shown at the bottom of the grid while at least one
+    /// cell is selected. Surfaces the bulk actions we care about today —
+    /// remove from stack, split into a new stack — plus a cancel that
+    /// clears the selection without mutating anything.
+    private var selectionActionBar: some View {
+        HStack(spacing: 14) {
+            Text("\(selectedIds.count) selected")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.primary.opacity(0.9))
+
+            Divider().frame(height: 16)
+
+            actionBarButton(icon: "arrow.up.and.line.horizontal.and.arrow.down", label: "Move to new stack", action: splitSelectionToNewStack)
+            actionBarButton(icon: "minus.circle", label: "Remove from stack", action: removeSelection, tint: Color.red.opacity(0.85))
+
+            Divider().frame(height: 16)
+
+            actionBarButton(icon: "xmark", label: "Clear", action: clearSelection)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(
+            Capsule()
+                .fill(UITokens.surfaceFloater)
+                .shadow(color: .black.opacity(0.3), radius: 18, y: 6)
+        )
+        .overlay(Capsule().strokeBorder(UITokens.surfaceBorder, lineWidth: 0.5))
+    }
+
+    @ViewBuilder
+    private func actionBarButton(icon: String, label: String, action: @escaping () -> Void, tint: Color = .primary) -> some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: icon).font(.system(size: 11, weight: .semibold))
+                Text(label).font(.system(size: 11, weight: .medium))
+            }
+            .foregroundStyle(tint.opacity(0.85))
+        }
+        .buttonStyle(.plain)
+        .help(label)
+    }
+
+    private func clearSelection() {
+        withAnimation(.easeInOut(duration: 0.15)) {
+            selectedIds.removeAll()
+            anchorSelectionIndex = nil
+        }
+    }
+
+    private func removeSelection() {
+        let ids = selectedIds
+        guard !ids.isEmpty else { return }
+        for id in ids {
+            db.removeHighlight(id, fromStack: currentStack.id)
+        }
+        clearSelection()
+    }
+
+    /// Split the current selection out into a new unnamed stack. The
+    /// source stack stays if it has survivors, or is auto-deleted by
+    /// the DB method if the selection emptied it. A brief HUD toast
+    /// names the new stack so the user knows where the items went.
+    private func splitSelectionToNewStack() {
+        let ids = selectedIds
+        guard !ids.isEmpty else { return }
+        let ordered = items.filter { ids.contains($0.id) }.map(\.id)
+        guard let newStack = db.moveHighlightsToNewStack(highlightIds: ordered, fromStack: currentStack.id) else {
+            return
+        }
+        clearSelection()
+        showSplitConfirmation("Moved \(ordered.count) to new stack")
+        _ = newStack
+    }
+
+    private func showSplitConfirmation(_ text: String) {
+        withAnimation(.easeInOut(duration: 0.15)) { splitConfirmationText = text }
+        Task {
+            try? await Task.sleep(for: .seconds(1.5))
+            await MainActor.run {
+                withAnimation(.easeInOut(duration: 0.3)) { splitConfirmationText = nil }
+            }
+        }
     }
 
     private func commitName() {
@@ -470,6 +723,7 @@ private struct StackDetailItemCell: View {
     var noteCount: Int = 0
     var isBeingDragged: Bool = false
     var didJustDrag: Bool = false
+    var isSelected: Bool = false
     var onRemove: () -> Void
     var onOpen: () -> Void
 
@@ -486,11 +740,23 @@ private struct StackDetailItemCell: View {
         .clipShape(RoundedRectangle(cornerRadius: UITokens.radiusCard))
         .overlay(
             RoundedRectangle(cornerRadius: UITokens.radiusCard)
-                .strokeBorder(UITokens.surfaceBorder, lineWidth: 0.5)
+                .strokeBorder(
+                    isSelected ? Color.accentColor : UITokens.surfaceBorder,
+                    lineWidth: isSelected ? 2 : 0.5
+                )
         )
         .shadow(color: UITokens.shadowCard, radius: isHovered ? 8 : 6, y: 2)
+        .overlay(alignment: .topLeading) {
+            if isSelected {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 18))
+                    .foregroundStyle(.white, Color.accentColor)
+                    .padding(6)
+                    .transition(.scale.combined(with: .opacity))
+            }
+        }
         .overlay(alignment: .topTrailing) {
-            if isHovered && !isBeingDragged {
+            if isHovered && !isBeingDragged && !isSelected {
                 removeButton.padding(6).transition(.opacity)
             }
         }

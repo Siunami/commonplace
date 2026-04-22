@@ -255,9 +255,27 @@ struct BrowseView: View {
     /// "already added" visual state on AddToStackButton.
     @State private var pinnedStackMembers: Set<String> = []
     @State private var selectedStack: Stack? = nil
+    /// The stack, if any, that the currently-open item was launched from.
+    /// When set, dismissing CardDetailView restores the stack overlay
+    /// instead of returning to the bare archive — so "open an item from
+    /// inside a stack" and "close that item" feels like pop rather than
+    /// two independent navigations. Also drives the sibling list used
+    /// by arrow-key gallery navigation.
+    @State private var originStack: Stack? = nil
+    /// Snapshot of origin-stack items captured when the user opened the
+    /// first highlight from a stack. Re-read from the DB only when the
+    /// origin stack itself changes — arrow-key paging within a stack
+    /// doesn't need a fresh fetch on every press.
+    @State private var originStackItems: [Highlight] = []
     @State private var showStacks = false
     @State private var fullScreenImage: NSImage?
     @State private var footerBarFrame: CGRect = .zero
+    /// Drawer state — a recent-stacks picker that slides in from the right
+    /// when the user hovers the pinned floater (after a short delay) or
+    /// clicks the chevron affordance. Used to swap the pinned stack
+    /// without navigating away from the current view.
+    @State private var drawerOpen = false
+    @State private var drawerHoverTask: Task<Void, Never>? = nil
     @AppStorage("browseViewMode") private var viewMode: BrowseViewMode = .mosaic
     private let pageSize = 50
 
@@ -283,7 +301,65 @@ struct BrowseView: View {
             }
             .offset(x: 6, y: -6)
         }
+        .overlay(alignment: .topLeading) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { drawerOpen.toggle() }
+            } label: {
+                Image(systemName: "rectangle.stack")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18, height: 18)
+                    .background(Circle().fill(UITokens.surfaceFloater))
+                    .overlay(Circle().strokeBorder(UITokens.surfaceBorder, lineWidth: 0.5))
+            }
+            .buttonStyle(.plain)
+            .offset(x: -6, y: -6)
+            .help("Switch pinned stack")
+        }
         .id("pinned-stack-\(pinned.id)")
+        .onHover { hovering in
+            handleFloaterHover(hovering)
+        }
+    }
+
+    /// Floater hover: entering schedules an open after a 250ms dwell (so
+    /// incidental passes through the corner don't flash the column open);
+    /// leaving schedules a close after 300ms (a subsequent enter into the
+    /// drawer cancels the pending close via `handleDrawerHover(true)`).
+    private func handleFloaterHover(_ hovering: Bool) {
+        drawerHoverTask?.cancel()
+        if hovering {
+            if drawerOpen { return }
+            let task = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                if Task.isCancelled { return }
+                withAnimation(.easeInOut(duration: 0.2)) { drawerOpen = true }
+            }
+            drawerHoverTask = task
+        } else {
+            guard drawerOpen else { return }
+            let task = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                if Task.isCancelled { return }
+                withAnimation(.easeInOut(duration: 0.2)) { drawerOpen = false }
+            }
+            drawerHoverTask = task
+        }
+    }
+
+    /// Drawer hover: entering cancels any pending close so the column
+    /// stays open while the cursor is over a card. Leaving schedules a
+    /// close after 300ms — a re-enter (into the column or back onto the
+    /// floater) cancels the pending close.
+    private func handleDrawerHover(_ hovering: Bool) {
+        drawerHoverTask?.cancel()
+        if hovering { return }
+        let task = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            if Task.isCancelled { return }
+            withAnimation(.easeInOut(duration: 0.2)) { drawerOpen = false }
+        }
+        drawerHoverTask = task
     }
 
     // MARK: - Computed
@@ -618,19 +694,25 @@ struct BrowseView: View {
                 ZStack {
                     Color.black.opacity(0.3)
                         .ignoresSafeArea()
-                        .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = nil } }
+                        .onTapGesture { dismissHighlight() }
 
                     CardDetailView(
                         highlight: highlight,
-                        onDismiss: { withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = nil } },
+                        onDismiss: { dismissHighlight() },
                         onStackNavigation: { stack in
                             withAnimation(.easeInOut(duration: 0.2)) {
                                 selectedHighlight = nil
+                                originStack = nil
+                                originStackItems = []
                                 selectedStack = stack
                             }
                         },
                         onImageFullscreen: { image in
                             withAnimation(.easeInOut(duration: 0.2)) { fullScreenImage = image }
+                        },
+                        siblings: siblings(for: highlight),
+                        onNavigate: { sibling in
+                            selectedHighlight = sibling
                         }
                     )
                         .id(highlight.id)
@@ -641,7 +723,7 @@ struct BrowseView: View {
                         .padding(40)
                 }
                 .transition(.opacity)
-                .onExitCommand { withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = nil } }
+                .onExitCommand { dismissHighlight() }
             }
         }
         .overlay {
@@ -655,7 +737,13 @@ struct BrowseView: View {
                         stack: stack,
                         onDismiss: { withAnimation(.easeInOut(duration: 0.2)) { selectedStack = nil } },
                         onOpenHighlight: { highlight in
+                            // Record the stack + its ordered items as the "origin"
+                            // for this highlight — dismissing it later restores the
+                            // stack overlay, and arrow keys page through the stack.
+                            let orderedItems = DatabaseManager.shared.highlightsForStack(stackId: stack.id)
                             withAnimation(.easeInOut(duration: 0.2)) {
+                                originStack = stack
+                                originStackItems = orderedItems
                                 selectedStack = nil
                                 selectedHighlight = highlight
                             }
@@ -681,16 +769,48 @@ struct BrowseView: View {
                 .transition(.opacity)
             }
         }
-        // Pinned stack floater — rendered as the topmost overlay so it's
-        // always reachable, even when a highlight or stack detail view
-        // is open on top of the archive. Anchored to the window's
-        // bottom-right corner with explicit clearance above the footer.
+        // Pinned stack floater + stack-switch column — rendered as the
+        // topmost overlay so they're always reachable, even when a
+        // highlight or stack detail view is open on top of the archive.
+        // The column (when open) sits directly above the floater in the
+        // same VStack so it reads as "more pinned-style tiles stacked
+        // above the pinned one," like messages rising from a chat input.
         .overlay(alignment: .bottomTrailing) {
             if let pinned = pinnedStack {
-                pinnedStackFloater(pinned)
+                GeometryReader { geo in
+                    VStack(alignment: .trailing, spacing: 8) {
+                        if drawerOpen {
+                            StackDrawer(
+                                currentPinnedId: pinned.id,
+                                maxColumnHeight: max(
+                                    120,
+                                    geo.size.height - footerBarFrame.height - 240
+                                ),
+                                onPick: { stack in
+                                    DatabaseManager.shared.setPinnedStack(id: stack.id)
+                                    withAnimation(.easeInOut(duration: 0.2)) { drawerOpen = false }
+                                },
+                                onDismiss: {
+                                    withAnimation(.easeInOut(duration: 0.2)) { drawerOpen = false }
+                                },
+                                onHoverChange: { hovering in
+                                    handleDrawerHover(hovering)
+                                }
+                            )
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
+
+                        pinnedStackFloater(pinned)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+                    .frame(
+                        maxWidth: .infinity,
+                        maxHeight: .infinity,
+                        alignment: .bottomTrailing
+                    )
                     .padding(.trailing, 16)
                     .padding(.bottom, footerBarFrame.height + 16)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
             }
         }
         // Membership of the pinned stack flows through the environment so
@@ -704,6 +824,34 @@ struct BrowseView: View {
 
     private func routeCardTap(_ highlight: Highlight) {
         withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = highlight }
+    }
+
+    /// Dismiss the item detail. If the item was opened from a stack,
+    /// pop back to that stack's overlay instead of returning to the
+    /// bare archive — so "open from stack, close item" reads as a
+    /// back-step, not two unrelated dismissals.
+    private func dismissHighlight() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            selectedHighlight = nil
+            if let origin = originStack {
+                selectedStack = origin
+            }
+            originStack = nil
+            originStackItems = []
+        }
+    }
+
+    /// Ordered list of items the user can page through with arrow keys
+    /// while `highlight` is on screen. Stack-origin items win when the
+    /// item was opened from a stack; otherwise the currently-filtered
+    /// archive is used. Arrow nav quietly no-ops when the list has
+    /// only the current item or doesn't contain it.
+    private func siblings(for highlight: Highlight) -> [Highlight] {
+        if originStack != nil, !originStackItems.isEmpty,
+           originStackItems.contains(where: { $0.id == highlight.id }) {
+            return originStackItems
+        }
+        return highlights
     }
 
     // MARK: - Data Loading

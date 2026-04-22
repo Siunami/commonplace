@@ -357,6 +357,135 @@ extension DatabaseManager {
         removeHighlight(highlightId, fromStack: pinned.id)
     }
 
+    /// Combine all items from `sourceId` into `destinationId` and delete
+    /// the source stack. Source items are inserted at the TOP of the
+    /// destination (lowest `position` values) in their source-ordered
+    /// sequence, so the user's hand-ordering within the source is
+    /// preserved at the top of the merged stack. INSERT OR IGNORE makes
+    /// items already in both stacks a silent no-op. The composite PK on
+    /// `highlight_stack` means the result is always duplicate-free.
+    /// Notifies once, with `mergedSource` and `mergedInto` so listeners
+    /// that were observing the source can swap to the destination.
+    @discardableResult
+    func mergeStack(sourceId: String, into destinationId: String) -> Bool {
+        guard let dbQueue else { return false }
+        guard sourceId != destinationId else { return false }
+        let now = Date().timeIntervalSince1970
+        do {
+            try dbQueue.write { db in
+                let sourceIds = try String.fetchAll(db, sql: """
+                    SELECT highlightId FROM highlight_stack
+                    WHERE stackId = ?
+                    ORDER BY position ASC, addedAt DESC
+                    """, arguments: [sourceId])
+
+                if !sourceIds.isEmpty {
+                    let minExisting = (try Int.fetchOne(db,
+                        sql: "SELECT COALESCE(MIN(position), 0) FROM highlight_stack WHERE stackId = ?",
+                        arguments: [destinationId]) ?? 0)
+                    var nextPosition = minExisting - sourceIds.count
+                    for hid in sourceIds {
+                        try db.execute(sql: """
+                            INSERT OR IGNORE INTO highlight_stack (stackId, highlightId, addedAt, position)
+                            VALUES (?, ?, ?, ?)
+                            """, arguments: [destinationId, hid, now, nextPosition])
+                        nextPosition += 1
+                    }
+                    try db.execute(
+                        sql: "UPDATE stack SET updatedAt = ? WHERE id = ?",
+                        arguments: [now, destinationId]
+                    )
+                }
+
+                // Cascading FK on highlight_stack removes source's junction rows.
+                try db.execute(sql: "DELETE FROM stack WHERE id = ?", arguments: [sourceId])
+            }
+            NotificationCenter.default.post(
+                name: .stackDataDidChange, object: nil,
+                userInfo: ["mergedSource": sourceId, "mergedInto": destinationId]
+            )
+            return true
+        } catch {
+            CaptureLog.error("Failed to merge stack: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Split a selection out of an existing stack into a brand-new
+    /// unnamed stack, in a single transaction. Items keep their relative
+    /// ordering from the source and are removed from it. If removing
+    /// them leaves the source empty, the source is deleted too (matching
+    /// the auto-prune behavior of single-item removal). Returns the new
+    /// stack on success, or nil if nothing was moved / the transaction
+    /// failed. Fires one `.stackDataDidChange` notification so every
+    /// observer reloads once regardless of how many items moved.
+    @discardableResult
+    func moveHighlightsToNewStack(highlightIds: [String], fromStack sourceId: String) -> Stack? {
+        guard let dbQueue else { return nil }
+        guard !highlightIds.isEmpty else { return nil }
+        let now = Date().timeIntervalSince1970
+        let newStack = Stack(
+            id: UUID().uuidString,
+            name: nil,
+            stackDescription: nil,
+            createdAt: now,
+            updatedAt: now,
+            isPinned: false
+        )
+        do {
+            var sourceStackDeleted = false
+            try dbQueue.write { db in
+                try newStack.insert(db)
+
+                // Preserve source ordering for the moved items.
+                let placeholders = Array(repeating: "?", count: highlightIds.count).joined(separator: ",")
+                var args: [DatabaseValueConvertible] = [sourceId]
+                args.append(contentsOf: highlightIds)
+                let orderedIds = try String.fetchAll(db, sql: """
+                    SELECT highlightId FROM highlight_stack
+                    WHERE stackId = ? AND highlightId IN (\(placeholders))
+                    ORDER BY position ASC, addedAt DESC
+                    """, arguments: StatementArguments(args))
+
+                for (index, hid) in orderedIds.enumerated() {
+                    try db.execute(sql: """
+                        INSERT INTO highlight_stack (stackId, highlightId, addedAt, position)
+                        VALUES (?, ?, ?, ?)
+                        """, arguments: [newStack.id, hid, now, index])
+                }
+
+                var deleteArgs: [DatabaseValueConvertible] = [sourceId]
+                deleteArgs.append(contentsOf: highlightIds)
+                try db.execute(sql: """
+                    DELETE FROM highlight_stack
+                    WHERE stackId = ? AND highlightId IN (\(placeholders))
+                    """, arguments: StatementArguments(deleteArgs))
+
+                let remaining = try Int.fetchOne(db,
+                    sql: "SELECT COUNT(*) FROM highlight_stack WHERE stackId = ?",
+                    arguments: [sourceId]) ?? 0
+                if remaining == 0 {
+                    try db.execute(sql: "DELETE FROM stack WHERE id = ?", arguments: [sourceId])
+                    sourceStackDeleted = true
+                } else {
+                    try db.execute(
+                        sql: "UPDATE stack SET updatedAt = ? WHERE id = ?",
+                        arguments: [now, sourceId]
+                    )
+                }
+            }
+            var userInfo: [String: Any] = ["stackId": newStack.id, "sourceStackId": sourceId]
+            if sourceStackDeleted { userInfo["sourceStackDeleted"] = true }
+            NotificationCenter.default.post(
+                name: .stackDataDidChange, object: nil, userInfo: userInfo
+            )
+            return newStack
+        } catch {
+            CaptureLog.error("Failed to move highlights to new stack: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
     /// Bulk variant of `addHighlightToPinnedOrNewStack`. All inserts run
     /// in a single write transaction and one change notification is posted,
     /// so "add all from this time range" is cheap regardless of cluster size.

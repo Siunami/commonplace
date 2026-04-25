@@ -572,6 +572,27 @@ final class DatabaseManager {
         }) ?? [:]
     }
 
+    /// Batch-fetches every note for the given highlight ids, grouped by
+    /// highlightId and ordered oldest → newest. Used by the history list
+    /// so rows can render their full annotation stack inline instead of
+    /// relying on a count badge.
+    func notesForHighlights(ids: [String]) -> [String: [HighlightNote]] {
+        guard let dbQueue, !ids.isEmpty else { return [:] }
+        return (try? dbQueue.read { db in
+            let placeholders = ids.map { _ in "?" }.joined(separator: ",")
+            let notes = try HighlightNote.fetchAll(db, sql: """
+                SELECT * FROM highlight_note
+                WHERE highlightId IN (\(placeholders))
+                ORDER BY createdAt ASC
+                """, arguments: StatementArguments(ids))
+            var result: [String: [HighlightNote]] = [:]
+            for note in notes {
+                result[note.highlightId, default: []].append(note)
+            }
+            return result
+        }) ?? [:]
+    }
+
     /// Returns intrinsic width/height ratios for a batch of highlights. The
     /// ratio is the media's pixel width divided by pixel height, pulled from
     /// whichever source the highlight points to (screenshot, file_record, or
@@ -625,17 +646,53 @@ final class DatabaseManager {
 
     // MARK: - Pattern Queries
 
-    func appFacets() -> [(appName: String, bundleId: String?, count: Int)] {
+    /// App-facet counts for the sidebar. Scoped to `request` when
+    /// provided so the sidebar reads as "apps matching the current
+    /// view" instead of the whole archive — removes the confusion of
+    /// clicking an app that then shows zero rows because a search or
+    /// filter was already hiding them.
+    func appFacets(_ request: BrowseLoadRequest? = nil) -> [(appName: String, bundleId: String?, count: Int)] {
         guard let dbQueue else { return [] }
-        return (try? dbQueue.read { db in
-            let rows = try Row.fetchAll(db, sql: """
-                SELECT sourceApp, MAX(bundleId) as bundleId, COUNT(*) as cnt
-                FROM highlight
-                WHERE sourceApp IS NOT NULL
-                  AND sourceApp != 'Screenshot'
-                GROUP BY sourceApp
-                ORDER BY cnt DESC
+
+        let filters = request.map { BrowseFilterSQL($0.activeFilters) }
+        let match = request?.fts5MatchQuery
+
+        var whereParts: [String] = [
+            "h.sourceApp IS NOT NULL",
+            "h.sourceApp != 'Screenshot'"
+        ]
+        var args: [String] = []
+        var joinSQL = ""
+
+        if let match {
+            joinSQL = """
+                JOIN highlight_search hs ON hs.highlightId = h.id
+                """
+            whereParts.append("""
+                hs.id IN (
+                    SELECT rowid FROM highlight_search_fts
+                    WHERE highlight_search_fts MATCH ?
+                )
                 """)
+            args.append(match)
+        }
+
+        if let filters, !filters.whereClause.isEmpty {
+            whereParts.append(filters.whereClause)
+            args.append(contentsOf: filters.arguments)
+        }
+
+        let sql = """
+            SELECT h.sourceApp, MAX(h.bundleId) as bundleId, COUNT(*) as cnt
+            FROM highlight h
+            \(joinSQL)
+            WHERE \(whereParts.joined(separator: " AND "))
+            GROUP BY h.sourceApp
+            ORDER BY cnt DESC
+            """
+
+        return (try? dbQueue.read { db in
+            let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
             return rows.compactMap { row -> (String, String?, Int)? in
                 guard let app: String = row["sourceApp"],
                       let cnt: Int = row["cnt"] else { return nil }
@@ -937,6 +994,24 @@ final class DatabaseManager {
         }
     }
 
+    /// Batch variant used by BrowseView's pagination pipeline so FileCards
+    /// don't each fire a separate `fileRecord(byId:)` query on mount. One
+    /// DB round trip per page instead of one per file-type card.
+    func fileRecords(byIds ids: [Int64]) -> [Int64: FileRecord] {
+        guard !ids.isEmpty else { return [:] }
+        let records = (try? dbQueue?.read { db in
+            try FileRecord
+                .filter(ids.contains(Column("id")))
+                .fetchAll(db)
+        }) ?? []
+        var out: [Int64: FileRecord] = [:]
+        out.reserveCapacity(records.count)
+        for rec in records {
+            if let id = rec.id { out[id] = rec }
+        }
+        return out
+    }
+
     func fileRecordByPath(_ filePath: String) -> FileRecord? {
         try? dbQueue?.read { db in
             try FileRecord
@@ -953,6 +1028,22 @@ final class DatabaseManager {
         let record = try? dbQueue?.read { db in
             try FileRecord
                 .filter(Column("originalUrl") == originalUrl)
+                .fetchOne(db)
+        }
+        guard let record, FileManager.default.fileExists(atPath: record.filePath) else {
+            return nil
+        }
+        return record
+    }
+
+    /// Look up a file by SHA-256 of its contents — the bytes-level dedup
+    /// key written at ingest in v22. Verifies the persisted copy still
+    /// exists on disk; if it was deleted out of band, returns nil so the
+    /// caller proceeds as a fresh ingest.
+    func fileRecord(byHash fileHash: String) -> FileRecord? {
+        let record = try? dbQueue?.read { db in
+            try FileRecord
+                .filter(Column("fileHash") == fileHash)
                 .fetchOne(db)
         }
         guard let record, FileManager.default.fileExists(atPath: record.filePath) else {

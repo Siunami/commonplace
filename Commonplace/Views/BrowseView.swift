@@ -7,6 +7,34 @@ import PDFKit
 import Quartz
 import QuickLookThumbnailing
 
+// MARK: - Search result highlighting
+
+/// Wraps `text` as an AttributedString with case-insensitive occurrences of
+/// `query` visually highlighted. Returns a plain AttributedString when the
+/// query is empty (no visible change) so card call sites can wrap every
+/// rendered string unconditionally.
+///
+/// Used across `MasonryCard`, `ArchiveListView`, and their subtypes so
+/// whatever field a search matched against gets surfaced visually — the
+/// user can see at a glance *why* each card came back in the result set.
+enum SearchHighlight {
+    static func render(_ text: String, query: String) -> AttributedString {
+        var attr = AttributedString(text)
+        guard !query.isEmpty, !text.isEmpty else { return attr }
+        let needle = query.lowercased()
+        let haystack = text.lowercased()
+        var searchStart = haystack.startIndex
+        while let found = haystack.range(of: needle, range: searchStart..<haystack.endIndex) {
+            if let attrRange = Range(found, in: attr) {
+                attr[attrRange].backgroundColor = Color.yellow.opacity(0.55)
+                attr[attrRange].foregroundColor = .primary
+            }
+            searchStart = found.upperBound
+        }
+        return attr
+    }
+}
+
 // MARK: - Shared design tokens
 
 enum UITokens {
@@ -240,34 +268,54 @@ struct BrowseView: View {
     @State private var sidebarRefreshTask: Task<Void, Never>? = nil
     @State private var sidebarRefreshGeneration = 0
     @State private var isReloadingCaptures = false
+    /// Total rows matching the current BrowseLoadRequest — decoupled from the
+    /// paginated `highlights` slice so the footer shows the full dataset size
+    /// rather than whatever has been scrolled into view so far.
+    @State private var totalCaptureCount: Int = 0
     @State private var noteCounts: [String: Int] = [:]
+    /// Full bodies of every note attached to a visible highlight, grouped
+    /// by highlightId (oldest → newest). Populated alongside `noteCounts`
+    /// in `loadCaptures`. The history list reads this to render each note
+    /// inline so annotations read as first-class content, not a hidden
+    /// count. Only history view consults it today; mosaic still uses
+    /// `noteCounts` + `userNote` since cards don't have room for a stack.
+    @State private var highlightNotes: [String: [HighlightNote]] = [:]
     @State private var aspectRatios: [String: CGFloat] = [:]
-    @State private var selectedFilter: CaptureFilter = .all
-    @State private var selectedApp: String? = nil
+    /// Pre-resolved `CardSourceLink`s, keyed by highlight id. Populated in
+    /// batches as pagination fetches more rows so per-card rendering doesn't
+    /// have to re-run `FileManager.fileExists` or JSON-decode sourceContext
+    /// on every hover / scroll tick.
+    @State private var sourceLinks: [String: CardSourceLink] = [:]
+    /// Pre-fetched `FileRecord`s for every file-type highlight on the page,
+    /// keyed by the highlight's `fileId`. Without this, each `FileCard.task`
+    /// fires its own `fileRecord(byId:)` query on mount — a 50-card page
+    /// with ~20 file cards = 20+ serialized DB calls firing behind the
+    /// render path. One batched query instead.
+    @State private var fileRecords: [Int64: FileRecord] = [:]
+    @State private var activeFilters: ActiveFilters = .init()
     @State private var appFacets: [AppFacet] = []
-    // Scroll position managed by SwiftUI's default behavior
     @State private var typeCounts: [String: Int] = [:]
     @State private var isDropTargeted = false
-    @State private var showSettings = false
     @State private var hasMore = false
     @State private var pinnedStack: Stack? = nil
     /// Ids of highlights currently in the pinned stack — drives the
     /// "already added" visual state on AddToStackButton.
     @State private var pinnedStackMembers: Set<String> = []
-    @State private var selectedStack: Stack? = nil
-    /// The stack, if any, that the currently-open item was launched from.
-    /// When set, dismissing CardDetailView restores the stack overlay
-    /// instead of returning to the bare archive — so "open an item from
-    /// inside a stack" and "close that item" feels like pop rather than
-    /// two independent navigations. Also drives the sibling list used
-    /// by arrow-key gallery navigation.
-    @State private var originStack: Stack? = nil
-    /// Snapshot of origin-stack items captured when the user opened the
-    /// first highlight from a stack. Re-read from the DB only when the
-    /// origin stack itself changes — arrow-key paging within a stack
-    /// doesn't need a fresh fetch on every press.
-    @State private var originStackItems: [Highlight] = []
-    @State private var showStacks = false
+    /// Restored from disk on launch via `WorkspaceStateStore.load()`,
+    /// falling back to the default single-pane / single-All-view
+    /// workspace if nothing's persisted yet (or if the persisted shape
+    /// fails validation — see `WorkspaceStateStore.validate`).
+    @State private var workspaceState: WorkspaceState = WorkspaceStateStore.load() ?? .initial
+    /// Debounces `WorkspaceStateStore.save` on workspace changes so a
+    /// burst of mutations (e.g. tab drag → reorder → activate) writes
+    /// once at the end instead of N times.
+    @State private var workspacePersistTask: Task<Void, Never>? = nil
+    /// Snapshot of the active stack tab's items at the moment a card
+    /// detail was opened from it. Used as the gallery sibling list so
+    /// arrow-key paging walks the stack rather than the unrelated
+    /// archive. Reset to empty whenever the modal opens from anywhere
+    /// else (a non-stack tab) so the archive list takes over instead.
+    @State private var modalSourceStackItems: [Highlight] = []
     @State private var fullScreenImage: NSImage?
     @State private var footerBarFrame: CGRect = .zero
     /// Drawer state — a recent-stacks picker that slides in from the right
@@ -276,8 +324,44 @@ struct BrowseView: View {
     /// without navigating away from the current view.
     @State private var drawerOpen = false
     @State private var drawerHoverTask: Task<Void, Never>? = nil
+    /// When non-nil, the stream was loaded as a windowed slice centered
+    /// on this highlight — the user jumped here from a detail-view
+    /// capture-event handle. Drives the "Back to newest" chip + changes
+    /// infinite-scroll's "load older" boundary to continue from the
+    /// window's tail.
+    @State private var focusedHighlightId: String? = nil
+    /// Set briefly after a scroll-to-target lands so the target card
+    /// can flash an accent ring — helps the user's eye find where the
+    /// view just jumped to. Cleared by a cancellable task, so rapid
+    /// successive jumps don't fight each other over who wins the ring.
+    @State private var jumpFlashId: String? = nil
+    @State private var jumpFlashTask: Task<Void, Never>? = nil
+    @State private var isWindowedMode = false
+    /// True while the window's first row is older than the global newest,
+    /// i.e. there's still room to page upward. Set when entering windowed
+    /// mode, cleared when an upward fetch comes back short or when the
+    /// stream resets to global-newest.
+    @State private var hasNewer = false
+    /// In-flight upward fetch. Tracked separately from `browseLoadTask`
+    /// so the near-top trigger doesn't compete with the regular paging
+    /// path's task slot. Bool is sufficient — only one upward fetch at
+    /// a time, and we don't need to cancel it externally.
+    @State private var newerLoadInFlight = false
+    /// True once the masonry has been scrolled past `backToNewestRevealOffset`
+    /// from the top. Drives `BackToNewestChip` visibility — hiding it while
+    /// the user is already at the top avoids redundant chrome.
+    @State private var isScrolledAwayFromTop = false
     @AppStorage("browseViewMode") private var viewMode: BrowseViewMode = .mosaic
-    private let pageSize = 50
+    /// Smaller than you'd expect because MasonryLayout measures every
+    /// subview on state change — 20 cards is the sweet spot where the
+    /// first paint feels instant across searches. Infinite scroll fills
+    /// in more as the user scrolls past the viewport.
+    private let pageSize = 20
+    private let jumpWindowSize = 75
+    /// Scroll offset (in pt, from the top) past which the "back to newest"
+    /// chip becomes eligible to show. Below this the user is effectively
+    /// already at the top — surfacing the chip would just be visual noise.
+    private let backToNewestRevealOffset: CGFloat = 200
 
     /// The pinned stack rendered as a compact, intrinsic-sized floating tile
     /// anchored to the browse window's bottom-right corner. Sized by content
@@ -292,7 +376,9 @@ struct BrowseView: View {
             stack: pinned,
             isPinned: true,
             onTap: {
-                selectedStack = pinned
+                // Pinned stack tap opens a fresh tab in whichever
+                // pane is currently active. No teleport-to-existing.
+                workspaceState.openTab(.stack(id: pinned.id))
             }
         )
         .overlay(alignment: .topTrailing) {
@@ -322,26 +408,20 @@ struct BrowseView: View {
         }
     }
 
-    /// Floater hover: entering schedules an open after a 250ms dwell (so
-    /// incidental passes through the corner don't flash the column open);
-    /// leaving schedules a close after 300ms (a subsequent enter into the
-    /// drawer cancels the pending close via `handleDrawerHover(true)`).
+    /// Floater hover: entering opens the drawer immediately; leaving
+    /// schedules a close after a short debounce so moving the cursor into
+    /// the drawer column doesn't flicker it shut.
     private func handleFloaterHover(_ hovering: Bool) {
         drawerHoverTask?.cancel()
         if hovering {
             if drawerOpen { return }
-            let task = Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 250_000_000)
-                if Task.isCancelled { return }
-                withAnimation(.easeInOut(duration: 0.2)) { drawerOpen = true }
-            }
-            drawerHoverTask = task
+            drawerOpen = true
         } else {
             guard drawerOpen else { return }
             let task = Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 300_000_000)
+                try? await Task.sleep(nanoseconds: 120_000_000)
                 if Task.isCancelled { return }
-                withAnimation(.easeInOut(duration: 0.2)) { drawerOpen = false }
+                drawerOpen = false
             }
             drawerHoverTask = task
         }
@@ -349,15 +429,15 @@ struct BrowseView: View {
 
     /// Drawer hover: entering cancels any pending close so the column
     /// stays open while the cursor is over a card. Leaving schedules a
-    /// close after 300ms — a re-enter (into the column or back onto the
-    /// floater) cancels the pending close.
+    /// short-debounced close — a re-enter (into the column or back onto
+    /// the floater) cancels the pending close.
     private func handleDrawerHover(_ hovering: Bool) {
         drawerHoverTask?.cancel()
         if hovering { return }
         let task = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 300_000_000)
+            try? await Task.sleep(nanoseconds: 120_000_000)
             if Task.isCancelled { return }
-            withAnimation(.easeInOut(duration: 0.2)) { drawerOpen = false }
+            drawerOpen = false
         }
         drawerHoverTask = task
     }
@@ -367,8 +447,7 @@ struct BrowseView: View {
     private var browseLoadRequest: BrowseLoadRequest {
         BrowseLoadRequest(
             searchText: searchText,
-            selectedFilter: selectedFilter,
-            selectedApp: selectedApp
+            activeFilters: activeFilters
         )
     }
 
@@ -393,217 +472,56 @@ struct BrowseView: View {
         return nil
     }
 
-    /// The "+" add tile pins to the top-left of the masonry only on user-curated
-    /// views. Type and App filters are metadata-derived (things land in those
-    /// buckets based on how they were captured), so "add to Screenshots" or
-    /// "add to app = Chrome" is semantically meaningless there.
-    private var showAddTile: Bool {
-        selectedFilter == .all && selectedApp == nil && !showSettings
+    /// The "+" add tile pins to the top-left of the masonry in every mosaic
+    /// filter state. Adding a note under a non-.all filter doesn't guarantee
+    /// the new note lands in the filtered bucket (it's typed as .copy so it
+    /// only shows under All/Copies), but keeping the affordance always
+    /// reachable is worth the mild semantic slippage.
+    private var showAddTile: Bool { true }
+
+    /// Currently-active tab content across the workspace. Used to drive
+    /// sidebar selection and to decide which sibling list a card-detail
+    /// modal walks via arrow keys.
+    private var activeTabContent: WorkspaceTabContent? {
+        workspaceState.activePane?.activeTab?.content
     }
 
     // MARK: - Body
 
     var body: some View {
-        HStack(spacing: 0) {
-            CaptureFilterSidebar(
-                appFacets: appFacets,
-                typeCounts: typeCounts,
-                selectedApp: $selectedApp,
-                selectedFilter: $selectedFilter,
-                showSettings: $showSettings,
-                showStacks: $showStacks
-            )
-            .onChange(of: selectedApp) { _, _ in
-                guard isActive else { return }
-                loadCaptures(reset: true)
+        WorkspaceView(
+            state: $workspaceState,
+            pinnedStackId: pinnedStack?.id,
+            onTogglePinForStack: { stackId in
+                let alreadyPinned = pinnedStack?.id == stackId
+                DatabaseManager.shared.setPinnedStack(id: alreadyPinned ? nil : stackId)
             }
-            .onChange(of: selectedFilter) { _, _ in
-                guard isActive else { return }
-                loadCaptures(reset: true)
-            }
-            .onChange(of: searchText) { _, _ in
-                guard isActive else { return }
-                loadCaptures(reset: true)
-            }
-
-            Divider()
-
-            ZStack(alignment: .bottom) {
-                // Darker surface than the sidebar so cards visually rest
-                // on a distinct backdrop — fundamental to the elevation
-                // hierarchy (background → card → floating).
-                UITokens.surfaceBackground
-                    .ignoresSafeArea()
-
-                if showSettings {
-                    ScrollView {
-                        SettingsView()
-                            .frame(maxWidth: 500)
-                            .padding(24)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if showStacks {
-                    AllStacksView(onOpenStack: { stack in
-                        withAnimation(.easeInOut(duration: 0.2)) { selectedStack = stack }
-                    })
-                } else {
-
-            VStack(spacing: 0) {
-                if filteredHighlights.isEmpty && !(showAddTile && viewMode == .mosaic) {
-                    VStack(spacing: 12) {
-                        Spacer()
-                        Image(systemName: "tray")
-                            .font(.system(size: 36))
-                            .foregroundStyle(.quaternary)
-                        Text(emptyStateTitle)
-                            .foregroundStyle(.secondary)
-                            .font(.callout)
-                        if let emptyStateSubtitle {
-                            Text(emptyStateSubtitle)
-                                .font(.caption)
-                                .foregroundStyle(.tertiary)
-                        } else {
-                            VStack(spacing: 4) {
-                                Text("Cmd+Shift+3 — screenshot")
-                                Text("Cmd+Shift+4 — region capture")
-                                Text("Copy text anywhere — auto-captured")
-                                Text("Drop files here to import")
-                            }
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                        }
-                        Spacer()
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    ScrollView {
-                        Group {
-                            switch viewMode {
-                            case .mosaic:
-                                MasonryLayout(minColumnWidth: 260, spacing: 14, pinFirst: showAddTile) {
-                                    if showAddTile {
-                                        AddTile()
-                                    }
-                                    ForEach(filteredHighlights) { highlight in
-                                        MasonryCard(
-                                            highlight: highlight,
-                                            noteCount: noteCounts[highlight.id] ?? 0,
-                                            preferredAspectRatio: aspectRatios[highlight.id]
-                                        )
-                                        .id(highlight.id)
-                                        .onTapGesture {
-                                            routeCardTap(highlight)
-                                        }
-                                    }
-                                }
-                                .padding(.horizontal, 16).padding(.vertical, 12)
-                            case .history:
-                                HistoryListView(
-                                    highlights: filteredHighlights,
-                                    noteCounts: noteCounts,
-                                    onSelect: { highlight in
-                                        routeCardTap(highlight)
-                                    }
-                                )
-                            }
-                        }
-                        // Force a clean unmount/remount when the user toggles
-                        // between mosaic and history. Without it, SwiftUI
-                        // preserves the ScrollView subtree and async-loading
-                        // cards re-enter with stale measurement caches, which
-                        // is what was producing the overlap after a mode
-                        // switch.
-                        .id(viewMode)
-                        // Reserve clearance below the last card so the floating
-                        // pinned stack doesn't obscure content at the bottom.
-                        // `.animation(nil, …)` suppresses the implicit animation
-                        // when the floater appears — without it, the 220pt
-                        // change would animate alongside other pinnedStack
-                        // transitions, re-flowing every masonry card.
-                        .padding(.bottom, pinnedStack != nil ? 220 : 0)
-                        .animation(nil, value: pinnedStack)
-                    }
-                    .onScrollGeometryChange(for: Bool.self) { geo in
-                        // True when scrolled within 400pt of the bottom of the content
-                        let bottomEdge = geo.contentOffset.y + geo.containerSize.height
-                        let threshold = geo.contentSize.height - 400
-                        return bottomEdge >= threshold
-                    } action: { _, isNearBottom in
-                        if isNearBottom && hasMore {
-                            loadCaptures(reset: false)
-                        }
-                    }
-                }
-
-                Divider()
-                HStack(spacing: 8) {
-                    Image(systemName: "magnifyingglass")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                    TextField("Search...", text: $searchText)
-                        .textFieldStyle(.plain)
-                        .font(.callout)
-                    if !searchText.isEmpty {
-                        Button(action: { searchText = "" }) {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.caption)
-                                .foregroundStyle(.tertiary)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    Text("\(filteredHighlights.count) captures")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                    if isReloadingCaptures {
-                        ProgressView()
-                            .controlSize(.small)
-                    }
-                    BrowseViewModeToggle(viewMode: $viewMode)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .background {
-                    GeometryReader { proxy in
-                        Color.clear.preference(
-                            key: BrowseFooterBarFramePreferenceKey.self,
-                            value: proxy.frame(in: .named("BrowseRootSpace"))
-                        )
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .contentShape(Rectangle())
-            .simultaneousGesture(TapGesture().onEnded { clearFocus() })
-            .onDrop(of: [.fileURL, .item], isTargeted: $isDropTargeted) { providers in
-                handleDrop(providers)
-            }
-            .overlay {
-                if isDropTargeted {
-                    RoundedRectangle(cornerRadius: 8)
-                        .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 3, dash: [8, 6]))
-                        .background(Color.accentColor.opacity(0.08))
-                        .overlay {
-                            VStack(spacing: 8) {
-                                Image(systemName: "square.and.arrow.down.on.square")
-                                    .font(.system(size: 36, weight: .regular))
-                                    .foregroundStyle(Color.accentColor)
-                                Text("Drop to add to captures")
-                                    .font(.headline)
-                                    .foregroundStyle(Color.accentColor)
-                            }
-                        }
-                        .padding(8)
-                        .allowsHitTesting(false)
-                }
-            }
-
-            } // end else (showSettings)
-            } // end ZStack
+        ) { content, paneId, tabId in
+            tabBody(for: content, paneId: paneId, tabId: tabId)
         }
+        .onChange(of: activeFilters) { _, _ in
+            guard isActive else { return }
+            loadCaptures(reset: true)
+        }
+        // Inline search field is gone — search lives in the sidebar
+        // now (Cmd+F). `searchText` stays as a dead `""` so the
+        // existing BrowseLoadRequest construction keeps working
+        // without a fork; it just always takes the filter-only path.
         .coordinateSpace(name: "BrowseRootSpace")
         .onPreferenceChange(BrowseFooterBarFramePreferenceKey.self) { footerBarFrame = $0 }
+        .onChange(of: workspaceState) { _, newState in
+            // Debounce a burst of mutations (drag-and-drop reorders,
+            // tab close cascades, divider drags) into one disk write.
+            workspacePersistTask?.cancel()
+            workspacePersistTask = Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(500))
+                guard !Task.isCancelled else { return }
+                WorkspaceStateStore.save(newState)
+            }
+        }
         .onAppear {
             isActive = true
+            DatabaseManager.shared.pruneEmptyStacks()
             loadCaptures(reset: true)
             refreshSidebarData()
             pinnedStack = DatabaseManager.shared.pinnedStack()
@@ -622,10 +540,33 @@ struct BrowseView: View {
             loadCaptures(reset: true)
             refreshSidebarData()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .workspaceCommandNewTab).receive(on: DispatchQueue.main)) { _ in
+            workspaceState.openTab(.newTab)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .workspaceCommandCloseActiveTab).receive(on: DispatchQueue.main)) { _ in
+            guard let pane = workspaceState.activePane else { return }
+            workspaceState.closeTab(paneId: pane.id, tabId: pane.activeTabId)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .workspaceCommandNextTab).receive(on: DispatchQueue.main)) { _ in
+            shiftActiveTab(by: 1)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .workspaceCommandPrevTab).receive(on: DispatchQueue.main)) { _ in
+            shiftActiveTab(by: -1)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .workspaceCommandSelectTab).receive(on: DispatchQueue.main)) { note in
+            guard let index = note.userInfo?["index"] as? Int else { return }
+            selectTab(at: index)
+        }
         .onReceive(NotificationCenter.default.publisher(for: .highlightDidSave).throttle(for: .seconds(1), scheduler: DispatchQueue.main, latest: true)) { _ in
             guard isActive else { return }
             loadCaptures(reset: true)
             refreshSidebarData()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .searchSidebarJumpToHighlight).receive(on: DispatchQueue.main)) { note in
+            guard isActive else { return }
+            guard let id = note.userInfo?["highlightId"] as? String else { return }
+            guard let target = DatabaseManager.shared.highlight(byId: id) else { return }
+            jumpToHighlight(target)
         }
         .onReceive(NotificationCenter.default.publisher(for: .highlightDataDidChange).receive(on: DispatchQueue.main)) { notification in
             guard isActive else { return }
@@ -635,10 +576,19 @@ struct BrowseView: View {
 
             // Targeted refresh for the affected highlight's cached state.
             if let hid {
+                // A change to notes / annotations changes the card's
+                // natural height, so drop the memoized height for this
+                // id. (NSCache prefix-delete isn't a thing, so we flush
+                // the whole cache — cheap to rebuild on next render.)
+                MasonryHeightCache.invalidate(id: hid)
                 switch change {
                 case "notes":
                     let counts = DatabaseManager.shared.noteCountsForHighlights(ids: [hid])
                     noteCounts[hid] = counts[hid] ?? 0
+                    // Refresh the full inline-note list for this highlight so
+                    // the history view reflects the add/delete immediately.
+                    let fetched = DatabaseManager.shared.notesForHighlights(ids: [hid])
+                    highlightNotes[hid] = fetched[hid] ?? []
                     // The userNote strip on the masonry card reads from highlight.userNote,
                     // which changes when a note is added/removed — refetch that row too.
                     if let updated = DatabaseManager.shared.highlight(byId: hid),
@@ -653,6 +603,9 @@ struct BrowseView: View {
                 default:
                     break
                 }
+                // Annotation changes resize the card. The `MasonryHeightCache.invalidate`
+                // call above clears the stale entry; the next layout pass will
+                // re-measure via `sizeThatFits` and refill the cache.
             }
 
             // Sidebar counts always refresh — cheap indexed scans.
@@ -663,27 +616,30 @@ struct BrowseView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: BrowseWindowController.showSettingsNotification)) { _ in
-            showSettings = true
+            // Settings is special — there's only ever one settings
+            // surface globally, so prefer focusing an existing tab if
+            // any. Falls back to opening fresh in the active pane.
+            if !workspaceState.focusExisting(.settings) {
+                workspaceState.openTab(.settings)
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .stackDataDidChange).receive(on: DispatchQueue.main)) { _ in
             // @State dedupes equal writes (Stack, Set<String> are Equatable),
             // so direct assignment won't re-render when nothing changed.
             pinnedStack = DatabaseManager.shared.pinnedStack()
             pinnedStackMembers = DatabaseManager.shared.highlightIdsInPinnedStack()
-            if let sel = selectedStack,
-               let refreshed = DatabaseManager.shared.stack(byId: sel.id) {
-                selectedStack = refreshed
-            } else if selectedStack != nil {
-                selectedStack = nil
-            }
+            // Drop any stack tab whose underlying stack has been deleted
+            // (e.g. merged away). The vanish callback inside StackBody also
+            // handles this for the actively-rendered tab; this catches
+            // background tabs the user hasn't switched to recently.
+            pruneVanishedStackTabs()
         }
         .onReceive(NotificationCenter.default.publisher(for: BrowseWindowController.showHighlightDetailNotification)) { notification in
             guard let highlightId = notification.userInfo?["highlightId"] as? String,
                   let highlight = DatabaseManager.shared.highlight(byId: highlightId) else { return }
-            // Reset sidebar to "All" so the item is visible in the background list
+            // Reset filters so the item is visible in the background list
             // once the detail overlay is dismissed.
-            selectedFilter = .all
-            selectedApp = nil
+            activeFilters = .init()
             searchText = ""
             isActive = true
             loadCaptures(reset: true)
@@ -702,10 +658,9 @@ struct BrowseView: View {
                         onStackNavigation: { stack in
                             withAnimation(.easeInOut(duration: 0.2)) {
                                 selectedHighlight = nil
-                                originStack = nil
-                                originStackItems = []
-                                selectedStack = stack
+                                modalSourceStackItems = []
                             }
+                            workspaceState.openTab(.stack(id: stack.id))
                         },
                         onImageFullscreen: { image in
                             withAnimation(.easeInOut(duration: 0.2)) { fullScreenImage = image }
@@ -713,6 +668,12 @@ struct BrowseView: View {
                         siblings: siblings(for: highlight),
                         onNavigate: { sibling in
                             selectedHighlight = sibling
+                        },
+                        onJumpTo: { target in
+                            jumpToHighlight(target)
+                        },
+                        onRevealInAll: { target in
+                            revealInAll(target)
                         }
                     )
                         .id(highlight.id)
@@ -724,38 +685,6 @@ struct BrowseView: View {
                 }
                 .transition(.opacity)
                 .onExitCommand { dismissHighlight() }
-            }
-        }
-        .overlay {
-            if let stack = selectedStack {
-                ZStack {
-                    Color.black.opacity(0.3)
-                        .ignoresSafeArea()
-                        .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { selectedStack = nil } }
-
-                    StackDetailView(
-                        stack: stack,
-                        onDismiss: { withAnimation(.easeInOut(duration: 0.2)) { selectedStack = nil } },
-                        onOpenHighlight: { highlight in
-                            // Record the stack + its ordered items as the "origin"
-                            // for this highlight — dismissing it later restores the
-                            // stack overlay, and arrow keys page through the stack.
-                            let orderedItems = DatabaseManager.shared.highlightsForStack(stackId: stack.id)
-                            withAnimation(.easeInOut(duration: 0.2)) {
-                                originStack = stack
-                                originStackItems = orderedItems
-                                selectedStack = nil
-                                selectedHighlight = highlight
-                            }
-                        }
-                    )
-                    .id(stack.id)
-                    .frame(maxWidth: 900, maxHeight: .infinity)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                    .shadow(color: .black.opacity(0.25), radius: 16, y: 4)
-                    .padding(40)
-                }
-                .transition(.opacity)
             }
         }
         .overlay {
@@ -808,7 +737,7 @@ struct BrowseView: View {
                         maxHeight: .infinity,
                         alignment: .bottomTrailing
                     )
-                    .padding(.trailing, 16)
+                    .padding(.trailing, 24)
                     .padding(.bottom, footerBarFrame.height + 16)
                 }
             }
@@ -826,32 +755,474 @@ struct BrowseView: View {
         withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = highlight }
     }
 
-    /// Dismiss the item detail. If the item was opened from a stack,
-    /// pop back to that stack's overlay instead of returning to the
-    /// bare archive — so "open from stack, close item" reads as a
-    /// back-step, not two unrelated dismissals.
+    /// Dismiss the item detail. The source tab stays visible underneath
+    /// the modal at all times now, so closing simply drops the modal —
+    /// no more origin-stack restoration dance.
     private func dismissHighlight() {
         withAnimation(.easeInOut(duration: 0.2)) {
             selectedHighlight = nil
-            if let origin = originStack {
-                selectedStack = origin
+            modalSourceStackItems = []
+        }
+    }
+
+    /// Re-center the archive on `target` — the user clicked a handle in
+    /// the capture-events section to jump back to that moment. Fetches a
+    /// windowed slice (75 newer + center + 75 older), swaps `highlights`
+    /// for it, and animates the scroll. `onChange(of: focusedHighlightId)`
+    /// drives the actual `scrollTo(_, anchor: .center)` so the view has
+    /// the new rows in its layout before the animation runs.
+    private func jumpToHighlight(_ target: Highlight) {
+        selectedHighlight = nil
+        modalSourceStackItems = []
+
+        // Widen to the full archive — a target from a different filter
+        // wouldn't otherwise be present in `filteredHighlights`.
+        activeFilters = .init()
+        searchText = ""
+
+        let window = DatabaseManager.shared.highlightsWindow(
+            centerTimestamp: target.timestamp,
+            before: jumpWindowSize,
+            after: jumpWindowSize
+        )
+
+        highlights = window
+        highlightsOffset = window.count
+        hasMore = !window.isEmpty
+        isWindowedMode = true
+        // Assume more newer rows exist until an upward fetch proves
+        // otherwise. The window center is rarely exactly at the global
+        // newest, so this is a safe default.
+        hasNewer = true
+        totalCaptureCount = DatabaseManager.shared.browseHighlightsCount(
+            BrowseLoadRequest(searchText: "", activeFilters: .init())
+        )
+        focusedHighlightId = target.id
+    }
+
+    /// "Show in All" from a card-detail header: ensure the All tab is
+    /// active, drop any origin-stack sibling context, and scroll-snap to
+    /// the target. Works whether the modal was opened from the All tab
+    /// (archive already mounted) or from a stack tab (archive needs to
+    /// mount first). We clear `focusedHighlightId` so the subsequent
+    /// assign inside `jumpToHighlight` is always a real change — otherwise
+    /// re-revealing the same item would be a no-op. The deferred dispatch
+    /// lets the tab swap mount the ScrollViewReader before we set the
+    /// focus id it listens for.
+    private func revealInAll(_ target: Highlight) {
+        focusedHighlightId = nil
+        modalSourceStackItems = []
+        // Make sure the active pane has an All-view tab. If one
+        // already exists in any pane, focus it (jump-to-moment is an
+        // explicit "show me this" action — landing the user on a
+        // pre-existing All view feels right). Otherwise open fresh
+        // in the active pane.
+        if !workspaceState.focusExisting(.allView) {
+            workspaceState.openTab(.allView)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            jumpToHighlight(target)
+        }
+    }
+
+    /// Shift the active pane's active tab by `delta`, wrapping at both
+    /// ends. Drives `⌘⇧]` / `⌘⇧[` from the Tab menu.
+    private func shiftActiveTab(by delta: Int) {
+        guard let pane = workspaceState.activePane else { return }
+        guard let paneIdx = workspaceState.panes.firstIndex(where: { $0.id == pane.id }) else { return }
+        let tabs = pane.tabs
+        guard !tabs.isEmpty else { return }
+        guard let currentIdx = tabs.firstIndex(where: { $0.id == pane.activeTabId }) else { return }
+        let count = tabs.count
+        let next = ((currentIdx + delta) % count + count) % count
+        workspaceState.panes[paneIdx].activeTabId = tabs[next].id
+    }
+
+    /// Jump to the Nth (0-indexed) tab in the active pane. No-op when
+    /// the pane has fewer tabs than the requested index. Drives
+    /// `⌘1..9` from the Tab menu.
+    private func selectTab(at index: Int) {
+        guard let pane = workspaceState.activePane else { return }
+        guard let paneIdx = workspaceState.panes.firstIndex(where: { $0.id == pane.id }) else { return }
+        guard pane.tabs.indices.contains(index) else { return }
+        workspaceState.panes[paneIdx].activeTabId = pane.tabs[index].id
+    }
+
+    /// Leave windowed mode — reset the stream to the newest-first view
+    /// the user started from, and scroll to the top.
+    private func exitWindowedMode(proxy: ScrollViewProxy) {
+        focusedHighlightId = nil
+        isWindowedMode = false
+        hasNewer = false
+        highlightsOffset = 0
+        loadCaptures(reset: true)
+        if let firstId = highlights.first?.id {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    proxy.scrollTo(firstId, anchor: .top)
+                }
             }
-            originStack = nil
-            originStackItems = []
         }
     }
 
     /// Ordered list of items the user can page through with arrow keys
-    /// while `highlight` is on screen. Stack-origin items win when the
-    /// item was opened from a stack; otherwise the currently-filtered
-    /// archive is used. Arrow nav quietly no-ops when the list has
-    /// only the current item or doesn't contain it.
+    /// while `highlight` is on screen. When the modal was opened from a
+    /// stack tab, the snapshot taken at open time wins; otherwise the
+    /// currently-filtered archive list is used. Arrow nav quietly no-ops
+    /// when the list has only the current item or doesn't contain it.
     private func siblings(for highlight: Highlight) -> [Highlight] {
-        if originStack != nil, !originStackItems.isEmpty,
-           originStackItems.contains(where: { $0.id == highlight.id }) {
-            return originStackItems
+        if !modalSourceStackItems.isEmpty,
+           modalSourceStackItems.contains(where: { $0.id == highlight.id }) {
+            return modalSourceStackItems
         }
         return highlights
+    }
+
+    /// Sweep stack tabs that no longer correspond to a real stack and
+    /// close them. Called from .stackDataDidChange so a deleted/merged
+    /// stack doesn't leave a dangling tab pointing at nothing.
+    private func pruneVanishedStackTabs() {
+        var deletions: [(paneId: UUID, tabId: UUID)] = []
+        for pane in workspaceState.panes {
+            for tab in pane.tabs {
+                if case .stack(let id) = tab.content,
+                   DatabaseManager.shared.stack(byId: id) == nil {
+                    deletions.append((pane.id, tab.id))
+                }
+            }
+        }
+        for d in deletions {
+            workspaceState.closeTab(paneId: d.paneId, tabId: d.tabId)
+        }
+    }
+
+    // MARK: - Tab body dispatch
+
+    /// Map a tab content case onto its body. The All-view tab reuses the
+    /// archive masonry; stack tabs render `StackBody`; the new-tab chooser
+    /// renders `NewTabChooser` and self-closes (or replaces itself) on
+    /// pick; settings reuses `SettingsView`. The pane/tab IDs are threaded
+    /// through so bodies that need to mutate their own slot in the
+    /// workspace tree (currently just the chooser) don't have to re-locate
+    /// themselves on every render.
+    @ViewBuilder
+    private func tabBody(for content: WorkspaceTabContent, paneId: UUID, tabId: UUID) -> some View {
+        switch content {
+        case .allView:
+            archiveBody
+        case .stack(let id):
+            stackTabBody(id: id)
+        case .newTab:
+            NewTabChooser(onPick: { picked in
+                handleChooserPick(picked, paneId: paneId, tabId: tabId)
+            })
+        case .settings:
+            ScrollView {
+                SettingsView()
+                    .frame(maxWidth: 500)
+                    .padding(24)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(UITokens.surfaceBackground)
+        }
+    }
+
+    /// Resolve a chooser selection. The user clicked "+" in a specific
+    /// pane and picked some content — the chooser tab in THAT pane
+    /// becomes the picked content in place. No pane teleporting, no
+    /// dedup against existing tabs. Multiple instances of the same
+    /// content across panes are explicitly allowed.
+    private func handleChooserPick(_ picked: WorkspaceTabContent, paneId: UUID, tabId: UUID) {
+        workspaceState.replaceContent(paneId: paneId, tabId: tabId, newContent: picked)
+    }
+
+    @ViewBuilder
+    private func stackTabBody(id: String) -> some View {
+        if let stack = DatabaseManager.shared.stack(byId: id) {
+            StackBody(
+                stack: stack,
+                onOpenHighlight: { highlight in
+                    let items = DatabaseManager.shared.highlightsForStack(stackId: stack.id)
+                    modalSourceStackItems = items
+                    withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = highlight }
+                },
+                onOpenSubstack: { child in
+                    workspaceState.openTab(.stack(id: child.id))
+                },
+                onStackVanished: {
+                    // Close every tab anywhere in the workspace that
+                    // points to this vanished stack.
+                    var closures: [(UUID, UUID)] = []
+                    for pane in workspaceState.panes {
+                        for tab in pane.tabs where tab.content == .stack(id: id) {
+                            closures.append((pane.id, tab.id))
+                        }
+                    }
+                    for (paneId, tabId) in closures {
+                        workspaceState.closeTab(paneId: paneId, tabId: tabId)
+                    }
+                }
+            )
+        } else {
+            VStack(spacing: 8) {
+                Image(systemName: "rectangle.stack.badge.minus")
+                    .font(.system(size: 28, weight: .light))
+                    .foregroundStyle(.tertiary)
+                Text("This stack is no longer available")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(UITokens.surfaceBackground)
+        }
+    }
+
+    /// The classic browse archive: empty state OR masonry/history of
+    /// captures, with a search/count footer at the bottom and drag-and-
+    /// drop import support across the whole surface.
+    private var archiveBody: some View {
+        ZStack(alignment: .bottom) {
+            UITokens.surfaceBackground
+                .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                AllViewFilterBar(
+                    activeFilters: $activeFilters,
+                    appFacets: appFacets,
+                    typeCounts: typeCounts,
+                    candidateCount: { candidate in
+                        var test = activeFilters
+                        switch candidate {
+                        case .type(let t):
+                            // Already-selected candidates report the current
+                            // result count rather than a "what if added"
+                            // figure (since adding a present value is a
+                            // no-op under AND semantics).
+                            test.types.insert(t)
+                        case .app(let a):
+                            test.apps.insert(a)
+                        }
+                        return DatabaseManager.shared.browseHighlightsCount(
+                            BrowseLoadRequest(searchText: searchText, activeFilters: test)
+                        )
+                    }
+                )
+
+                if filteredHighlights.isEmpty && !(showAddTile && viewMode == .mosaic) {
+                    VStack(spacing: 12) {
+                        Spacer()
+                        Image(systemName: "tray")
+                            .font(.system(size: 36))
+                            .foregroundStyle(.quaternary)
+                        Text(emptyStateTitle)
+                            .foregroundStyle(.secondary)
+                            .font(.callout)
+                        if let emptyStateSubtitle {
+                            Text(emptyStateSubtitle)
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        } else {
+                            VStack(spacing: 4) {
+                                Text("Cmd+Shift+3 — screenshot")
+                                Text("Cmd+Shift+4 — region capture")
+                                Text("Copy text anywhere — auto-captured")
+                                Text("Drop files here to import")
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                        }
+                        Spacer()
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            Group {
+                                switch viewMode {
+                                case .mosaic:
+                                    MasonryLayout(minColumnWidth: 260, spacing: 14, pinFirst: showAddTile) {
+                                        if showAddTile {
+                                            AddTile()
+                                        }
+                                        ForEach(filteredHighlights) { highlight in
+                                            MasonryCard(
+                                                highlight: highlight,
+                                                noteCount: noteCounts[highlight.id] ?? 0,
+                                                preferredAspectRatio: aspectRatios[highlight.id],
+                                                sourceLink: sourceLinks[highlight.id],
+                                                fileRecord: highlight.fileId.flatMap { fileRecords[$0] },
+                                                searchQuery: searchText
+                                            )
+                                            .id(highlight.id)
+                                            .overlay {
+                                                if jumpFlashId == highlight.id {
+                                                    RoundedRectangle(cornerRadius: UITokens.radiusCard)
+                                                        .strokeBorder(Color.accentColor, lineWidth: 3)
+                                                        .allowsHitTesting(false)
+                                                        .transition(.asymmetric(
+                                                            insertion: .opacity.animation(.easeIn(duration: 0.18)),
+                                                            removal: .opacity.animation(.easeOut(duration: 0.7))
+                                                        ))
+                                                }
+                                            }
+                                            .onTapGesture {
+                                                routeCardTap(highlight)
+                                            }
+                                        }
+                                    }
+                                    .padding(.horizontal, 16).padding(.vertical, 12)
+                                case .list:
+                                    ArchiveListView(
+                                        highlights: filteredHighlights,
+                                        highlightNotes: highlightNotes,
+                                        noteCounts: noteCounts,
+                                        onSelect: { highlight in
+                                            routeCardTap(highlight)
+                                        },
+                                        onApproachEnd: {
+                                            if hasMore { loadCaptures(reset: false) }
+                                        }
+                                    )
+                                }
+                            }
+                            .id(viewMode)
+                            .padding(.bottom, pinnedStack != nil ? 220 : 0)
+                            .animation(nil, value: pinnedStack)
+                        }
+                        .overlay(alignment: .top) {
+                            if isWindowedMode && isScrolledAwayFromTop {
+                                BackToNewestChip {
+                                    exitWindowedMode(proxy: proxy)
+                                }
+                                .padding(.top, 12)
+                                .transition(.opacity.combined(with: .move(edge: .top)))
+                            }
+                        }
+                        .onScrollGeometryChange(for: Bool.self) { geo in
+                            let bottomEdge = geo.contentOffset.y + geo.containerSize.height
+                            let threshold = geo.contentSize.height - 400
+                            return bottomEdge >= threshold
+                        } action: { _, isNearBottom in
+                            if isNearBottom && hasMore {
+                                loadCaptures(reset: false)
+                            }
+                        }
+                        .onScrollGeometryChange(for: Bool.self) { geo in
+                            geo.contentOffset.y > backToNewestRevealOffset
+                        } action: { _, scrolled in
+                            withAnimation(.easeInOut(duration: 0.15)) {
+                                isScrolledAwayFromTop = scrolled
+                            }
+                        }
+                        .onScrollGeometryChange(for: Bool.self) { geo in
+                            geo.contentOffset.y < 400
+                        } action: { _, isNearTop in
+                            if isNearTop && isWindowedMode && hasNewer {
+                                loadNewerCaptures(proxy: proxy)
+                            }
+                        }
+                        .onChange(of: focusedHighlightId) { _, newValue in
+                            guard let id = newValue else { return }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    proxy.scrollTo(id, anchor: .center)
+                                }
+                            }
+                            // Flash the arriving card so the eye can
+                            // latch onto it after the scroll lands.
+                            jumpFlashTask?.cancel()
+                            jumpFlashTask = Task {
+                                try? await Task.sleep(for: .milliseconds(280))
+                                guard !Task.isCancelled else { return }
+                                await MainActor.run { jumpFlashId = id }
+                                try? await Task.sleep(for: .milliseconds(950))
+                                guard !Task.isCancelled else { return }
+                                await MainActor.run { jumpFlashId = nil }
+                            }
+                        }
+                        .onChange(of: viewMode) { _, _ in
+                            // When the user toggles between mosaic and
+                            // history while a jump target is active,
+                            // re-apply the scroll so the target lands
+                            // in view on the newly-mounted branch.
+                            guard let id = focusedHighlightId else { return }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    proxy.scrollTo(id, anchor: .center)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Divider()
+                HStack(spacing: 8) {
+                    Button(action: {
+                        NotificationCenter.default.post(name: .toggleSearchSidebar, object: nil)
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "magnifyingglass")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                            Text("Search")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                            Text("⌘F")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.quaternary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open search (⌘F)")
+
+                    Spacer()
+
+                    Text("\(totalCaptureCount) captures")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                    if isReloadingCaptures {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    BrowseViewModeToggle(viewMode: $viewMode)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background {
+                    GeometryReader { proxy in
+                        Color.clear.preference(
+                            key: BrowseFooterBarFramePreferenceKey.self,
+                            value: proxy.frame(in: .named("BrowseRootSpace"))
+                        )
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .simultaneousGesture(TapGesture().onEnded { clearFocus() })
+            .onDrop(of: [.fileURL, .item], isTargeted: $isDropTargeted) { providers in
+                handleDrop(providers)
+            }
+            .overlay {
+                if isDropTargeted {
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 3, dash: [8, 6]))
+                        .background(Color.accentColor.opacity(0.08))
+                        .overlay {
+                            VStack(spacing: 8) {
+                                Image(systemName: "square.and.arrow.down.on.square")
+                                    .font(.system(size: 36, weight: .regular))
+                                    .foregroundStyle(Color.accentColor)
+                                Text("Drop to add to captures")
+                                    .font(.headline)
+                                    .foregroundStyle(Color.accentColor)
+                            }
+                        }
+                        .padding(8)
+                        .allowsHitTesting(false)
+                }
+            }
+        }
     }
 
     // MARK: - Data Loading
@@ -862,7 +1233,16 @@ struct BrowseView: View {
             browseLoadGeneration += 1
             browseLoadTask?.cancel()
             hasMore = false
-            isReloadingCaptures = true
+            // Only show the spinner if the query is still running after
+            // 200ms. Fast searches (FTS5 + small page) finish in <50ms,
+            // and flashing the spinner for every keystroke reads as lag.
+            let spinnerGen = browseLoadGeneration
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(200))
+                if spinnerGen == browseLoadGeneration && browseLoadTask != nil {
+                    isReloadingCaptures = true
+                }
+            }
         } else if browseLoadTask != nil {
             return
         }
@@ -876,43 +1256,162 @@ struct BrowseView: View {
         let task = Task.detached(priority: .userInitiated) {
             let db = DatabaseManager.shared
             let batch = db.browseHighlights(request, offset: offset, limit: limit)
-            let newCounts = db.noteCountsForHighlights(ids: batch.map(\.id))
-            let newRatios = db.aspectRatiosForHighlights(ids: batch.map(\.id))
-            let facets: [(appName: String, bundleId: String?, count: Int)]? =
-                shouldRefreshFacets ? db.appFacets() : nil
+            let batchIds = batch.map(\.id)
+
+            // Stage instrumentation — one log line per search tells us
+            // exactly where time is going when the user perceives lag.
+            // Cheap to leave on; flip to `.debug` if noise ever matters.
+            let stageStart = Date()
+            let t0 = Date()
+            let newCounts = db.noteCountsForHighlights(ids: batchIds)
+            let tCounts = Int(Date().timeIntervalSince(t0) * 1000)
+            let t1 = Date()
+            let newNotes = db.notesForHighlights(ids: batchIds)
+            let tNotes = Int(Date().timeIntervalSince(t1) * 1000)
+            let t2 = Date()
+            let newRatios = db.aspectRatiosForHighlights(ids: batchIds)
+            let tRatios = Int(Date().timeIntervalSince(t2) * 1000)
+            let t3 = Date()
+            // Resolve source links here (off the render path). Runs
+            // `FileManager.fileExists` checks + JSON decode in a batch so
+            // MasonryCard's body no longer burns syscalls on every render.
+            let newSourceLinks = CardSourceLinkResolver.resolveBatch(batch)
+            let tSource = Int(Date().timeIntervalSince(t3) * 1000)
+            let t4 = Date()
+            // Batch-fetch FileRecords so FileCards don't each fire their
+            // own DB query on mount.
+            let fileIds = batch.compactMap(\.fileId)
+            let newFileRecords = db.fileRecords(byIds: fileIds)
+            let tFiles = Int(Date().timeIntervalSince(t4) * 1000)
+            let tBatchTotal = Int(Date().timeIntervalSince(stageStart) * 1000)
+            CaptureLog.info("[search stage] batch queries total=\(tBatchTotal)ms (noteCounts=\(tCounts)ms notes=\(tNotes)ms ratios=\(tRatios)ms sourceLinks=\(tSource)ms fileRecords=\(tFiles)ms) batch=\(batch.count) rows")
 
             guard !Task.isCancelled else { return }
 
+            let tMain = Date()
             await MainActor.run {
                 guard generation == browseLoadGeneration else { return }
 
-                // Dedupe by id: an in-flight paginated load can race with a
-                // reset triggered by .highlightDidSave / .highlightDataDidChange,
-                // and real-time inserts can shift rows so the same id appears
-                // on consecutive OFFSET pages. Either way, duplicate ids in
-                // ForEach give undefined layout (overlapping masonry cards).
+                // Phase 1 — render the mosaic as soon as rows + batches
+                // are in hand. Count + facets follow in phase 2 so the
+                // user isn't blocked on a full-table count/group-by for
+                // the initial paint.
+                //
+                // Dedupe by id: an in-flight paginated load can race with
+                // a reset triggered by .highlightDidSave /
+                // .highlightDataDidChange, and real-time inserts can
+                // shift rows so the same id appears on consecutive OFFSET
+                // pages. Either way, duplicate ids in ForEach give
+                // undefined layout (overlapping masonry cards).
                 if reset {
                     highlights = batch
                     highlightsOffset = batch.count
+                    sourceLinks = newSourceLinks
+                    fileRecords = newFileRecords
                 } else {
                     let existingIds = Set(highlights.map(\.id))
                     let newRows = batch.filter { !existingIds.contains($0.id) }
                     highlights.append(contentsOf: newRows)
                     highlightsOffset += batch.count
+                    sourceLinks.merge(newSourceLinks) { _, new in new }
+                    fileRecords.merge(newFileRecords) { _, new in new }
                 }
                 hasMore = batch.count == limit
                 noteCounts.merge(newCounts) { _, new in new }
+                if reset {
+                    highlightNotes = newNotes
+                } else {
+                    highlightNotes.merge(newNotes) { _, new in new }
+                }
                 aspectRatios.merge(newRatios) { _, new in new }
-                if let facets {
+                isReloadingCaptures = false
+                browseLoadTask = nil
+            }
+            let tMainTotal = Int(Date().timeIntervalSince(tMain) * 1000)
+            CaptureLog.info("[search stage] phase 1 main-actor write: \(tMainTotal)ms")
+
+            // Phase 2 — count + facets. Waits 300ms before running so
+            // rapid typing doesn't trigger the facet GROUP BY per
+            // keystroke. Every new keystroke cancels this task; only
+            // when typing settles does phase 2 actually run. This was
+            // the second full SwiftUI body re-eval per keystroke —
+            // splitting it off from the critical path halves the
+            // render-pipeline work during active typing.
+            guard reset, !Task.isCancelled else { return }
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            let tPhase2 = Date()
+            let tFacets0 = Date()
+            let facets = shouldRefreshFacets
+                ? db.appFacets(request)
+                : [(appName: String, bundleId: String?, count: Int)]()
+            let tFacets = Int(Date().timeIntervalSince(tFacets0) * 1000)
+            let tCount0 = Date()
+            let total = db.browseHighlightsCount(request)
+            let tCount = Int(Date().timeIntervalSince(tCount0) * 1000)
+
+            guard !Task.isCancelled else { return }
+
+            await MainActor.run {
+                guard generation == browseLoadGeneration else { return }
+                if shouldRefreshFacets {
                     appFacets = facets.map {
                         AppFacet(appName: $0.appName, bundleId: $0.bundleId, count: $0.count)
                     }
                 }
-                isReloadingCaptures = false
-                browseLoadTask = nil
+                totalCaptureCount = total
             }
+            let tPhase2Total = Int(Date().timeIntervalSince(tPhase2) * 1000)
+            CaptureLog.info("[search stage] phase 2 count+facets: total=\(tPhase2Total)ms (facets=\(tFacets)ms count=\(tCount)ms)")
         }
         browseLoadTask = task
+    }
+
+    /// Page upward in windowed mode: fetch up to `pageSize` rows newer
+    /// than the current top row's timestamp and prepend them. Anchors
+    /// the scroll position to the previous top row so the user's view
+    /// doesn't visibly jump when the new rows insert above.
+    private func loadNewerCaptures(proxy: ScrollViewProxy) {
+        guard isWindowedMode, hasNewer, !newerLoadInFlight,
+              let topTimestamp = highlights.first?.timestamp,
+              let anchorId = highlights.first?.id else { return }
+        newerLoadInFlight = true
+        let limit = pageSize
+
+        Task.detached(priority: .userInitiated) {
+            let db = DatabaseManager.shared
+            let batch = db.highlightsNewer(thanTimestamp: topTimestamp, limit: limit)
+            let batchIds = batch.map(\.id)
+            let counts = db.noteCountsForHighlights(ids: batchIds)
+            let notes = db.notesForHighlights(ids: batchIds)
+            let ratios = db.aspectRatiosForHighlights(ids: batchIds)
+            let links = CardSourceLinkResolver.resolveBatch(batch)
+            let fileIds = batch.compactMap(\.fileId)
+            let files = db.fileRecords(byIds: fileIds)
+
+            await MainActor.run {
+                defer { newerLoadInFlight = false }
+                guard isWindowedMode else { return }
+                let existingIds = Set(highlights.map(\.id))
+                let newRows = batch.filter { !existingIds.contains($0.id) }
+                guard !newRows.isEmpty else {
+                    hasNewer = false
+                    return
+                }
+                highlights = newRows + highlights
+                noteCounts.merge(counts) { _, n in n }
+                highlightNotes.merge(notes) { _, n in n }
+                aspectRatios.merge(ratios) { _, n in n }
+                sourceLinks.merge(links) { _, n in n }
+                fileRecords.merge(files) { _, n in n }
+                hasNewer = newRows.count == limit
+                // Re-anchor on the row that was previously at the top so
+                // the user's visible position doesn't shift down by the
+                // height of the prepended batch. No animation — this is
+                // a positional correction, not a user gesture.
+                proxy.scrollTo(anchorId, anchor: .top)
+            }
+        }
     }
 
     private func clearFocus() {
@@ -997,6 +1496,57 @@ private struct BrowseFooterBarFramePreferenceKey: PreferenceKey {
     }
 }
 
+/// LayoutValueKey that MasonryCard uses to publish its `highlight.id` to
+/// the surrounding `MasonryLayout`. Gives the layout a stable identity
+/// per subview so it can memoize per-card heights across searches —
+/// when the same card reappears in a later result set, its height is a
+/// dict lookup instead of a fresh `sizeThatFits` walk.
+private struct MasonryCardIdKey: LayoutValueKey {
+    static let defaultValue: String? = nil
+}
+
+/// Process-wide height memo keyed by (highlight.id, columnWidth bucket).
+/// Bucketing tolerates width drift during drag without blowing the cache
+/// — critical for smooth pane-divider resize where colWidth can shift
+/// by several pt per frame. The 8pt bucket means a card measured at
+/// 380pt is reused at 372–387pt without re-measurement; the visible
+/// height difference for a 7pt width change is sub-pt for text and a
+/// fraction of a line for images, imperceptible during live drag and
+/// resolved via re-measure once the drag crosses a bucket boundary.
+private enum MasonryHeightCache {
+    private static let cache: NSCache<NSString, NSNumber> = {
+        let c = NSCache<NSString, NSNumber>()
+        c.countLimit = 5000
+        return c
+    }()
+
+    /// Pt-width bucket size. Higher = more cache hits during drag,
+    /// at the cost of slightly stale heights between bucket boundaries.
+    private static let bucketSize: Int = 8
+
+    static func key(id: String, colWidth: CGFloat) -> NSString {
+        let bucket = Int((colWidth / CGFloat(bucketSize)).rounded()) * bucketSize
+        return "\(id)|\(bucket)" as NSString
+    }
+
+    static func cached(id: String, colWidth: CGFloat) -> CGFloat? {
+        guard let v = cache.object(forKey: key(id: id, colWidth: colWidth)) else { return nil }
+        return CGFloat(v.doubleValue)
+    }
+
+    static func store(_ h: CGFloat, id: String, colWidth: CGFloat) {
+        cache.setObject(NSNumber(value: Double(h)), forKey: key(id: id, colWidth: colWidth))
+    }
+
+    static func invalidate(id: String) {
+        // No fast prefix removal on NSCache; clearing the whole cache
+        // is cheap enough for the rare invalidation (note edit,
+        // annotation change). Alternative would be to keep a parallel
+        // dict but that duplicates state.
+        cache.removeAllObjects()
+    }
+}
+
 private struct MasonryLayout: Layout {
     let minColumnWidth: CGFloat
     let spacing: CGFloat
@@ -1021,16 +1571,60 @@ private struct MasonryLayout: Layout {
         var columns: Int = 0
         var columnWidth: CGFloat = 0
         var heights: [CGFloat] = []
+        /// Hash of the subview-id sequence seen at last full measure.
+        /// When the current sequence matches, we know the content is
+        /// identical and can reuse `heights` verbatim. Prevents the
+        /// earlier bug where subview-count-matches-but-content-differs
+        /// gave wrong layouts.
+        var contentHash: Int = 0
         var assignments: [(col: Int, y: CGFloat)] = []
         var contentHeight: CGFloat = 0
     }
 
     func makeCache(subviews: Subviews) -> CacheData { CacheData() }
 
+    /// Build a hash over subview identities. Subviews publish their
+    /// `highlight.id` through `MasonryCardIdKey`; the AddTile publishes
+    /// no id, so it hashes to a stable sentinel. Any reordering or
+    /// content swap flips the hash and forces a full re-measure.
+    private func subviewsHash(_ subviews: Subviews) -> Int {
+        var hasher = Hasher()
+        for s in subviews {
+            hasher.combine(s[MasonryCardIdKey.self] ?? "__addtile__")
+        }
+        return hasher.finalize()
+    }
+
+    /// Three-tier height resolution:
+    ///   1. `MasonryCardHeightKey` — pre-computed in pure Swift by
+    ///      `MasonryHeightComputer`, pushed down via layoutValue. Zero
+    ///      SwiftUI measurement. This is the fast path we want every
+    ///      card to hit.
+    ///   2. `MasonryHeightCache` — id-keyed memo of a prior SwiftUI
+    ///      measurement. Catches cards that arrived without a
+    ///      pre-computed height (race at first render).
+    ///   3. `sizeThatFits` fallback — the expensive walk, only taken
+    ///      when both upstream paths miss. Results backfill (2).
     private func measureHeights(subviews: Subviews, colWidth: CGFloat) -> [CGFloat] {
-        subviews.map {
-            let measured = $0.sizeThatFits(.init(width: colWidth, height: nil)).height
-            return measured.isFinite ? measured : 0
+        // Heights come from SwiftUI's own `sizeThatFits` (accurate by
+        // definition — that's the same value used to render). The
+        // id-keyed cache memoizes the result so subsequent layout
+        // passes are an O(1) dict lookup. The pre-compute path that
+        // tried to bypass `sizeThatFits` was removed: SwiftUI's
+        // resolved fonts (`design: .serif` → New York on modern
+        // macOS) don't match the NSFont we measured against, which
+        // produced under-estimated heights and visible card overlap.
+        return subviews.map { s -> CGFloat in
+            if let id = s[MasonryCardIdKey.self],
+               let cached = MasonryHeightCache.cached(id: id, colWidth: colWidth) {
+                return cached
+            }
+            let measured = s.sizeThatFits(.init(width: colWidth, height: nil)).height
+            let h = measured.isFinite ? measured : 0
+            if let id = s[MasonryCardIdKey.self] {
+                MasonryHeightCache.store(h, id: id, colWidth: colWidth)
+            }
+            return h
         }
     }
 
@@ -1039,19 +1633,46 @@ private struct MasonryLayout: Layout {
         subviews: Subviews,
         cache: inout CacheData
     ) {
-        // Always re-measure and re-layout. The previous "structureChanged"
-        // short-circuit could stick with stale assignments when a card's
-        // intrinsic height changed mid-transition (async image/link-preview
-        // loads, mode-switch animations). layout() is O(n·cols) on
-        // already-measured heights — cheap enough to run unconditionally.
         let columns = columnCount(for: totalWidth)
         let colWidth = columnWidth(for: totalWidth, columns: columns)
+        let hash = subviewsHash(subviews)
+
+        // Fast path — identical content + same column count, with
+        // colWidth drift up to 8pt. Skips every `sizeThatFits` walk.
+        // The 8pt tolerance is the difference between smooth and
+        // stuttery during pane-divider drag: a fast drag shifts each
+        // pane's width by 3-6pt per frame, far past the old 1pt
+        // tolerance. Heights cached at the previous width remain
+        // accurate enough at the new width that the visible result
+        // is indistinguishable from a full re-measure during the
+        // drag, and the layout snaps tight on `onEnd` when the user
+        // releases. Beyond 8pt, fall through to the full re-measure
+        // path so column-count changes (or genuine resize) get
+        // accurate layout.
+        if !cache.heights.isEmpty,
+           cache.contentHash == hash,
+           cache.heights.count == subviews.count,
+           cache.columns == columns,
+           abs(cache.columnWidth - colWidth) < 8.0 {
+            let (colHeights, assignments) = layout(columns: columns, colWidth: colWidth, heights: cache.heights)
+            cache.measuredWidth = totalWidth
+            cache.columnWidth = colWidth
+            cache.assignments = assignments
+            cache.contentHeight = colHeights.max() ?? 0
+            return
+        }
+
+        // Full re-measure, but each per-subview call checks the shared
+        // id-keyed height cache first — so even this "slow" path is
+        // often a dict lookup per card when the user is running a new
+        // search that surfaces cards they've seen before.
         let heights = measureHeights(subviews: subviews, colWidth: colWidth)
         let (colHeights, assignments) = layout(columns: columns, colWidth: colWidth, heights: heights)
         cache.measuredWidth = totalWidth
         cache.columns = columns
         cache.columnWidth = colWidth
         cache.heights = heights
+        cache.contentHash = hash
         cache.assignments = assignments
         cache.contentHeight = colHeights.max() ?? 0
     }
@@ -1098,24 +1719,17 @@ private struct MasonryLayout: Layout {
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout CacheData) {
-        // Re-measure inline and compute placements from scratch. Using the
-        // cache here would hold assignments from `sizeThatFits` that can be
-        // stale by the time we place — async image/link-preview loads
-        // between the two calls change card natural heights. Those stale
-        // Y offsets caused the visible overlap. Propose `height: nil` so
-        // each subview renders at its natural height and neither we nor
-        // SwiftUI try to squeeze a view smaller than its content requires.
-        let columns = columnCount(for: bounds.width)
-        let colWidth = columnWidth(for: bounds.width, columns: columns)
-        let heights = measureHeights(subviews: subviews, colWidth: colWidth)
-        let (_, assignments) = layout(columns: columns, colWidth: colWidth, heights: heights)
-        cache.measuredWidth = bounds.width
-        cache.columns = columns
-        cache.columnWidth = colWidth
-        cache.heights = heights
-        cache.assignments = assignments
+        // Route through `refreshCache` so the drag-tight fast path kicks
+        // in. When SwiftUI's layout hasn't changed width between
+        // `sizeThatFits` and here (the normal case), `refreshCache` is a
+        // no-op that reuses the existing heights. Async image loads that
+        // landed between passes are handled by SwiftUI re-invoking
+        // `sizeThatFits` with a fresh layout pass, which invalidates the
+        // cache via the subview count or width deltas.
+        refreshCache(for: bounds.width, subviews: subviews, cache: &cache)
+        let colWidth = cache.columnWidth
         for (i, subview) in subviews.enumerated() {
-            let a = assignments[i]
+            let a = cache.assignments[i]
             let x = bounds.minX + CGFloat(a.col) * (colWidth + spacing)
             let y = bounds.minY + a.y
             subview.place(
@@ -1131,7 +1745,7 @@ private struct MasonryLayout: Layout {
 /// Openable reference attached to a card's hover-revealed top-right pill.
 /// Ranked so enricher-extracted deeplinks and web URLs win over weaker
 /// fallbacks (file path, then bare app-launch) — see `MasonryCard.sourceLink`.
-enum CardSourceLink {
+enum CardSourceLink: Equatable {
     case url(String, label: String)
     case file(URL, label: String)
     case app(bundleId: String, label: String)
@@ -1173,58 +1787,26 @@ private struct MasonryCard: View {
     /// preview reserve aspect-correct space before any image/video decodes,
     /// which keeps neighbour cards from re-flowing when the bitmap arrives.
     var preferredAspectRatio: CGFloat? = nil
+    /// Pre-resolved source link for this highlight, computed off the render
+    /// path by BrowseView's pagination pipeline. When nil, no hover pill is
+    /// shown. See `CardSourceLinkResolver` — this used to be a computed
+    /// property that ran two `FileManager.fileExists` syscalls per render.
+    var sourceLink: CardSourceLink? = nil
+    /// Pre-fetched FileRecord for file-type highlights. When nil, FileCard
+    /// falls back to its own DB lookup on mount (keeps the legacy
+    /// fileRecordByPath fallback path intact for orphan highlights).
+    var fileRecord: FileRecord? = nil
+    /// Current search query. When non-empty, cards render their visible
+    /// text via `SearchHighlight.render` so matches highlight in the
+    /// actual rendered field — body, filename, link title, annotation,
+    /// etc. Empty string is a no-op.
+    var searchQuery: String = ""
     @State private var isHovered = false
     @State private var isLinkHovered = false
 
     private var hasAnnotation: Bool {
         if let note = highlight.userNote, !note.isEmpty { return true }
         return false
-    }
-
-    /// Best "open outside the app" target for this card, picked by strength.
-    /// Enricher URLs (Slack permalinks, browser page URL) > `sourceUrl` >
-    /// URL-copy `contentText` > file path > bare app launch via `bundleId`.
-    private var sourceLink: CardSourceLink? {
-        if let entry = highlight.decodedSourceContext.first(where: { $0.url != nil }),
-           let urlString = entry.url, let parsed = URL(string: urlString) {
-            return .url(urlString, label: hostLabel(from: parsed, fallback: urlString))
-        }
-
-        if let urlString = highlight.sourceUrl, !urlString.isEmpty,
-           let parsed = URL(string: urlString), parsed.scheme?.hasPrefix("http") == true {
-            return .url(urlString, label: hostLabel(from: parsed, fallback: urlString))
-        }
-
-        if highlight.isURLCopy {
-            let trimmed = highlight.contentText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let parsed = URL(string: trimmed) {
-                return .url(trimmed, label: hostLabel(from: parsed, fallback: trimmed))
-            }
-        }
-
-        if let path = highlight.sourceUrl, path.hasPrefix("/"),
-           FileManager.default.fileExists(atPath: path) {
-            let url = URL(fileURLWithPath: path)
-            return .file(url, label: url.lastPathComponent)
-        }
-        if let path = highlight.documentPath, !path.isEmpty,
-           FileManager.default.fileExists(atPath: path) {
-            let url = URL(fileURLWithPath: path)
-            return .file(url, label: url.lastPathComponent)
-        }
-
-        if let bid = highlight.bundleId, !bid.isEmpty,
-           let name = highlight.sourceApp, !name.isEmpty {
-            return .app(bundleId: bid, label: name)
-        }
-        return nil
-    }
-
-    private func hostLabel(from url: URL, fallback: String) -> String {
-        if let host = url.host, !host.isEmpty {
-            return host.replacingOccurrences(of: "www.", with: "")
-        }
-        return fallback
     }
 
     private func linkHelp(_ link: CardSourceLink) -> String {
@@ -1238,15 +1820,11 @@ private struct MasonryCard: View {
     var body: some View {
         VStack(spacing: 0) {
             cardContent
-                .overlay(alignment: .bottomTrailing) {
-                    AddToStackButton(highlightId: highlight.id, style: .overlay)
-                        .padding(8)
-                }
 
             if hasAnnotation || noteCount > 1 {
                 VStack(alignment: .leading, spacing: 5) {
                     if hasAnnotation {
-                        Text(highlight.userNote ?? "")
+                        Text(SearchHighlight.render(highlight.userNote ?? "", query: searchQuery))
                             .font(.system(.callout, design: .serif))
                             .foregroundStyle(.primary.opacity(0.85))
                             .lineLimit(6)
@@ -1277,8 +1855,13 @@ private struct MasonryCard: View {
                 .strokeBorder(UITokens.surfaceBorder, lineWidth: 0.5)
         )
         .shadow(color: UITokens.shadowCard, radius: 6, y: 2)
+        .contentShape(RoundedRectangle(cornerRadius: UITokens.radiusCard))
+        .overlay(alignment: .bottomTrailing) {
+            AddToStackButton(highlightId: highlight.id, style: .overlay)
+                .padding(8)
+        }
         .overlay(alignment: .topTrailing) {
-            if let link = sourceLink, isHovered {
+            if let link = sourceLink, isHovered, highlight.isURLCopy {
                 Button(action: { link.open() }) {
                     HStack(spacing: 0) {
                         Text(link.label)
@@ -1319,6 +1902,9 @@ private struct MasonryCard: View {
             }
         }
         .materialContextMenu(for: highlight)
+        // Publish the highlight id so `MasonryLayout` can memoize
+        // height across relayouts via `MasonryHeightCache`.
+        .layoutValue(key: MasonryCardIdKey.self, value: highlight.id)
     }
 
     @ViewBuilder
@@ -1329,16 +1915,16 @@ private struct MasonryCard: View {
         case "recording":
             ScreenshotCard(highlight: highlight, preferredAspectRatio: preferredAspectRatio)
         case "highlight":
-            HighlightCard(highlight: highlight)
+            HighlightCard(highlight: highlight, searchQuery: searchQuery)
         case "note":
-            NoteCard(highlight: highlight)
+            NoteCard(highlight: highlight, searchQuery: searchQuery)
         case "file":
-            FileCard(highlight: highlight, preferredAspectRatio: preferredAspectRatio)
+            FileCard(highlight: highlight, preferredAspectRatio: preferredAspectRatio, prefetchedRecord: fileRecord, searchQuery: searchQuery)
         default:
             if highlight.isURLCopy {
-                LinkCard(highlight: highlight, preferredAspectRatio: preferredAspectRatio)
+                LinkCard(highlight: highlight, preferredAspectRatio: preferredAspectRatio, searchQuery: searchQuery)
             } else {
-                TextCard(highlight: highlight)
+                TextCard(highlight: highlight, searchQuery: searchQuery)
             }
         }
     }
@@ -1410,7 +1996,7 @@ private struct CardCoverPreview<Placeholder: View, Overlay: View>: View {
                         .resizable()
                         .aspectRatio(contentMode: .fill)
                         .frame(width: geo.size.width, height: geo.size.height)
-                        .clipShape(Rectangle())
+                        .clipped()
                 } else {
                     placeholder
                         .frame(width: geo.size.width, height: geo.size.height)
@@ -1419,7 +2005,7 @@ private struct CardCoverPreview<Placeholder: View, Overlay: View>: View {
                 overlay
             }
             .frame(width: geo.size.width, height: geo.size.height)
-            .clipShape(Rectangle())
+            .clipped()
         }
         .aspectRatio(resolvedAspectRatio, contentMode: .fit)
         .frame(maxWidth: .infinity)
@@ -1484,24 +2070,53 @@ private struct ScreenshotCard: View {
         .task {
             if image == nil {
                 let path = highlight.contentText
-                // Try loading as image first (screenshots, PNGs)
-                image = await Task.detached {
-                    NSImage(contentsOfFile: path)
-                }.value
-                // Fall back to video thumbnail extraction for recordings (.mov, .mp4)
+                image = await CardImageCache.load(path: path)
                 if image == nil {
                     image = await LiveThumbnail.generate(for: URL(fileURLWithPath: path))
                 }
-                // Fall back to FileRecord thumbnail if available
                 if image == nil, let fileId = highlight.fileId,
                    let rec = DatabaseManager.shared.fileRecord(byId: fileId),
                    let thumbPath = rec.thumbnailPath {
-                    image = await Task.detached {
-                        NSImage(contentsOfFile: thumbPath)
-                    }.value
+                    image = await CardImageCache.load(path: thumbPath)
                 }
             }
         }
+    }
+}
+
+// MARK: - Card Image Cache
+
+/// Process-wide NSCache for card thumbnails. Without this, tab toggles (All
+/// → Stacks → All) hard-unmount the archive mosaic via PaneView's `.id`
+/// switch, and every MasonryCard's `.task { }` re-decodes its image from
+/// disk on the return trip — a 500-card archive burns a massive spike.
+/// Keyed by absolute file path so both `NSImage(contentsOfFile:)` call
+/// sites and `LiveThumbnail` share entries.
+enum CardImageCache {
+    private static let cache: NSCache<NSString, NSImage> = {
+        let c = NSCache<NSString, NSImage>()
+        c.countLimit = 2000
+        return c
+    }()
+
+    static func cached(path: String) -> NSImage? {
+        cache.object(forKey: path as NSString)
+    }
+
+    static func store(_ image: NSImage, path: String) {
+        cache.setObject(image, forKey: path as NSString)
+    }
+
+    /// Cache-aware convenience for the common `NSImage(contentsOfFile:)`
+    /// pattern. Returns cached value synchronously if present, otherwise
+    /// loads off-main and stores the result before returning.
+    static func load(path: String) async -> NSImage? {
+        if let cached = cached(path: path) { return cached }
+        let loaded = await Task.detached(priority: .utility) {
+            NSImage(contentsOfFile: path)
+        }.value
+        if let loaded { store(loaded, path: path) }
+        return loaded
     }
 }
 
@@ -1513,9 +2128,18 @@ private struct ScreenshotCard: View {
 /// preview instead of an icon placeholder.
 enum LiveThumbnail {
     static func generate(for fileURL: URL) async -> NSImage? {
-        let ext = fileURL.pathExtension.lowercased()
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+        let path = fileURL.path
+        if let cached = CardImageCache.cached(path: path) { return cached }
 
+        let ext = fileURL.pathExtension.lowercased()
+        guard FileManager.default.fileExists(atPath: path) else { return nil }
+
+        let result = await generateUncached(fileURL: fileURL, ext: ext)
+        if let result { CardImageCache.store(result, path: path) }
+        return result
+    }
+
+    private static func generateUncached(fileURL: URL, ext: String) async -> NSImage? {
         // Image files: load directly. QuickLook sometimes returns nil for PNGs
         // and other common image types, which causes the masonry to render a
         // file-icon placeholder instead of the actual image.
@@ -1685,6 +2309,7 @@ private enum TextCardStyle {
 
 private struct TextCard: View {
     let highlight: Highlight
+    var searchQuery: String = ""
 
     var body: some View {
         if TextHighlightRouter.isImageFilePath(highlight.contentText) {
@@ -1696,7 +2321,7 @@ private struct TextCard: View {
                     .fill(Color.primary.opacity(0.12))
                     .frame(width: 2)
 
-                Text(highlight.contentText)
+                Text(SearchHighlight.render(highlight.contentText, query: searchQuery))
                     .font(style.font)
                     .foregroundStyle(.primary.opacity(0.85))
                     .lineLimit(style.lineLimit)
@@ -1712,6 +2337,7 @@ private struct TextCard: View {
 
 private struct HighlightCard: View {
     let highlight: Highlight
+    var searchQuery: String = ""
 
     var body: some View {
         if TextHighlightRouter.isImageFilePath(highlight.contentText) {
@@ -1723,7 +2349,7 @@ private struct HighlightCard: View {
                     .fill(Color.orange.opacity(0.8))
                     .frame(width: 2)
 
-                Text(highlight.contentText)
+                Text(SearchHighlight.render(highlight.contentText, query: searchQuery))
                     .font(style.font)
                     .foregroundStyle(.primary.opacity(0.85))
                     .lineLimit(style.lineLimit)
@@ -1742,8 +2368,21 @@ private enum TextHighlightRouter {
     private static let imageExts: Set<String> = [
         "png", "jpg", "jpeg", "heic", "heif", "gif", "bmp", "tiff", "tif", "webp"
     ]
+    /// Result is a pure function of `text` (path existence doesn't flip mid-
+    /// session in any meaningful way for a capture archive), so we cache by
+    /// content string. Avoids re-running `FileManager.fileExists` on every
+    /// hover-driven body re-eval of TextCard / HighlightCard.
+    private static let cache = NSCache<NSString, NSNumber>()
 
     static func isImageFilePath(_ text: String) -> Bool {
+        let key = text as NSString
+        if let cached = cache.object(forKey: key) { return cached.boolValue }
+        let result = compute(text)
+        cache.setObject(NSNumber(value: result), forKey: key)
+        return result
+    }
+
+    private static func compute(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.hasPrefix("/") else { return false }
         guard !trimmed.contains("\n") else { return false }
@@ -1757,10 +2396,11 @@ private enum TextHighlightRouter {
 
 private struct NoteCard: View {
     let highlight: Highlight
+    var searchQuery: String = ""
 
     var body: some View {
         let style = TextCardStyle.style(for: highlight.contentText)
-        Text(highlight.contentText)
+        Text(SearchHighlight.render(highlight.contentText, query: searchQuery))
             .font(style.font)
             .foregroundStyle(.primary.opacity(0.85))
             .lineLimit(style.lineLimit)
@@ -1777,8 +2417,20 @@ private struct FileCard: View {
     /// Pre-resolved intrinsic aspect ratio from BrowseView's batch map. See
     /// ScreenshotCard for the rationale — same problem, same fix.
     var preferredAspectRatio: CGFloat? = nil
+    /// Pre-fetched from BrowseView's pagination pipeline. When provided,
+    /// `.task` skips the per-mount DB lookup entirely and goes straight to
+    /// thumbnail loading.
+    var prefetchedRecord: FileRecord? = nil
+    var searchQuery: String = ""
     @State private var thumbnail: NSImage?
-    @State private var fileRecord: FileRecord?
+    @State private var resolvedRecord: FileRecord?
+    /// Memoized `NSWorkspace.icon(forFile:)` result. Resolved once in
+    /// `.task` and reused across hover-driven body re-evals. Without this
+    /// the placeholder's `Image(nsImage: systemFileIcon)` call re-hits the
+    /// workspace icon subsystem on every hover tick.
+    @State private var cachedIcon: NSImage?
+
+    private var fileRecord: FileRecord? { prefetchedRecord ?? resolvedRecord }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1815,7 +2467,10 @@ private struct FileCard: View {
                         .padding(6)
                 }
             }
-            Text(fileRecord?.fileName ?? URL(fileURLWithPath: highlight.contentText).lastPathComponent)
+            Text(SearchHighlight.render(
+                fileRecord?.fileName ?? URL(fileURLWithPath: highlight.contentText).lastPathComponent,
+                query: searchQuery
+            ))
                 .font(.caption)
                 .lineLimit(2, reservesSpace: true)
                 .truncationMode(.middle)
@@ -1826,42 +2481,72 @@ private struct FileCard: View {
 
         }
         .task {
-            // Resolve the FileRecord: prefer foreign key, but fall back to
-            // a path lookup if the highlight was inserted before the FK fix.
-            var rec: FileRecord?
-            if let fId = highlight.fileId {
-                rec = DatabaseManager.shared.fileRecord(byId: fId)
-            }
-            if rec == nil {
-                rec = DatabaseManager.shared.fileRecordByPath(highlight.contentText)
+            // Resolve the FileRecord: prefer BrowseView's prefetched batch,
+            // then the foreign key, then a path lookup for highlights
+            // inserted before the FK fix.
+            let rec: FileRecord?
+            if let pre = prefetchedRecord {
+                rec = pre
+            } else {
+                var r: FileRecord?
+                if let fId = highlight.fileId {
+                    r = DatabaseManager.shared.fileRecord(byId: fId)
+                }
+                if r == nil {
+                    r = DatabaseManager.shared.fileRecordByPath(highlight.contentText)
+                }
+                rec = r
+                resolvedRecord = rec
             }
             guard let rec else { return }
-            self.fileRecord = rec
 
             if let thumbPath = rec.thumbnailPath {
-                thumbnail = await Task.detached {
-                    NSImage(contentsOfFile: thumbPath)
-                }.value
+                thumbnail = await CardImageCache.load(path: thumbPath)
             }
             // Always try a live preview for videos/PDFs when the cached
             // thumbnail is missing or failed to load.
             if thumbnail == nil {
                 thumbnail = await LiveThumbnail.generate(for: URL(fileURLWithPath: rec.filePath))
             }
+            // Resolve the placeholder icon once — the body will read the
+            // cached value regardless of whether the thumbnail ended up
+            // being shown.
+            cachedIcon = resolveSystemIcon(for: rec)
         }
     }
 
     private var systemFileIcon: NSImage {
+        cachedIcon ?? NSWorkspace.shared.icon(for: .data)
+    }
+
+    private func resolveSystemIcon(for rec: FileRecord) -> NSImage {
         let path = highlight.contentText
         if FileManager.default.fileExists(atPath: path) {
             return NSWorkspace.shared.icon(forFile: path)
         }
-        // File might have been deleted — use UTI-based icon
-        if let ext = fileRecord?.fileExtension,
+        if let ext = rec.fileExtension,
            let utType = UTType(filenameExtension: ext) {
             return NSWorkspace.shared.icon(for: utType)
         }
         return NSWorkspace.shared.icon(for: .data)
+    }
+}
+
+// MARK: - Link Host Cache
+
+/// Memoized host-label resolution for LinkCard (and its variants). The
+/// parse+replace runs every body eval before `preview` arrives, and for
+/// cards that never fetch a preview it would run forever. Since the result
+/// is a pure function of `urlString`, stash it in a shared NSCache.
+private enum LinkHostCache {
+    private static let cache = NSCache<NSString, NSString>()
+
+    static func host(for urlString: String) -> String {
+        let key = urlString as NSString
+        if let cached = cache.object(forKey: key) { return cached as String }
+        let host = URL(string: urlString)?.host?.replacingOccurrences(of: "www.", with: "") ?? urlString
+        cache.setObject(host as NSString, forKey: key)
+        return host
     }
 }
 
@@ -1872,6 +2557,7 @@ private struct LinkCard: View {
     /// Pre-resolved intrinsic aspect ratio for the link's hero image, from
     /// BrowseView's batch map. See ScreenshotCard for the rationale.
     var preferredAspectRatio: CGFloat? = nil
+    var searchQuery: String = ""
     @State private var preview: LinkPreview?
     @State private var heroImage: NSImage?
     @State private var faviconImage: NSImage?
@@ -1882,9 +2568,7 @@ private struct LinkCard: View {
     }
 
     private var displayHost: String {
-        preview?.siteName
-            ?? URL(string: urlString)?.host?.replacingOccurrences(of: "www.", with: "")
-            ?? urlString
+        preview?.siteName ?? LinkHostCache.host(for: urlString)
     }
 
     private var displayTitle: String {
@@ -1927,7 +2611,7 @@ private struct LinkCard: View {
                             .foregroundStyle(.tertiary)
                             .frame(width: 14, height: 14)
                     }
-                    Text(displayHost)
+                    Text(SearchHighlight.render(displayHost, query: searchQuery))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -1938,7 +2622,7 @@ private struct LinkCard: View {
                         .foregroundStyle(.tertiary)
                 }
 
-                Text(displayTitle)
+                Text(SearchHighlight.render(displayTitle, query: searchQuery))
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(.primary)
                     .lineLimit(3)
@@ -1946,7 +2630,7 @@ private struct LinkCard: View {
                     .multilineTextAlignment(.leading)
 
                 if let desc = preview?.ogDescription, !desc.isEmpty {
-                    Text(desc)
+                    Text(SearchHighlight.render(desc, query: searchQuery))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
@@ -1955,7 +2639,7 @@ private struct LinkCard: View {
                 }
 
                 if let app = highlight.sourceApp {
-                    Text(app)
+                    Text(SearchHighlight.render(app, query: searchQuery))
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
@@ -1970,10 +2654,10 @@ private struct LinkCard: View {
             self.preview = fetched
             self.didLoad = true
             if let path = fetched?.imagePath {
-                self.heroImage = await Task.detached { NSImage(contentsOfFile: path) }.value
+                self.heroImage = await CardImageCache.load(path: path)
             }
             if let path = fetched?.faviconPath {
-                self.faviconImage = await Task.detached { NSImage(contentsOfFile: path) }.value
+                self.faviconImage = await CardImageCache.load(path: path)
             }
         }
     }
@@ -1990,9 +2674,7 @@ struct DetailLinkPreview: View {
     @State private var isHovered = false
 
     private var displayHost: String {
-        preview?.siteName
-            ?? URL(string: urlString)?.host?.replacingOccurrences(of: "www.", with: "")
-            ?? urlString
+        preview?.siteName ?? LinkHostCache.host(for: urlString)
     }
 
     private var displayTitle: String {
@@ -2095,10 +2777,10 @@ struct DetailLinkPreview: View {
             self.preview = fetched
             self.didLoad = true
             if let path = fetched?.imagePath {
-                self.heroImage = await Task.detached { NSImage(contentsOfFile: path) }.value
+                self.heroImage = await CardImageCache.load(path: path)
             }
             if let path = fetched?.faviconPath {
-                self.faviconImage = await Task.detached { NSImage(contentsOfFile: path) }.value
+                self.faviconImage = await CardImageCache.load(path: path)
             }
         }
     }
@@ -2119,9 +2801,7 @@ struct EmbeddedLinkPreview: View {
     @State private var didLoad = false
 
     private var displayHost: String {
-        preview?.siteName
-            ?? URL(string: urlString)?.host?.replacingOccurrences(of: "www.", with: "")
-            ?? urlString
+        preview?.siteName ?? LinkHostCache.host(for: urlString)
     }
 
     private var displayTitle: String {
@@ -2196,10 +2876,10 @@ struct EmbeddedLinkPreview: View {
                 self.preview = fetched
                 self.didLoad = true
                 if let path = fetched?.imagePath {
-                    self.heroImage = await Task.detached { NSImage(contentsOfFile: path) }.value
+                    self.heroImage = await CardImageCache.load(path: path)
                 }
                 if let path = fetched?.faviconPath {
-                    self.faviconImage = await Task.detached { NSImage(contentsOfFile: path) }.value
+                    self.faviconImage = await CardImageCache.load(path: path)
                 }
             }
         }
@@ -2225,7 +2905,13 @@ struct InstantTooltipButton: View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 13, weight: .regular))
-                .foregroundStyle(isHovered ? Color.primary : Color.primary.opacity(0.4))
+                .foregroundStyle(isHovered ? Color.primary : Color.primary.opacity(0.5))
+                .frame(width: 28, height: 28)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(Color.primary.opacity(isHovered ? 0.08 : 0))
+                )
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .help(label)
@@ -2304,6 +2990,38 @@ func openFile(_ path: String) {
         NSWorkspace.shared.open([url], withApplicationAt: previewURL, configuration: NSWorkspace.OpenConfiguration())
     } else {
         NSWorkspace.shared.open(url)
+    }
+}
+
+/// Top-anchored pill surfaced while the archive is in "jumped-to-moment"
+/// mode. Tapping it drops the windowed slice and scrolls back to the top
+/// of the newest-first stream.
+private struct BackToNewestChip: View {
+    let onTap: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.up.to.line")
+                    .font(.caption2.weight(.semibold))
+                Text("Back to newest")
+                    .font(.caption.weight(.medium))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(
+                Capsule()
+                    .fill(UITokens.surfaceFloater)
+                    .shadow(color: UITokens.shadowFloater, radius: 6, y: 2)
+            )
+            .overlay(
+                Capsule().strokeBorder(UITokens.surfaceBorderStrong, lineWidth: 0.5)
+            )
+            .foregroundStyle(isHovered ? .primary : .secondary)
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
     }
 }
 
@@ -2397,7 +3115,18 @@ private struct CardMetadataFooter: View {
 
 enum BrowseViewMode: String, CaseIterable {
     case mosaic
-    case history
+    case list
+
+    /// Decode legacy persisted values. Earlier builds wrote `"history"`
+    /// for what is now `.list`; keep that mapping so existing workspaces
+    /// don't reset to mosaic on first launch after the rename.
+    init?(rawValue: String) {
+        switch rawValue {
+        case "mosaic": self = .mosaic
+        case "list", "history": self = .list
+        default: return nil
+        }
+    }
 }
 
 private struct BrowseViewModeToggle: View {
@@ -2406,7 +3135,7 @@ private struct BrowseViewModeToggle: View {
     var body: some View {
         HStack(spacing: 2) {
             button(mode: .mosaic, icon: "square.grid.2x2.fill", help: "Mosaic")
-            button(mode: .history, icon: "list.bullet", help: "History")
+            button(mode: .list, icon: "list.bullet", help: "List")
         }
         .padding(2)
         .background(
@@ -2435,435 +3164,11 @@ private struct BrowseViewModeToggle: View {
     }
 }
 
-// MARK: - History Grouping
-//
-// Chronologically ordered captures are split first by calendar day, then by
-// "burst" inside each day — a burst is a run of items within `burstGap`
-// seconds of each other. Bursts surface the natural rhythm of capture
-// sessions ("everything I grabbed while researching X at 2 PM") without the
-// user having to eyeball timestamps. A 30-minute gap is the default
-// boundary; long enough that a short coffee break doesn't split a session,
-// short enough that morning vs. afternoon work remains distinct.
-
-struct HistoryCluster: Identifiable {
-    let id = UUID()
-    let highlights: [Highlight]  // newest first within the cluster
-
-    var itemCount: Int { highlights.count }
-    var startDate: Date { highlights.last?.date ?? Date() }
-    var endDate: Date { highlights.first?.date ?? Date() }
-
-    var rangeLabel: String {
-        let f = DateFormatter()
-        f.timeStyle = .short
-        let s = f.string(from: startDate)
-        let e = f.string(from: endDate)
-        return s == e ? s : "\(s) – \(e)"
-    }
-}
-
-struct HistoryDay: Identifiable {
-    let id: Date  // start-of-day; unique per day
-    let label: String
-    let clusters: [HistoryCluster]
-
-    var totalCount: Int { clusters.reduce(0) { $0 + $1.itemCount } }
-    var allHighlightIds: [String] { clusters.flatMap { $0.highlights.map(\.id) } }
-}
-
-// Inline preview categories. Screenshots, recordings, and files all render
-// a real thumbnail, so they collapse into the same "media" bucket for strip
-// grouping. Everything else stays a compact row.
-private extension Highlight {
-    var isMediaType: Bool {
-        highlightType == "screenshot" || highlightType == "recording" || highlightType == "file"
-    }
-}
-
-// One entry in the vertical timeline inside a cluster. A run of consecutive
-// media items collapses into `.strip` so a burst of screenshots reads as
-// one visual unit rather than N stacked tiles.
-enum HistoryTimelineItem: Identifiable {
-    case row(Highlight)
-    case media(Highlight)
-    case strip([Highlight])
-
-    var id: String {
-        switch self {
-        case .row(let h): return "row-\(h.id)"
-        case .media(let h): return "media-\(h.id)"
-        case .strip(let hs): return "strip-\(hs.first?.id ?? "")-\(hs.count)"
-        }
-    }
-}
-
-enum HistoryGrouping {
-    static let burstGap: TimeInterval = 30 * 60  // 30 minutes
-
-    /// Within a single cluster, merge consecutive media highlights into
-    /// strips while leaving text-like items as their own rows.
-    static func timelineItems(_ highlights: [Highlight]) -> [HistoryTimelineItem] {
-        var items: [HistoryTimelineItem] = []
-        var mediaRun: [Highlight] = []
-
-        func flushMedia() {
-            if mediaRun.count == 1 {
-                items.append(.media(mediaRun[0]))
-            } else if mediaRun.count >= 2 {
-                items.append(.strip(mediaRun))
-            }
-            mediaRun = []
-        }
-
-        for h in highlights {
-            if h.isMediaType {
-                mediaRun.append(h)
-            } else {
-                flushMedia()
-                items.append(.row(h))
-            }
-        }
-        flushMedia()
-        return items
-    }
-
-    static func group(_ highlights: [Highlight]) -> [HistoryDay] {
-        guard !highlights.isEmpty else { return [] }
-        let calendar = Calendar.current
-        var days: [HistoryDay] = []
-
-        var dayStart: Date? = nil
-        var dayClusters: [HistoryCluster] = []
-        var clusterItems: [Highlight] = []
-        var lastItemDate: Date? = nil
-
-        func flushCluster() {
-            guard !clusterItems.isEmpty else { return }
-            dayClusters.append(HistoryCluster(highlights: clusterItems))
-            clusterItems = []
-        }
-        func flushDay() {
-            flushCluster()
-            guard let start = dayStart, !dayClusters.isEmpty else { return }
-            days.append(HistoryDay(
-                id: start,
-                label: dayLabel(for: start, calendar: calendar),
-                clusters: dayClusters
-            ))
-            dayClusters = []
-        }
-
-        for h in highlights {
-            let itemDay = calendar.startOfDay(for: h.date)
-            if dayStart == nil {
-                dayStart = itemDay
-            } else if itemDay != dayStart {
-                flushDay()
-                dayStart = itemDay
-                lastItemDate = nil
-            }
-            // highlights arrive newest-first, so `last - current` is the gap
-            if let last = lastItemDate, last.timeIntervalSince(h.date) > burstGap {
-                flushCluster()
-            }
-            clusterItems.append(h)
-            lastItemDate = h.date
-        }
-        flushDay()
-        return days
-    }
-
-    static func dayLabel(for date: Date, calendar: Calendar) -> String {
-        if calendar.isDateInToday(date) { return "Today" }
-        if calendar.isDateInYesterday(date) { return "Yesterday" }
-        let f = DateFormatter()
-        let now = Date()
-        if calendar.isDate(date, equalTo: now, toGranularity: .weekOfYear) {
-            f.dateFormat = "EEEE"
-        } else if calendar.isDate(date, equalTo: now, toGranularity: .year) {
-            f.dateFormat = "EEEE, MMM d"
-        } else {
-            f.dateFormat = "MMM d, yyyy"
-        }
-        return f.string(from: date)
-    }
-}
-
-// MARK: - History List
-
-private struct HistoryListView: View {
-    let highlights: [Highlight]
-    let noteCounts: [String: Int]
-    let onSelect: (Highlight) -> Void
-
-    private var days: [HistoryDay] { HistoryGrouping.group(highlights) }
-
-    var body: some View {
-        LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
-            ForEach(days) { day in
-                Section {
-                    ForEach(Array(day.clusters.enumerated()), id: \.element.id) { _, cluster in
-                        HistoryClusterHeader(cluster: cluster)
-                        ForEach(HistoryGrouping.timelineItems(cluster.highlights)) { item in
-                            Group {
-                                switch item {
-                                case .row(let h):
-                                    HistoryRow(
-                                        highlight: h,
-                                        noteCount: noteCounts[h.id] ?? 0
-                                    )
-                                    .contentShape(Rectangle())
-                                    .onTapGesture { onSelect(h) }
-                                case .media(let h):
-                                    HistoryMediaRow(
-                                        highlight: h,
-                                        noteCount: noteCounts[h.id] ?? 0,
-                                        onSelect: { onSelect(h) }
-                                    )
-                                case .strip(let hs):
-                                    HistoryMediaStrip(
-                                        highlights: hs,
-                                        onSelect: onSelect
-                                    )
-                                }
-                            }
-                        }
-                    }
-                } header: {
-                    HistoryDayHeader(day: day)
-                }
-            }
-        }
-    }
-}
-
-// MARK: - Day Header
-
-private struct HistoryDayHeader: View {
-    let day: HistoryDay
-    @State private var isHovered = false
-    @State private var justAdded = false
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Text(day.label.uppercased())
-                .font(.system(size: 11, weight: .semibold))
-                .tracking(UITokens.sectionLabelTracking)
-                .foregroundStyle(.secondary)
-            Text("\(day.totalCount) \(day.totalCount == 1 ? "capture" : "captures")")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-            Spacer()
-            Button(action: addAll) {
-                HStack(spacing: 4) {
-                    Image(systemName: justAdded ? "checkmark" : "rectangle.stack.badge.plus")
-                        .font(.system(size: 10, weight: .medium))
-                    Text(justAdded ? "Added day" : "Add day to stack")
-                        .font(.system(size: 11, weight: .medium))
-                }
-                .foregroundStyle(justAdded ? Color.accentColor : .secondary)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(
-                    RoundedRectangle(cornerRadius: 5)
-                        .fill(justAdded
-                              ? Color.accentColor.opacity(0.1)
-                              : (isHovered ? Color.primary.opacity(0.06) : Color.clear))
-                )
-            }
-            .buttonStyle(.plain)
-            .opacity(isHovered || justAdded ? 1 : 0)
-            .help("Add every capture from this day into the pinned stack")
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
-        .background(UITokens.surfaceBackground)
-        .overlay(alignment: .bottom) {
-            Divider().opacity(0.6)
-        }
-        .contentShape(Rectangle())
-        .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.12)) { isHovered = hovering }
-        }
-    }
-
-    private func addAll() {
-        _ = DatabaseManager.shared.addHighlightsToPinnedOrNewStack(day.allHighlightIds)
-        withAnimation(.easeInOut(duration: 0.2)) { justAdded = true }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            withAnimation(.easeOut(duration: 0.25)) { justAdded = false }
-        }
-    }
-}
-
-// MARK: - Cluster Header
-
-private struct HistoryClusterHeader: View {
-    let cluster: HistoryCluster
-    @State private var isHovered = false
-    @State private var justAdded = false
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Rectangle()
-                .fill(Color.secondary.opacity(0.25))
-                .frame(width: 32, height: 1)
-            Text(cluster.rangeLabel)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.secondary)
-                .monospacedDigit()
-            Text("·")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-            Text("\(cluster.itemCount) item\(cluster.itemCount == 1 ? "" : "s")")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-            Spacer()
-            Button(action: addAll) {
-                HStack(spacing: 4) {
-                    Image(systemName: justAdded ? "checkmark" : "rectangle.stack.badge.plus")
-                        .font(.system(size: 10, weight: .medium))
-                    Text(justAdded ? "Added" : "Add all to stack")
-                        .font(.system(size: 11, weight: .medium))
-                }
-                .foregroundStyle(justAdded ? Color.accentColor : .secondary)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(
-                    RoundedRectangle(cornerRadius: 5)
-                        .fill(justAdded
-                              ? Color.accentColor.opacity(0.1)
-                              : (isHovered ? Color.primary.opacity(0.06) : Color.clear))
-                )
-            }
-            .buttonStyle(.plain)
-            .opacity(isHovered || justAdded ? 1 : 0)
-            .help("Add every capture in this time window into the pinned stack")
-        }
-        .padding(.horizontal, 20)
-        .padding(.top, 16)
-        .padding(.bottom, 6)
-        .contentShape(Rectangle())
-        .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.12)) { isHovered = hovering }
-        }
-    }
-
-    private func addAll() {
-        let ids = cluster.highlights.map(\.id)
-        _ = DatabaseManager.shared.addHighlightsToPinnedOrNewStack(ids)
-        withAnimation(.easeInOut(duration: 0.2)) { justAdded = true }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            withAnimation(.easeOut(duration: 0.25)) { justAdded = false }
-        }
-    }
-}
-
-// MARK: - History Row
-
-private struct HistoryRow: View {
-    let highlight: Highlight
-    var noteCount: Int = 0
-    @State private var isHovered = false
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            HistoryRowThumbnail(highlight: highlight)
-                .frame(width: 44, height: 44)
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6)
-                        .strokeBorder(UITokens.surfaceBorder, lineWidth: 0.5)
-                )
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(primaryText)
-                    .font(.system(.callout, design: .serif))
-                    .foregroundStyle(.primary.opacity(0.88))
-                    .lineLimit(2, reservesSpace: true)
-                    .multilineTextAlignment(.leading)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                if let annotation = highlight.userNote, !annotation.isEmpty {
-                    Text(annotation)
-                        .font(.caption)
-                        .foregroundStyle(.orange.opacity(0.85))
-                        .lineLimit(1, reservesSpace: true)
-                }
-
-                HStack(spacing: 6) {
-                    if let meta = secondaryMeta {
-                        Text(meta)
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                            .lineLimit(1)
-                    }
-                    if noteCount > 0 {
-                        HStack(spacing: 3) {
-                            Image(systemName: "text.bubble")
-                                .font(.system(size: 9))
-                            Text("\(noteCount)")
-                                .font(.system(size: 10, weight: .medium))
-                        }
-                        .foregroundStyle(.tertiary)
-                    }
-                }
-            }
-
-            Spacer(minLength: 8)
-
-            VStack(alignment: .trailing, spacing: 6) {
-                Text(timeString)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .monospacedDigit()
-                AddToStackButton(highlightId: highlight.id)
-                    .opacity(isHovered ? 1 : 0)
-            }
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 10)
-        .background(isHovered ? Color.primary.opacity(0.03) : Color.clear)
-        .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.1)) { isHovered = hovering }
-        }
-    }
-
-    private var primaryText: String {
-        switch highlight.highlightType {
-        case "screenshot": return "Screenshot"
-        case "recording": return "Recording"
-        case "file":
-            let name = (highlight.contentText as NSString).lastPathComponent
-            return name.isEmpty ? "File" : name
-        default:
-            let trimmed = highlight.contentText.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? "(empty)" : trimmed
-        }
-    }
-
-    private var secondaryMeta: String? {
-        var parts: [String] = []
-        if let app = highlight.sourceApp, !app.isEmpty { parts.append(app) }
-        if let short = CardMetadata.shortURL(from: highlight.sourceUrl) {
-            parts.append(short)
-        }
-        if parts.isEmpty, let wt = highlight.windowTitle, !wt.isEmpty {
-            parts.append(wt)
-        }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
-    }
-
-    private var timeString: String {
-        let f = DateFormatter()
-        f.timeStyle = .short
-        return f.string(from: highlight.date)
-    }
-}
 
 // MARK: - Highlight Thumbnail Loader
 //
-// Shared image-loading pipeline for history-view previews. Tries the raw
+// Shared image-loading pipeline for capture previews (mosaic, list-row
+// thumbnails, search sidebar). Tries the raw
 // content path first (screenshots land there verbatim), falls back to
 // LiveThumbnail for recordings/PDFs/other file types, then the persisted
 // thumbnailPath on FileRecord. Returns nil for text-like highlights.
@@ -2871,9 +3176,7 @@ private struct HistoryRow: View {
 enum HighlightThumbnailLoader {
     static func load(for highlight: Highlight) async -> NSImage? {
         let path = highlight.contentText
-        if let direct = await Task.detached(priority: .utility, operation: {
-            NSImage(contentsOfFile: path)
-        }).value {
+        if let direct = await CardImageCache.load(path: path) {
             return direct
         }
         if let live = await LiveThumbnail.generate(for: URL(fileURLWithPath: path)) {
@@ -2882,303 +3185,9 @@ enum HighlightThumbnailLoader {
         if let fileId = highlight.fileId,
            let rec = DatabaseManager.shared.fileRecord(byId: fileId),
            let thumbPath = rec.thumbnailPath {
-            return await Task.detached(priority: .utility, operation: {
-                NSImage(contentsOfFile: thumbPath)
-            }).value
+            return await CardImageCache.load(path: thumbPath)
         }
         return nil
     }
 }
 
-// MARK: - History Row Thumbnail
-
-private struct HistoryRowThumbnail: View {
-    let highlight: Highlight
-    @State private var image: NSImage?
-
-    var body: some View {
-        GeometryReader { geo in
-            ZStack {
-                if let image {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
-                        .frame(width: geo.size.width, height: geo.size.height)
-                        .clipShape(Rectangle())
-                } else {
-                    ZStack {
-                        Rectangle().fill(iconBackground)
-                        Image(systemName: iconName)
-                            .font(.system(size: 16, weight: .regular))
-                            .foregroundStyle(iconColor)
-                    }
-                }
-            }
-            .frame(width: geo.size.width, height: geo.size.height)
-            .clipShape(Rectangle())
-        }
-        .task(id: highlight.id) {
-            guard image == nil, highlight.isMediaType else { return }
-            image = await HighlightThumbnailLoader.load(for: highlight)
-        }
-    }
-
-    private var iconName: String {
-        switch highlight.highlightType {
-        case "screenshot": return "photo"
-        case "recording": return "video"
-        case "highlight": return "quote.opening"
-        case "note": return "square.and.pencil"
-        case "file": return "doc"
-        default: return highlight.isURLCopy ? "link" : "text.alignleft"
-        }
-    }
-
-    private var iconColor: Color {
-        switch highlight.highlightType {
-        case "highlight": return .orange.opacity(0.85)
-        case "note": return .blue.opacity(0.8)
-        default:
-            return highlight.isURLCopy ? .blue.opacity(0.75) : .secondary
-        }
-    }
-
-    private var iconBackground: Color {
-        switch highlight.highlightType {
-        case "highlight": return .orange.opacity(0.1)
-        case "note": return .blue.opacity(0.08)
-        default:
-            return highlight.isURLCopy ? Color.blue.opacity(0.07) : UITokens.chipFill
-        }
-    }
-}
-
-// MARK: - History Media Row (single wide inline preview)
-
-private struct HistoryMediaRow: View {
-    let highlight: Highlight
-    var noteCount: Int = 0
-    var onSelect: () -> Void
-    @State private var isHovered = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HistoryMediaPreview(highlight: highlight, contentMode: .fit)
-                .frame(maxWidth: 360, alignment: .leading)
-                .frame(minHeight: 110, maxHeight: 200)
-                .background(UITokens.surfaceBackground)
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6)
-                        .strokeBorder(UITokens.surfaceBorder, lineWidth: 0.5)
-                )
-                .overlay(alignment: .center) {
-                    if highlight.highlightType == "recording" {
-                        Image(systemName: "play.circle.fill")
-                            .font(.system(size: 36))
-                            .foregroundStyle(.white.opacity(0.92))
-                            .shadow(color: .black.opacity(0.45), radius: 4, y: 2)
-                    }
-                }
-
-            HStack(spacing: 8) {
-                Text(primaryLabel)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if let meta = secondaryMeta {
-                    Text(meta)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                }
-                if noteCount > 0 {
-                    HStack(spacing: 3) {
-                        Image(systemName: "text.bubble")
-                            .font(.system(size: 9))
-                        Text("\(noteCount)")
-                            .font(.system(size: 10, weight: .medium))
-                    }
-                    .foregroundStyle(.tertiary)
-                }
-                Spacer(minLength: 8)
-                Text(timeString)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .monospacedDigit()
-                AddToStackButton(highlightId: highlight.id)
-                    .opacity(isHovered ? 1 : 0)
-            }
-            .padding(.horizontal, 2)
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 10)
-        .background(isHovered ? Color.primary.opacity(0.03) : Color.clear)
-        .contentShape(Rectangle())
-        .onTapGesture { onSelect() }
-        .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.1)) { isHovered = hovering }
-        }
-    }
-
-    private var primaryLabel: String {
-        switch highlight.highlightType {
-        case "screenshot": return "Screenshot"
-        case "recording": return "Recording"
-        case "file":
-            let name = (highlight.contentText as NSString).lastPathComponent
-            return name.isEmpty ? "File" : name
-        default: return "Media"
-        }
-    }
-
-    private var secondaryMeta: String? {
-        var parts: [String] = []
-        if let app = highlight.sourceApp, !app.isEmpty { parts.append(app) }
-        if let short = CardMetadata.shortURL(from: highlight.sourceUrl) {
-            parts.append(short)
-        }
-        return parts.isEmpty ? nil : "· " + parts.joined(separator: " · ")
-    }
-
-    private var timeString: String {
-        let f = DateFormatter()
-        f.timeStyle = .short
-        return f.string(from: highlight.date)
-    }
-}
-
-// MARK: - History Media Strip (2+ consecutive media items)
-
-private struct HistoryMediaStrip: View {
-    let highlights: [Highlight]
-    let onSelect: (Highlight) -> Void
-
-    var body: some View {
-        LazyVGrid(
-            columns: [GridItem(.adaptive(minimum: 150, maximum: 220), spacing: 10, alignment: .top)],
-            alignment: .leading,
-            spacing: 10
-        ) {
-            ForEach(highlights) { h in
-                HistoryMediaTile(highlight: h)
-                    .onTapGesture { onSelect(h) }
-            }
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 8)
-    }
-}
-
-private struct HistoryMediaTile: View {
-    let highlight: Highlight
-    @State private var isHovered = false
-
-    private let tileHeight: CGFloat = 110
-
-    var body: some View {
-        // Fixed-size container — no scaleEffect, so hover can't bleed into
-        // neighbour cells. Hover state shifts the border/shadow only.
-        ZStack(alignment: .bottom) {
-            HistoryMediaPreview(highlight: highlight, contentMode: .fill)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            LinearGradient(
-                colors: [.clear, .black.opacity(0.55)],
-                startPoint: .center,
-                endPoint: .bottom
-            )
-            .frame(height: 40)
-            .frame(maxWidth: .infinity, alignment: .bottom)
-
-            HStack(spacing: 4) {
-                if highlight.highlightType == "recording" {
-                    Image(systemName: "play.fill")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(.white)
-                }
-                Text(timeString)
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.white)
-                    .monospacedDigit()
-                Spacer(minLength: 0)
-                AddToStackButton(highlightId: highlight.id)
-                    .opacity(isHovered ? 1 : 0)
-                    .colorScheme(.dark)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-
-            if highlight.highlightType == "recording" {
-                Image(systemName: "play.circle.fill")
-                    .font(.system(size: 28))
-                    .foregroundStyle(.white.opacity(0.9))
-                    .shadow(color: .black.opacity(0.4), radius: 3, y: 1)
-                    .frame(maxHeight: .infinity)
-            }
-        }
-        .frame(height: tileHeight)
-        .frame(maxWidth: .infinity)
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .overlay(
-            RoundedRectangle(cornerRadius: 6)
-                .strokeBorder(
-                    isHovered ? Color.accentColor.opacity(0.5) : UITokens.surfaceBorder,
-                    lineWidth: isHovered ? 1 : 0.5
-                )
-        )
-        .shadow(color: isHovered ? UITokens.shadowCard : .clear, radius: 4, y: 2)
-        .contentShape(Rectangle())
-        .animation(.easeInOut(duration: 0.12), value: isHovered)
-        .onHover { hovering in isHovered = hovering }
-    }
-
-    private var timeString: String {
-        let f = DateFormatter()
-        f.timeStyle = .short
-        return f.string(from: highlight.date)
-    }
-}
-
-// MARK: - History Media Preview (shared thumbnail view)
-
-private struct HistoryMediaPreview: View {
-    let highlight: Highlight
-    let contentMode: ContentMode
-    @State private var image: NSImage?
-
-    var body: some View {
-        GeometryReader { geo in
-            ZStack {
-                if let image {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: contentMode)
-                        .frame(width: geo.size.width, height: geo.size.height)
-                        .clipShape(Rectangle())
-                } else {
-                    ZStack {
-                        Rectangle().fill(UITokens.chipFill)
-                        Image(systemName: fallbackIcon)
-                            .font(.system(size: 28))
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-            }
-            .frame(width: geo.size.width, height: geo.size.height)
-            .clipShape(Rectangle())
-        }
-        .task(id: highlight.id) {
-            guard image == nil else { return }
-            image = await HighlightThumbnailLoader.load(for: highlight)
-        }
-    }
-
-    private var fallbackIcon: String {
-        switch highlight.highlightType {
-        case "screenshot": return "photo"
-        case "recording": return "video"
-        case "file": return "doc"
-        default: return "photo"
-        }
-    }
-}

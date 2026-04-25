@@ -21,6 +21,16 @@ struct CardDetailView: View {
     /// swaps `selectedHighlight`, preserving any origin context so back-
     /// navigation still works. If nil, arrow keys are inert.
     var onNavigate: ((Highlight) -> Void)?
+    /// Callback invoked when the user taps a row in the "Captured N times"
+    /// section to jump back to that moment in the archive. The host
+    /// (BrowseView) dismisses the overlay and windows the stream around
+    /// that highlight. Nil → capture-event rows render non-tappable.
+    var onJumpTo: ((Highlight) -> Void)?
+    /// Callback invoked when the user taps "Show in All" in the header.
+    /// The host dismisses the overlay, switches the active pane to the
+    /// All tab, and scroll-snaps the archive to this highlight's row.
+    /// Nil → the affordance is hidden.
+    var onRevealInAll: ((Highlight) -> Void)?
     @State private var image: NSImage?
     @State private var screenshotHovered = false
     @State private var fileImageHovered = false
@@ -30,6 +40,20 @@ struct CardDetailView: View {
 
     // Stack organization
     @State private var stacks: [Stack] = []
+
+    /// All highlights that share identity (fileId or contentHash) with
+    /// `highlight`, including `highlight` itself. Drives the "Captured N
+    /// times" section. Cached so reload is cheap on data-change
+    /// notifications.
+    @State private var captureEvents: [Highlight] = []
+
+    /// Gates the scroll body until every piece of data (image, notes,
+    /// stacks, capture events) is in hand. Without this, each async load
+    /// flips its own @State and each section pops in independently, which
+    /// reads as flicker/reflow. Loading in parallel + committing in a
+    /// single synchronous block collapses the arrival into one clean
+    /// render. Reset on `.task` so arrow-key siblings start fresh.
+    @State private var isReady = false
 
     // Video playback — controller is shared with whichever video player
     // renders (recording vs. file-video). Used to capture the current time
@@ -69,75 +93,14 @@ struct CardDetailView: View {
             Divider().opacity(0.5)
 
             ScrollView {
-                VStack(alignment: .leading, spacing: UITokens.sectionSpacing) {
-                    // Content preview
-                    if isScreenshot {
-                        if let image {
-                            Image(nsImage: image)
-                                .resizable()
-                                .aspectRatio(contentMode: .fit)
-                                .frame(maxWidth: .infinity)
-                                .clipShape(RoundedRectangle(cornerRadius: 8))
-                                .overlay(alignment: .topTrailing) {
-                                    if let onImageFullscreen {
-                                        ExpandImageButton(isHovered: screenshotHovered) {
-                                            onImageFullscreen(image)
-                                        }
-                                    }
-                                }
-                                .onHover { screenshotHovered = $0 }
-                                .onTapGesture { onImageFullscreen?(image) }
-                        }
-                    } else if isRecording {
-                        recordingDetailContent
-                    } else if isFile {
-                        fileDetailContent
-                    } else if highlight.isURLCopy {
-                        if highlight.fileId != nil {
-                            downloadedFileLinkContent
-                        } else {
-                            linkDetailContent
-                        }
-                    } else {
-                        // Copied text — styled as a clipping, sized to read as
-                        // the primary content. Everything else on the page is
-                        // deliberately quieter so this stays center stage.
-                        HStack(alignment: .top, spacing: 14) {
-                            RoundedRectangle(cornerRadius: 1.5)
-                                .fill(Color.primary.opacity(0.15))
-                                .frame(width: 3)
-
-                            Text(highlight.contentText)
-                                .font(.system(size: 18, design: .serif))
-                                .lineSpacing(4)
-                                .foregroundStyle(.primary.opacity(0.92))
-                                .textSelection(.enabled)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-
-                    notesTimeline
-
-                    // OCR text — collapsed metadata, full-width
-                    if isScreenshot, let screenshotId = highlight.screenshotId,
-                       let screenshot = DatabaseManager.shared.screenshot(byId: screenshotId),
-                       let ocrText = screenshot.ocrText, !ocrText.isEmpty {
-                        OCRTextBlock(text: ocrText)
-                    }
-
-                    // Auxiliary preview for URLs embedded inside text copies.
-                    if !highlight.isURLCopy,
-                       !isFile, !isScreenshot, !isRecording,
-                       let embeddedURL = Self.firstEmbeddedURL(in: highlight.contentText) {
-                        embeddedLinkPreviewSection(url: embeddedURL.absoluteString)
-                    }
-
-                    stackSection
-
-                    sourceSection
+                if isReady {
+                    readyContent
+                } else {
+                    // Blank until loadAllAndCommit finishes. Color.clear has
+                    // no intrinsic height, so the scroll body is empty until
+                    // every section is ready to render together.
+                    Color.clear.frame(height: 1)
                 }
-                .padding(20)
             }
 
             Divider().opacity(0.5)
@@ -146,19 +109,120 @@ struct CardDetailView: View {
         }
         .frame(minWidth: 520, idealWidth: 740, maxWidth: .infinity, minHeight: 420, idealHeight: 720, maxHeight: .infinity)
         .background(arrowNavShortcuts)
-        .task {
-            if isScreenshot && image == nil {
-                let path = highlight.contentText
-                image = await Task.detached {
-                    NSImage(contentsOfFile: path)
-                }.value
-            }
-            loadNotes()
-            reloadStacks()
+        .task(id: highlight.id) {
+            await loadAllAndCommit()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .highlightDidSave).receive(on: DispatchQueue.main)) { _ in
+            loadCaptureEvents()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .highlightDataDidChange).receive(on: DispatchQueue.main)) { _ in
+            loadCaptureEvents()
         }
         .onReceive(NotificationCenter.default.publisher(for: .stackDataDidChange).receive(on: DispatchQueue.main)) { _ in
             reloadStacks()
         }
+    }
+
+    /// Loads image + notes + stacks + capture events in parallel and
+    /// assigns them all in one synchronous block so SwiftUI renders the
+    /// body exactly once with every section populated. Runs on the main
+    /// actor; the image disk read is shunted to a detached task.
+    private func loadAllAndCommit() async {
+        // Kick off image load first (if applicable) in the background so
+        // its latency runs alongside the synchronous DB reads below.
+        let imageTask: Task<NSImage?, Never>? = {
+            guard isScreenshot else { return nil }
+            let path = highlight.contentText
+            return Task.detached { NSImage(contentsOfFile: path) }
+        }()
+
+        let db = DatabaseManager.shared
+        let loadedNotes = db.notesForHighlight(id: highlight.id)
+        let loadedStacks = db.stacksForHighlight(id: highlight.id)
+        let loadedEvents = db.captureEvents(for: highlight)
+        let loadedImage = await imageTask?.value
+
+        // Single batched commit: assigning these in sequence with no
+        // intervening await lets SwiftUI coalesce them into one render.
+        if let loadedImage { image = loadedImage }
+        notes = loadedNotes
+        stacks = loadedStacks
+        captureEvents = loadedEvents
+        isReady = true
+    }
+
+    /// Extracted so the gating `if isReady { ... }` stays readable. This
+    /// is the original scroll body — no behavioral changes.
+    @ViewBuilder
+    private var readyContent: some View {
+        VStack(alignment: .leading, spacing: UITokens.sectionSpacing) {
+            if isScreenshot {
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(maxWidth: .infinity)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .overlay(alignment: .topTrailing) {
+                            if let onImageFullscreen {
+                                ExpandImageButton(isHovered: screenshotHovered) {
+                                    onImageFullscreen(image)
+                                }
+                            }
+                        }
+                        .onHover { screenshotHovered = $0 }
+                        .onTapGesture { onImageFullscreen?(image) }
+                }
+            } else if isRecording {
+                recordingDetailContent
+            } else if isFile {
+                fileDetailContent
+            } else if highlight.isURLCopy {
+                if highlight.fileId != nil {
+                    downloadedFileLinkContent
+                } else {
+                    linkDetailContent
+                }
+            } else {
+                // Copied text — styled as a clipping, sized to read as
+                // the primary content. Everything else on the page is
+                // deliberately quieter so this stays center stage.
+                HStack(alignment: .top, spacing: 14) {
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(Color.primary.opacity(0.15))
+                        .frame(width: 3)
+
+                    Text(highlight.contentText)
+                        .font(.system(size: 18, design: .serif))
+                        .lineSpacing(4)
+                        .foregroundStyle(.primary.opacity(0.92))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+
+            notesTimeline
+
+            if isScreenshot, let screenshotId = highlight.screenshotId,
+               let screenshot = DatabaseManager.shared.screenshot(byId: screenshotId),
+               let ocrText = screenshot.ocrText, !ocrText.isEmpty {
+                OCRTextBlock(text: ocrText)
+            }
+
+            if !highlight.isURLCopy,
+               !isFile, !isScreenshot, !isRecording,
+               let embeddedURL = Self.firstEmbeddedURL(in: highlight.contentText) {
+                embeddedLinkPreviewSection(url: embeddedURL.absoluteString)
+            }
+
+            stackSection
+
+            captureEventsSection
+
+            sourceSection
+        }
+        .padding(20)
     }
 
     /// Invisible keyboard-shortcut buttons for arrow-key gallery
@@ -215,7 +279,7 @@ struct CardDetailView: View {
 
                 Spacer(minLength: 12)
 
-                HStack(spacing: 16) {
+                HStack(spacing: 4) {
                     InstantTooltipButton(icon: "rectangle.stack.badge.plus", label: "Add to stack") {
                         _ = DatabaseManager.shared.addHighlightToPinnedOrNewStack(highlight.id)
                         showConfirmation("Added to stack")
@@ -231,6 +295,11 @@ struct CardDetailView: View {
                     if isFile {
                         InstantTooltipButton(icon: "arrow.up.forward.app", label: "Open file") {
                             openFile(highlight.contentText); showConfirmation("Opened")
+                        }
+                    }
+                    if let onRevealInAll {
+                        InstantTooltipButton(icon: "square.grid.2x2", label: "Show in All") {
+                            onRevealInAll(highlight)
                         }
                     }
                     InstantTooltipButton(icon: "xmark", label: "Close") {
@@ -322,6 +391,38 @@ struct CardDetailView: View {
         DatabaseManager.shared.removeHighlight(highlight.id, fromStack: stack.id)
     }
 
+    // MARK: - Capture Events
+
+    /// Timeline of prior/later captures of the same thing — same file
+    /// bytes (fileId match) or same text/URL (contentHash match). Rendered
+    /// between the stacks list and the source card, and hidden when the
+    /// current highlight is the only event. Each row is tappable (via
+    /// `onJumpTo`) to re-center the archive on that moment.
+    @ViewBuilder
+    private var captureEventsSection: some View {
+        if captureEvents.count >= 2 {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionLabel(text: "Captured \(captureEvents.count) times")
+
+                VStack(spacing: 6) {
+                    ForEach(captureEvents) { event in
+                        CaptureEventRow(
+                            event: event,
+                            isCurrent: event.id == highlight.id,
+                            onJumpTo: event.id == highlight.id ? nil : onJumpTo
+                        )
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func loadCaptureEvents() {
+        let events = DatabaseManager.shared.captureEvents(for: highlight)
+        captureEvents = events
+    }
+
     // MARK: - Source
 
     /// Renders the page this item was captured from, when there's a
@@ -329,10 +430,17 @@ struct CardDetailView: View {
     /// the main content) and for items captured outside the browser.
     @ViewBuilder
     private var sourceSection: some View {
-        let url = highlight.sourceUrl.flatMap { raw -> String? in
-            guard !raw.isEmpty, URL(string: raw) != nil else { return nil }
+        let sanitize: (String?) -> String? = { raw in
+            guard let raw, !raw.isEmpty, URL(string: raw) != nil else { return nil }
             return raw
         }
+        // Fall back to the enricher-recorded page_url when sourceUrl
+        // didn't land (e.g., Chrome AppleScript was slow at capture but
+        // the enricher eventually succeeded and got stored in context).
+        let contextPageUrl = sanitize(
+            highlight.decodedSourceContext.first(where: { $0.key == "page_url" })?.url
+        )
+        let url = sanitize(highlight.sourceUrl) ?? contextPageUrl
         let showURL = url != nil && !highlight.isURLCopy
         let app = highlight.sourceApp
         let showApp = (app?.isEmpty == false)
@@ -907,6 +1015,87 @@ private struct ContextualSourceRow: View {
     private func openURL() {
         guard let urlString = entry.url, let url = URL(string: urlString) else { return }
         NSWorkspace.shared.open(url)
+    }
+}
+
+/// Row in the "Captured N times" section — one per capture event for the
+/// same piece of content. The current event is rendered non-tappable with
+/// a filled dot; siblings act as jump-to-stream handles.
+private struct CaptureEventRow: View {
+    let event: Highlight
+    let isCurrent: Bool
+    let onJumpTo: ((Highlight) -> Void)?
+    @State private var isHovered = false
+
+    private var isTappable: Bool { !isCurrent && onJumpTo != nil }
+
+    var body: some View {
+        Group {
+            if isTappable {
+                Button(action: { onJumpTo?(event) }) {
+                    rowContent
+                }
+                .buttonStyle(.plain)
+                .onHover { isHovered = $0 }
+            } else {
+                rowContent
+            }
+        }
+    }
+
+    private var rowContent: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: isCurrent ? "circle.fill" : "circle")
+                .font(.system(size: 10))
+                .foregroundStyle(isCurrent ? Color.accentColor : .secondary)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(timestampLabel)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 0)
+            if isTappable {
+                Image(systemName: "arrow.up.left.circle")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.secondary.opacity(isCurrent ? 0.12 : (isHovered ? 0.1 : 0.06)))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.secondary.opacity(0.12), lineWidth: 0.5)
+        )
+        .contentShape(Rectangle())
+    }
+
+    private var timestampLabel: String {
+        let base = formattedAbsolute(event.date)
+        if isCurrent { return "\(base) · this one" }
+        return "\(base) · \(CardMetadata.timeAgo(from: event.date))"
+    }
+
+    private var subtitle: String? {
+        if isCurrent { return nil }
+        if let app = event.sourceApp, !app.isEmpty { return app }
+        return nil
+    }
+
+    private func formattedAbsolute(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d · h:mm a"
+        return f.string(from: date)
     }
 }
 

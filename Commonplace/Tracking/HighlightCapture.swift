@@ -203,7 +203,8 @@ final class HighlightCapture {
         fileRecord: FileRecord,
         thumbnailImage: NSImage?,
         tagIds: [String] = [],
-        sourceUrl: String? = nil
+        sourceUrl: String? = nil,
+        sourceContext: String? = nil
     ) {
         let entryId = UUID().uuidString
         let filePath = fileRecord.filePath
@@ -229,7 +230,7 @@ final class HighlightCapture {
             displayResolution: nil,
             appearanceMode: nil,
             wifiNetwork: nil,
-            sourceContext: nil
+            sourceContext: sourceContext
         )
         db.insertHighlight(highlight)
         for tagId in tagIds {

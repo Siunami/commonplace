@@ -548,5 +548,534 @@ struct AppMigrations {
                 t.add(column: "sourceContext", .text)
             }
         }
+
+        migrator.registerMigration("v22_capture_event_links") { db in
+            // Bytes-level dedup key for files: SHA-256 of the file contents,
+            // computed at ingest. Nullable so pre-existing rows simply don't
+            // participate (a backfill can land later). The index enables
+            // fileRecord(byHash:) lookups on a hot path at capture time.
+            try db.alter(table: "file_record") { t in
+                t.add(column: "fileHash", .text)
+            }
+            try db.create(
+                index: "idx_file_record_fileHash",
+                on: "file_record",
+                columns: ["fileHash"],
+                ifNotExists: true
+            )
+
+            // Sibling resolution in CardDetailView's "Captured N times"
+            // section groups non-file highlights by contentHash. Without an
+            // index, each detail-view open triggers a full table scan on a
+            // growing archive.
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_highlight_contentHash
+                ON highlight(contentHash)
+                """)
+        }
+
+        migrator.registerMigration("v23_stack_stack") { db in
+            // Nesting: a stack may contain other stacks. Kept separate from
+            // `highlight_stack` so queries against either junction stay simple
+            // and each has its own `position` column — StackDetailView renders
+            // substacks and highlights in two independent sections. No cycle
+            // check; traversals (export, counts) carry a visited set instead.
+            try db.create(table: "stack_stack", ifNotExists: true) { t in
+                t.column("parentStackId", .text).notNull()
+                    .references("stack", onDelete: .cascade)
+                t.column("childStackId", .text).notNull()
+                    .references("stack", onDelete: .cascade)
+                t.column("addedAt", .double).notNull()
+                t.column("position", .integer).notNull().defaults(to: 0)
+                t.primaryKey(["parentStackId", "childStackId"])
+            }
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_stack_stack_parent_position
+                ON stack_stack(parentStackId, position)
+                """)
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_stack_stack_child
+                ON stack_stack(childStackId)
+                """)
+        }
+
+        // FTS5 full-text search. Pre-FTS, search was a 7-column LIKE
+        // `%query%` with 4 EXISTS subqueries — a full table scan per
+        // keystroke that fell over at archive sizes of more than a few
+        // thousand rows. This migration replaces that with an FTS5
+        // virtual table indexed on a denormalized `highlight_search`
+        // mirror (contentText + userNote + sourceApp + sourceUrl +
+        // windowTitle + documentPath + bundleId + ocrText + aggregated
+        // note bodies + filename).
+        //
+        // Triggers keep the mirror in sync with every source table so
+        // the app code doesn't need to manage it. The FTS5 side uses
+        // `content='highlight_search'` + `content_rowid='id'` —
+        // external-content form — so the index is built from the
+        // mirror automatically.
+        migrator.registerMigration("v24_search_fts") { db in
+            // Denormalized mirror, one row per highlight, holding the
+            // concatenated searchable text. `id INTEGER PRIMARY KEY
+            // AUTOINCREMENT` gives us the integer rowid FTS5 needs —
+            // since `highlight.id` is TEXT we can't use it directly.
+            try db.execute(sql: """
+                CREATE TABLE highlight_search (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    highlightId TEXT UNIQUE NOT NULL,
+                    searchText TEXT NOT NULL DEFAULT ''
+                )
+                """)
+            try db.execute(sql: """
+                CREATE INDEX idx_highlight_search_highlightId
+                ON highlight_search(highlightId)
+                """)
+
+            // FTS5 virtual table. `unicode61 remove_diacritics 2`:
+            // case-insensitive by default, folds accents so "cafe"
+            // matches "café". `content='highlight_search'` +
+            // `content_rowid='id'` means the FTS index mirrors the
+            // mirror — `snippet()` and column retrieval work out of
+            // the box, and we don't pay double storage.
+            try db.execute(sql: """
+                CREATE VIRTUAL TABLE highlight_search_fts USING fts5(
+                    searchText,
+                    content='highlight_search',
+                    content_rowid='id',
+                    tokenize='unicode61 remove_diacritics 2'
+                )
+                """)
+
+            // Keep the FTS index in lockstep with `highlight_search`
+            // inserts / updates / deletes. The `delete` command with
+            // the old rowid is the canonical way to remove an entry
+            // from an external-content FTS5 table.
+            try db.execute(sql: """
+                CREATE TRIGGER highlight_search_fts_ai AFTER INSERT ON highlight_search BEGIN
+                    INSERT INTO highlight_search_fts(rowid, searchText)
+                    VALUES (new.id, new.searchText);
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER highlight_search_fts_ad AFTER DELETE ON highlight_search BEGIN
+                    INSERT INTO highlight_search_fts(highlight_search_fts, rowid, searchText)
+                    VALUES ('delete', old.id, old.searchText);
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER highlight_search_fts_au AFTER UPDATE ON highlight_search BEGIN
+                    INSERT INTO highlight_search_fts(highlight_search_fts, rowid, searchText)
+                    VALUES ('delete', old.id, old.searchText);
+                    INSERT INTO highlight_search_fts(rowid, searchText)
+                    VALUES (new.id, new.searchText);
+                END
+                """)
+
+            // Population triggers — when a highlight or any of its
+            // related tables change, rewrite the highlight_search row
+            // for that highlight id. The concat expression is verbose
+            // but SQLite can't parameterize it via a view; inlined in
+            // each trigger.
+            //
+            // Helper SQL fragment (duplicated below for each trigger):
+            //   searchText for `h`:
+            //   contentText || userNote || sourceApp || sourceUrl ||
+            //   windowTitle || documentPath || bundleId ||
+            //   screenshot.ocrText (where id = h.screenshotId) ||
+            //   GROUP_CONCAT(highlight_note.body where highlightId = h.id) ||
+            //   file_record.fileName (where id = h.fileId)
+
+            // Highlight INSERT: insert a fresh mirror row.
+            try db.execute(sql: """
+                CREATE TRIGGER highlight_search_ai AFTER INSERT ON highlight BEGIN
+                    INSERT INTO highlight_search (highlightId, searchText)
+                    VALUES (
+                        new.id,
+                        COALESCE(new.contentText, '') || ' ' ||
+                        COALESCE(new.userNote, '') || ' ' ||
+                        COALESCE(new.sourceApp, '') || ' ' ||
+                        COALESCE(new.sourceUrl, '') || ' ' ||
+                        COALESCE(new.windowTitle, '') || ' ' ||
+                        COALESCE(new.documentPath, '') || ' ' ||
+                        COALESCE(new.bundleId, '') || ' ' ||
+                        COALESCE((SELECT ocrText FROM screenshot WHERE id = new.screenshotId), '') || ' ' ||
+                        COALESCE((SELECT GROUP_CONCAT(body, ' ') FROM highlight_note WHERE highlightId = new.id), '') || ' ' ||
+                        COALESCE((SELECT fileName FROM file_record WHERE id = new.fileId), '')
+                    );
+                END
+                """)
+
+            // Highlight UPDATE: rebuild the searchText for this row.
+            try db.execute(sql: """
+                CREATE TRIGGER highlight_search_au AFTER UPDATE ON highlight BEGIN
+                    UPDATE highlight_search SET searchText =
+                        COALESCE(new.contentText, '') || ' ' ||
+                        COALESCE(new.userNote, '') || ' ' ||
+                        COALESCE(new.sourceApp, '') || ' ' ||
+                        COALESCE(new.sourceUrl, '') || ' ' ||
+                        COALESCE(new.windowTitle, '') || ' ' ||
+                        COALESCE(new.documentPath, '') || ' ' ||
+                        COALESCE(new.bundleId, '') || ' ' ||
+                        COALESCE((SELECT ocrText FROM screenshot WHERE id = new.screenshotId), '') || ' ' ||
+                        COALESCE((SELECT GROUP_CONCAT(body, ' ') FROM highlight_note WHERE highlightId = new.id), '') || ' ' ||
+                        COALESCE((SELECT fileName FROM file_record WHERE id = new.fileId), '')
+                    WHERE highlightId = new.id;
+                END
+                """)
+
+            // Highlight DELETE: drop the mirror row (FTS5 delete fires
+            // via the highlight_search_fts_ad trigger).
+            try db.execute(sql: """
+                CREATE TRIGGER highlight_search_ad AFTER DELETE ON highlight BEGIN
+                    DELETE FROM highlight_search WHERE highlightId = old.id;
+                END
+                """)
+
+            // highlight_note changes → refresh the parent's searchText.
+            // Uses the same big concat, re-pulling from highlight for
+            // the base columns since we only have note data in `new`.
+            try db.execute(sql: """
+                CREATE TRIGGER highlight_note_search_ai AFTER INSERT ON highlight_note BEGIN
+                    UPDATE highlight_search SET searchText = (
+                        SELECT
+                            COALESCE(h.contentText, '') || ' ' ||
+                            COALESCE(h.userNote, '') || ' ' ||
+                            COALESCE(h.sourceApp, '') || ' ' ||
+                            COALESCE(h.sourceUrl, '') || ' ' ||
+                            COALESCE(h.windowTitle, '') || ' ' ||
+                            COALESCE(h.documentPath, '') || ' ' ||
+                            COALESCE(h.bundleId, '') || ' ' ||
+                            COALESCE((SELECT ocrText FROM screenshot WHERE id = h.screenshotId), '') || ' ' ||
+                            COALESCE((SELECT GROUP_CONCAT(body, ' ') FROM highlight_note WHERE highlightId = h.id), '') || ' ' ||
+                            COALESCE((SELECT fileName FROM file_record WHERE id = h.fileId), '')
+                        FROM highlight h WHERE h.id = new.highlightId
+                    ) WHERE highlightId = new.highlightId;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER highlight_note_search_au AFTER UPDATE ON highlight_note BEGIN
+                    UPDATE highlight_search SET searchText = (
+                        SELECT
+                            COALESCE(h.contentText, '') || ' ' ||
+                            COALESCE(h.userNote, '') || ' ' ||
+                            COALESCE(h.sourceApp, '') || ' ' ||
+                            COALESCE(h.sourceUrl, '') || ' ' ||
+                            COALESCE(h.windowTitle, '') || ' ' ||
+                            COALESCE(h.documentPath, '') || ' ' ||
+                            COALESCE(h.bundleId, '') || ' ' ||
+                            COALESCE((SELECT ocrText FROM screenshot WHERE id = h.screenshotId), '') || ' ' ||
+                            COALESCE((SELECT GROUP_CONCAT(body, ' ') FROM highlight_note WHERE highlightId = h.id), '') || ' ' ||
+                            COALESCE((SELECT fileName FROM file_record WHERE id = h.fileId), '')
+                        FROM highlight h WHERE h.id = new.highlightId
+                    ) WHERE highlightId = new.highlightId;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER highlight_note_search_ad AFTER DELETE ON highlight_note BEGIN
+                    UPDATE highlight_search SET searchText = (
+                        SELECT
+                            COALESCE(h.contentText, '') || ' ' ||
+                            COALESCE(h.userNote, '') || ' ' ||
+                            COALESCE(h.sourceApp, '') || ' ' ||
+                            COALESCE(h.sourceUrl, '') || ' ' ||
+                            COALESCE(h.windowTitle, '') || ' ' ||
+                            COALESCE(h.documentPath, '') || ' ' ||
+                            COALESCE(h.bundleId, '') || ' ' ||
+                            COALESCE((SELECT ocrText FROM screenshot WHERE id = h.screenshotId), '') || ' ' ||
+                            COALESCE((SELECT GROUP_CONCAT(body, ' ') FROM highlight_note WHERE highlightId = h.id), '') || ' ' ||
+                            COALESCE((SELECT fileName FROM file_record WHERE id = h.fileId), '')
+                        FROM highlight h WHERE h.id = old.highlightId
+                    ) WHERE highlightId = old.highlightId;
+                END
+                """)
+
+            // Screenshot.ocrText updates (async OCR completion after
+            // the highlight already exists): refresh every highlight
+            // that points at this screenshot.
+            try db.execute(sql: """
+                CREATE TRIGGER screenshot_ocr_search_au AFTER UPDATE OF ocrText ON screenshot BEGIN
+                    UPDATE highlight_search SET searchText = (
+                        SELECT
+                            COALESCE(h.contentText, '') || ' ' ||
+                            COALESCE(h.userNote, '') || ' ' ||
+                            COALESCE(h.sourceApp, '') || ' ' ||
+                            COALESCE(h.sourceUrl, '') || ' ' ||
+                            COALESCE(h.windowTitle, '') || ' ' ||
+                            COALESCE(h.documentPath, '') || ' ' ||
+                            COALESCE(h.bundleId, '') || ' ' ||
+                            COALESCE(new.ocrText, '') || ' ' ||
+                            COALESCE((SELECT GROUP_CONCAT(body, ' ') FROM highlight_note WHERE highlightId = h.id), '') || ' ' ||
+                            COALESCE((SELECT fileName FROM file_record WHERE id = h.fileId), '')
+                        FROM highlight h WHERE h.id = highlight_search.highlightId
+                    )
+                    WHERE highlightId IN (SELECT id FROM highlight WHERE screenshotId = new.id);
+                END
+                """)
+
+            // file_record.fileName updates (rare but possible on
+            // rename): refresh the owning highlight's searchText.
+            try db.execute(sql: """
+                CREATE TRIGGER file_record_name_search_au AFTER UPDATE OF fileName ON file_record BEGIN
+                    UPDATE highlight_search SET searchText = (
+                        SELECT
+                            COALESCE(h.contentText, '') || ' ' ||
+                            COALESCE(h.userNote, '') || ' ' ||
+                            COALESCE(h.sourceApp, '') || ' ' ||
+                            COALESCE(h.sourceUrl, '') || ' ' ||
+                            COALESCE(h.windowTitle, '') || ' ' ||
+                            COALESCE(h.documentPath, '') || ' ' ||
+                            COALESCE(h.bundleId, '') || ' ' ||
+                            COALESCE((SELECT ocrText FROM screenshot WHERE id = h.screenshotId), '') || ' ' ||
+                            COALESCE((SELECT GROUP_CONCAT(body, ' ') FROM highlight_note WHERE highlightId = h.id), '') || ' ' ||
+                            COALESCE(new.fileName, '')
+                        FROM highlight h WHERE h.id = highlight_search.highlightId
+                    )
+                    WHERE highlightId IN (SELECT id FROM highlight WHERE fileId = new.id);
+                END
+                """)
+
+            // Backfill: one INSERT per existing highlight builds its
+            // initial mirror row, and the `_ai` trigger on
+            // highlight_search cascades into the FTS index. Runs once
+            // at migration time.
+            let backfillStart = Date()
+            try db.execute(sql: """
+                INSERT INTO highlight_search (highlightId, searchText)
+                SELECT h.id,
+                    COALESCE(h.contentText, '') || ' ' ||
+                    COALESCE(h.userNote, '') || ' ' ||
+                    COALESCE(h.sourceApp, '') || ' ' ||
+                    COALESCE(h.sourceUrl, '') || ' ' ||
+                    COALESCE(h.windowTitle, '') || ' ' ||
+                    COALESCE(h.documentPath, '') || ' ' ||
+                    COALESCE(h.bundleId, '') || ' ' ||
+                    COALESCE((SELECT ocrText FROM screenshot WHERE id = h.screenshotId), '') || ' ' ||
+                    COALESCE((SELECT GROUP_CONCAT(body, ' ') FROM highlight_note WHERE highlightId = h.id), '') || ' ' ||
+                    COALESCE((SELECT fileName FROM file_record WHERE id = h.fileId), '')
+                FROM highlight h
+                """)
+            let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM highlight_search") ?? 0
+            let elapsed = Int(Date().timeIntervalSince(backfillStart) * 1000)
+            CaptureLog.info("[migration v24] FTS5 backfill: \(count) highlights indexed in \(elapsed)ms")
+        }
+
+        // Per-column FTS5 — split the v24 monolithic `searchText`
+        // into four columns so search results can show WHICH field
+        // matched (badge + snippet). Enables FTS5's `snippet()` to
+        // return a context window pointing at the match instead of
+        // the whole haystack, which the sidebar UI uses to render
+        // tight, interpretable results.
+        migrator.registerMigration("v25_search_fts_split") { db in
+            // Start fresh — v24 triggers + table go away and the
+            // four-column form takes over. Order matters: drop FTS
+            // first so its sync triggers are removed, then the mirror
+            // + its triggers.
+            try db.execute(sql: "DROP TABLE IF EXISTS highlight_search_fts")
+            try db.execute(sql: "DROP TRIGGER IF EXISTS highlight_search_fts_ai")
+            try db.execute(sql: "DROP TRIGGER IF EXISTS highlight_search_fts_ad")
+            try db.execute(sql: "DROP TRIGGER IF EXISTS highlight_search_fts_au")
+            try db.execute(sql: "DROP TRIGGER IF EXISTS highlight_search_ai")
+            try db.execute(sql: "DROP TRIGGER IF EXISTS highlight_search_au")
+            try db.execute(sql: "DROP TRIGGER IF EXISTS highlight_search_ad")
+            try db.execute(sql: "DROP TRIGGER IF EXISTS highlight_note_search_ai")
+            try db.execute(sql: "DROP TRIGGER IF EXISTS highlight_note_search_au")
+            try db.execute(sql: "DROP TRIGGER IF EXISTS highlight_note_search_ad")
+            try db.execute(sql: "DROP TRIGGER IF EXISTS screenshot_ocr_search_au")
+            try db.execute(sql: "DROP TRIGGER IF EXISTS file_record_name_search_au")
+            try db.execute(sql: "DROP TABLE IF EXISTS highlight_search")
+
+            // New mirror: four text columns + id mapping. `id INTEGER
+            // PRIMARY KEY AUTOINCREMENT` is the rowid FTS5 uses
+            // (matching `content_rowid='id'` below).
+            try db.execute(sql: """
+                CREATE TABLE highlight_search (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    highlightId TEXT UNIQUE NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    annotation TEXT NOT NULL DEFAULT '',
+                    ocr_text TEXT NOT NULL DEFAULT '',
+                    metadata TEXT NOT NULL DEFAULT ''
+                )
+                """)
+            try db.execute(sql: """
+                CREATE INDEX idx_highlight_search_highlightId
+                ON highlight_search(highlightId)
+                """)
+
+            // Per-column FTS5 virtual table. Query with MATCH returns
+            // every row hit; `snippet(<tbl>, <col>, ..., 12)` can
+            // target any column to pull a ~12-token window around
+            // the match. BM25 ranks relevance.
+            try db.execute(sql: """
+                CREATE VIRTUAL TABLE highlight_search_fts USING fts5(
+                    title,
+                    annotation,
+                    ocr_text,
+                    metadata,
+                    content='highlight_search',
+                    content_rowid='id',
+                    tokenize='unicode61 remove_diacritics 2'
+                )
+                """)
+
+            // FTS5 sync triggers — mirror `highlight_search` changes
+            // into the index. Canonical external-content form.
+            try db.execute(sql: """
+                CREATE TRIGGER highlight_search_fts_ai AFTER INSERT ON highlight_search BEGIN
+                    INSERT INTO highlight_search_fts(rowid, title, annotation, ocr_text, metadata)
+                    VALUES (new.id, new.title, new.annotation, new.ocr_text, new.metadata);
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER highlight_search_fts_ad AFTER DELETE ON highlight_search BEGIN
+                    INSERT INTO highlight_search_fts(highlight_search_fts, rowid, title, annotation, ocr_text, metadata)
+                    VALUES ('delete', old.id, old.title, old.annotation, old.ocr_text, old.metadata);
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER highlight_search_fts_au AFTER UPDATE ON highlight_search BEGIN
+                    INSERT INTO highlight_search_fts(highlight_search_fts, rowid, title, annotation, ocr_text, metadata)
+                    VALUES ('delete', old.id, old.title, old.annotation, old.ocr_text, old.metadata);
+                    INSERT INTO highlight_search_fts(rowid, title, annotation, ocr_text, metadata)
+                    VALUES (new.id, new.title, new.annotation, new.ocr_text, new.metadata);
+                END
+                """)
+
+            // Population triggers — each source table mutation writes
+            // into the corresponding column(s) of `highlight_search`.
+            //
+            // title: contentText for text-type rows, filename for
+            //        file-type rows (file_record.fileName).
+            // annotation: userNote + all highlight_note bodies.
+            // ocr_text: screenshot.ocrText.
+            // metadata: sourceApp, sourceUrl, windowTitle concat.
+
+            try db.execute(sql: """
+                CREATE TRIGGER highlight_search_ai AFTER INSERT ON highlight BEGIN
+                    INSERT INTO highlight_search (highlightId, title, annotation, ocr_text, metadata)
+                    VALUES (
+                        new.id,
+                        CASE
+                            WHEN new.highlightType = 'file' THEN
+                                COALESCE((SELECT fileName FROM file_record WHERE id = new.fileId), '')
+                            ELSE COALESCE(new.contentText, '')
+                        END,
+                        COALESCE(new.userNote, '') || ' ' ||
+                        COALESCE((SELECT GROUP_CONCAT(body, ' ') FROM highlight_note WHERE highlightId = new.id), ''),
+                        COALESCE((SELECT ocrText FROM screenshot WHERE id = new.screenshotId), ''),
+                        COALESCE(new.sourceApp, '') || ' ' ||
+                        COALESCE(new.sourceUrl, '') || ' ' ||
+                        COALESCE(new.windowTitle, '') || ' ' ||
+                        COALESCE(new.documentPath, '') || ' ' ||
+                        COALESCE(new.bundleId, '')
+                    );
+                END
+                """)
+
+            try db.execute(sql: """
+                CREATE TRIGGER highlight_search_au AFTER UPDATE ON highlight BEGIN
+                    UPDATE highlight_search SET
+                        title = CASE
+                            WHEN new.highlightType = 'file' THEN
+                                COALESCE((SELECT fileName FROM file_record WHERE id = new.fileId), '')
+                            ELSE COALESCE(new.contentText, '')
+                        END,
+                        annotation = COALESCE(new.userNote, '') || ' ' ||
+                            COALESCE((SELECT GROUP_CONCAT(body, ' ') FROM highlight_note WHERE highlightId = new.id), ''),
+                        ocr_text = COALESCE((SELECT ocrText FROM screenshot WHERE id = new.screenshotId), ''),
+                        metadata = COALESCE(new.sourceApp, '') || ' ' ||
+                            COALESCE(new.sourceUrl, '') || ' ' ||
+                            COALESCE(new.windowTitle, '') || ' ' ||
+                            COALESCE(new.documentPath, '') || ' ' ||
+                            COALESCE(new.bundleId, '')
+                    WHERE highlightId = new.id;
+                END
+                """)
+
+            try db.execute(sql: """
+                CREATE TRIGGER highlight_search_ad AFTER DELETE ON highlight BEGIN
+                    DELETE FROM highlight_search WHERE highlightId = old.id;
+                END
+                """)
+
+            // Note changes → refresh only the annotation column on
+            // the parent highlight_search row.
+            try db.execute(sql: """
+                CREATE TRIGGER highlight_note_search_ai AFTER INSERT ON highlight_note BEGIN
+                    UPDATE highlight_search SET annotation = (
+                        SELECT COALESCE(h.userNote, '') || ' ' ||
+                               COALESCE((SELECT GROUP_CONCAT(body, ' ') FROM highlight_note WHERE highlightId = h.id), '')
+                        FROM highlight h WHERE h.id = new.highlightId
+                    )
+                    WHERE highlightId = new.highlightId;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER highlight_note_search_au AFTER UPDATE ON highlight_note BEGIN
+                    UPDATE highlight_search SET annotation = (
+                        SELECT COALESCE(h.userNote, '') || ' ' ||
+                               COALESCE((SELECT GROUP_CONCAT(body, ' ') FROM highlight_note WHERE highlightId = h.id), '')
+                        FROM highlight h WHERE h.id = new.highlightId
+                    )
+                    WHERE highlightId = new.highlightId;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER highlight_note_search_ad AFTER DELETE ON highlight_note BEGIN
+                    UPDATE highlight_search SET annotation = (
+                        SELECT COALESCE(h.userNote, '') || ' ' ||
+                               COALESCE((SELECT GROUP_CONCAT(body, ' ') FROM highlight_note WHERE highlightId = h.id), '')
+                        FROM highlight h WHERE h.id = old.highlightId
+                    )
+                    WHERE highlightId = old.highlightId;
+                END
+                """)
+
+            // OCR landing after highlight creation — refresh only
+            // the ocr_text column for every highlight pointing at
+            // this screenshot.
+            try db.execute(sql: """
+                CREATE TRIGGER screenshot_ocr_search_au AFTER UPDATE OF ocrText ON screenshot BEGIN
+                    UPDATE highlight_search SET ocr_text = COALESCE(new.ocrText, '')
+                    WHERE highlightId IN (SELECT id FROM highlight WHERE screenshotId = new.id);
+                END
+                """)
+
+            // File rename — refresh only the title column for file
+            // highlights pointing at this file_record.
+            try db.execute(sql: """
+                CREATE TRIGGER file_record_name_search_au AFTER UPDATE OF fileName ON file_record BEGIN
+                    UPDATE highlight_search SET title = COALESCE(new.fileName, '')
+                    WHERE highlightId IN (
+                        SELECT id FROM highlight
+                        WHERE fileId = new.id AND highlightType = 'file'
+                    );
+                END
+                """)
+
+            // Backfill from the existing `highlight` table. Runs the
+            // same assembly as the insert trigger, once per row.
+            let backfillStart = Date()
+            try db.execute(sql: """
+                INSERT INTO highlight_search (highlightId, title, annotation, ocr_text, metadata)
+                SELECT h.id,
+                    CASE
+                        WHEN h.highlightType = 'file' THEN
+                            COALESCE((SELECT fileName FROM file_record WHERE id = h.fileId), '')
+                        ELSE COALESCE(h.contentText, '')
+                    END,
+                    COALESCE(h.userNote, '') || ' ' ||
+                        COALESCE((SELECT GROUP_CONCAT(body, ' ') FROM highlight_note WHERE highlightId = h.id), ''),
+                    COALESCE((SELECT ocrText FROM screenshot WHERE id = h.screenshotId), ''),
+                    COALESCE(h.sourceApp, '') || ' ' ||
+                        COALESCE(h.sourceUrl, '') || ' ' ||
+                        COALESCE(h.windowTitle, '') || ' ' ||
+                        COALESCE(h.documentPath, '') || ' ' ||
+                        COALESCE(h.bundleId, '')
+                FROM highlight h
+                """)
+            let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM highlight_search") ?? 0
+            let elapsed = Int(Date().timeIntervalSince(backfillStart) * 1000)
+            CaptureLog.info("[migration v25] FTS5 per-column backfill: \(count) highlights indexed in \(elapsed)ms")
+        }
     }
 }

@@ -61,6 +61,11 @@ final class BrowseWindowController: NSObject, NSWindowDelegate, ManagedWindowCon
             w.minSize = NSSize(width: 400, height: 300)
             w.isMovableByWindowBackground = false
             w.delegate = self
+            // Standard macOS title bar with traffic lights in their own
+            // row. Tabs render in a SwiftUI row directly below it (see
+            // WorkspaceView), starting flush at x=0 — no inset needed
+            // because traffic lights are above the tab row, not beside it.
+            w.titleVisibility = .hidden
             w.collectionBehavior = [.moveToActiveSpace]
             let hc = NSHostingController(rootView: BrowseView())
             hc.sizingOptions = []
@@ -81,6 +86,11 @@ final class BrowseWindowController: NSObject, NSWindowDelegate, ManagedWindowCon
 
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        // Become a regular app while Browse is visible — unlocks the
+        // macOS menu bar so SwiftUI Commands (⌘T / ⌘W / tab switching)
+        // can render and fire. Reverted in `dismiss()` so the app
+        // returns to its status-bar-extra character when hidden.
+        NSApp.setActivationPolicy(.regular)
 
         // Tell BrowseView to refresh its data
         NotificationCenter.default.post(name: Self.windowDidShowNotification, object: nil)
@@ -111,6 +121,11 @@ final class BrowseWindowController: NSObject, NSWindowDelegate, ManagedWindowCon
     }
 
     func dismiss() {
+        // Drop back to accessory mode (no Dock icon, no menu bar)
+        // before hiding so the transition is clean — the menu bar
+        // vanishes along with the window instead of lingering for a
+        // frame.
+        NSApp.setActivationPolicy(.accessory)
         // Hide — don't close. Window and SwiftUI hierarchy stay alive.
         window?.orderOut(nil)
     }

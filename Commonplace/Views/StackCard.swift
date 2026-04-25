@@ -13,11 +13,28 @@ struct StackCard: View {
     var isPinned: Bool = false
     var onTap: (() -> Void)? = nil
 
-    @State private var items: [Highlight] = []
+    @State private var slots: [MosaicSlot] = []
     @State private var totalCount: Int = 0
+    @State private var substackCount: Int = 0
 
     private let db = DatabaseManager.shared
     private let cellSize: CGFloat = 58
+
+    /// Mosaic positions can hold either a highlight or a substack. The
+    /// mosaic renders both as full-fidelity previews so a stack tile
+    /// truthfully reflects "what's inside" even when some of the recent
+    /// children are themselves stacks.
+    enum MosaicSlot: Identifiable {
+        case highlight(Highlight)
+        case substack(Stack)
+
+        var id: String {
+            switch self {
+            case .highlight(let h): return "h-\(h.id)"
+            case .substack(let s): return "s-\(s.id)"
+            }
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -61,10 +78,20 @@ struct StackCard: View {
                 .lineLimit(2)
                 .truncationMode(.tail)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("\(totalCount) item\(totalCount == 1 ? "" : "s")")
+            Text(countsSummary)
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
         }
+    }
+
+    /// Shows substack count alongside item count when a stack has any
+    /// substacks, so a nested container reads as "3 stacks · 8 items"
+    /// rather than hiding the tree depth behind a single number.
+    private var countsSummary: String {
+        if substackCount > 0 {
+            return "\(substackCount) stack\(substackCount == 1 ? "" : "s") · \(totalCount) item\(totalCount == 1 ? "" : "s")"
+        }
+        return "\(totalCount) item\(totalCount == 1 ? "" : "s")"
     }
 
     // MARK: - Mosaic
@@ -72,7 +99,7 @@ struct StackCard: View {
     @ViewBuilder
     private var mosaic: some View {
         Group {
-            if items.isEmpty {
+            if slots.isEmpty {
                 emptyStackPlaceholder
             } else {
                 adaptiveGrid
@@ -83,47 +110,50 @@ struct StackCard: View {
     }
 
     /// Mosaic fills left-to-right in rows of three: 1→2→3 across row 1,
-    /// then 4→5→6 across row 2. 1–3 items render as a single row sized
-    /// to the count; 4–6 items always produce a 2-row, 3-column grid
+    /// then 4→5→6 across row 2. 1–3 slots render as a single row sized
+    /// to the count; 4–6 slots always produce a 2-row, 3-column grid
     /// with invisible slots in unfilled positions.
     @ViewBuilder
     private var adaptiveGrid: some View {
-        switch items.count {
+        switch slots.count {
         case 1:
-            cell(for: items[0])
+            cell(for: slots[0])
         case 2:
             HStack(spacing: mosaicSpacing) {
-                cell(for: items[0])
-                cell(for: items[1])
+                cell(for: slots[0])
+                cell(for: slots[1])
             }
         case 3:
             HStack(spacing: mosaicSpacing) {
-                cell(for: items[0])
-                cell(for: items[1])
-                cell(for: items[2])
+                cell(for: slots[0])
+                cell(for: slots[1])
+                cell(for: slots[2])
             }
         default:
             VStack(spacing: mosaicSpacing) {
                 HStack(spacing: mosaicSpacing) {
-                    cell(for: items[safe: 0])
-                    cell(for: items[safe: 1])
-                    cell(for: items[safe: 2])
+                    cell(for: slots[safe: 0])
+                    cell(for: slots[safe: 1])
+                    cell(for: slots[safe: 2])
                 }
                 HStack(spacing: mosaicSpacing) {
-                    cell(for: items[safe: 3])
-                    cell(for: items[safe: 4])
-                    cell(for: items[safe: 5])
+                    cell(for: slots[safe: 3])
+                    cell(for: slots[safe: 4])
+                    cell(for: slots[safe: 5])
                 }
             }
         }
     }
 
     @ViewBuilder
-    private func cell(for highlight: Highlight?) -> some View {
+    private func cell(for slot: MosaicSlot?) -> some View {
         Group {
-            if let h = highlight {
+            switch slot {
+            case .highlight(let h):
                 StackItemPreview(highlight: h)
-            } else {
+            case .substack(let child):
+                SubstackMosaicSlot(child: child)
+            case nil:
                 Color.clear
             }
         }
@@ -131,7 +161,7 @@ struct StackCard: View {
         .clipShape(RoundedRectangle(cornerRadius: 4))
         .overlay(
             Group {
-                if highlight != nil {
+                if slot != nil {
                     RoundedRectangle(cornerRadius: 4)
                         .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
                 }
@@ -161,8 +191,18 @@ struct StackCard: View {
     // MARK: - Data
 
     private func reload() {
-        items = db.recentHighlightsForStack(stackId: stack.id, limit: 6)
+        // Substacks land in the mosaic first so the tile communicates the
+        // tree structure — a stack with 2 substacks and 10 items reads as
+        // "those 2 substacks + 4 recent items," not "10 random items."
+        let substacks = db.recentSubstacksForStack(stackId: stack.id, limit: 6)
+        let remaining = max(0, 6 - substacks.count)
+        let highlights = remaining > 0
+            ? db.recentHighlightsForStack(stackId: stack.id, limit: remaining)
+            : []
+        slots = substacks.map(MosaicSlot.substack)
+            + highlights.map(MosaicSlot.highlight)
         totalCount = db.itemCountForStack(stackId: stack.id)
+        substackCount = db.substackCountForStack(stackId: stack.id)
     }
 }
 
@@ -249,6 +289,39 @@ struct StackPinBadge: View {
 // Each branch mirrors the corresponding archive card so the stack tile
 // clearly shows the items that were added. Link highlights surface the
 // hero image + favicon + host so they're recognizable at mosaic scale.
+
+/// Visually distinct slot used when one of a stack's recent children is
+/// itself a substack. Fills with a faint accent so it reads as
+/// "this is a stack inside another stack" at mosaic scale — differentiated
+/// from highlights without requiring a recursive mini-mosaic (which would
+/// be unreadable at 58pt).
+private struct SubstackMosaicSlot: View {
+    let child: Stack
+
+    var body: some View {
+        ZStack {
+            Color.accentColor.opacity(0.14)
+            VStack(spacing: 3) {
+                Image(systemName: "rectangle.stack.fill")
+                    .font(.system(size: 16, weight: .regular))
+                    .foregroundStyle(Color.accentColor.opacity(0.75))
+                if let name = displayName {
+                    Text(name)
+                        .font(.system(size: 8, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .padding(.horizontal, 3)
+                }
+            }
+        }
+    }
+
+    private var displayName: String? {
+        guard child.isNamed, let name = child.name else { return nil }
+        return name
+    }
+}
 
 private struct StackItemPreview: View {
     let highlight: Highlight

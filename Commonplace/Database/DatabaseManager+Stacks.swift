@@ -23,9 +23,12 @@ extension DatabaseManager {
     }
 
     /// All stacks ordered with the pinned stack first, then by most-recent
-    /// activity (updatedAt desc). Prunes zero-item stacks before returning.
+    /// activity (updatedAt desc). Does not auto-prune on read — the "+ New
+    /// stack" affordance creates a fresh unnamed empty stack and would
+    /// race against an eager sweep before the user had a chance to name
+    /// it. Emptied-out stacks are already deleted inline from `removeHighlight`
+    /// and `moveHighlightsToNewStack`, so the eager sweep isn't needed here.
     func allStacks() -> [Stack] {
-        pruneEmptyStacks()
         return (try? dbQueue?.read { db in
             try Stack.fetchAll(db, sql: """
                 SELECT * FROM stack
@@ -34,15 +37,19 @@ extension DatabaseManager {
         }) ?? []
     }
 
-    /// Removes any stack that currently has zero items. Called from
-    /// `allStacks()` and after item-removal so empties never linger.
+    /// Removes unnamed stacks that currently have zero highlights AND zero
+    /// substacks. Named stacks are *index-card placeholders* the user created
+    /// intentionally — they survive going empty so the "outline first, fill
+    /// later" workflow works. A stack with only substacks (no highlights) is
+    /// also non-empty and is preserved.
     func pruneEmptyStacks() {
         guard let dbQueue else { return }
         let deletedIds: [String] = (try? dbQueue.write { db in
             let ids = try String.fetchAll(db, sql: """
                 SELECT s.id FROM stack s
-                LEFT JOIN highlight_stack hs ON hs.stackId = s.id
-                WHERE hs.stackId IS NULL
+                WHERE (s.name IS NULL OR TRIM(s.name) = '')
+                  AND NOT EXISTS (SELECT 1 FROM highlight_stack hs WHERE hs.stackId = s.id)
+                  AND NOT EXISTS (SELECT 1 FROM stack_stack ss WHERE ss.parentStackId = s.id)
                 """)
             if !ids.isEmpty {
                 try db.execute(
@@ -288,10 +295,21 @@ extension DatabaseManager {
                     sql: "DELETE FROM highlight_stack WHERE stackId = ? AND highlightId = ?",
                     arguments: [stackId, highlightId]
                 )
-                let remaining = try Int.fetchOne(db,
+                let remainingHighlights = try Int.fetchOne(db,
                     sql: "SELECT COUNT(*) FROM highlight_stack WHERE stackId = ?",
                     arguments: [stackId]) ?? 0
-                if remaining == 0 {
+                let remainingSubstacks = try Int.fetchOne(db,
+                    sql: "SELECT COUNT(*) FROM stack_stack WHERE parentStackId = ?",
+                    arguments: [stackId]) ?? 0
+                // Named stacks (user-created placeholders) survive going empty.
+                // Unnamed "scratch" stacks auto-delete only when they have
+                // zero highlights AND zero substacks.
+                let name = try String.fetchOne(db,
+                    sql: "SELECT name FROM stack WHERE id = ?",
+                    arguments: [stackId])
+                let isNamed = !(name?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+                let isEmpty = remainingHighlights == 0 && remainingSubstacks == 0
+                if isEmpty && !isNamed {
                     try db.execute(sql: "DELETE FROM stack WHERE id = ?", arguments: [stackId])
                     stackWasDeleted = true
                 } else {
@@ -461,10 +479,18 @@ extension DatabaseManager {
                     WHERE stackId = ? AND highlightId IN (\(placeholders))
                     """, arguments: StatementArguments(deleteArgs))
 
-                let remaining = try Int.fetchOne(db,
+                let remainingHighlights = try Int.fetchOne(db,
                     sql: "SELECT COUNT(*) FROM highlight_stack WHERE stackId = ?",
                     arguments: [sourceId]) ?? 0
-                if remaining == 0 {
+                let remainingSubstacks = try Int.fetchOne(db,
+                    sql: "SELECT COUNT(*) FROM stack_stack WHERE parentStackId = ?",
+                    arguments: [sourceId]) ?? 0
+                let sourceName = try String.fetchOne(db,
+                    sql: "SELECT name FROM stack WHERE id = ?",
+                    arguments: [sourceId])
+                let sourceIsNamed = !(sourceName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+                let sourceIsEmpty = remainingHighlights == 0 && remainingSubstacks == 0
+                if sourceIsEmpty && !sourceIsNamed {
                     try db.execute(sql: "DELETE FROM stack WHERE id = ?", arguments: [sourceId])
                     sourceStackDeleted = true
                 } else {
@@ -531,6 +557,228 @@ extension DatabaseManager {
         } catch {
             CaptureLog.error("Failed to bulk-add highlights to stack: \(error.localizedDescription)")
             return target
+        }
+    }
+
+    // MARK: - Substack reads
+
+    /// All substacks of the given parent, ordered by the user-defined
+    /// `position` (ascending). Fetched separately from highlights so the
+    /// detail view can render substacks and items in two independent sections.
+    func substacksForStack(stackId: String) -> [Stack] {
+        (try? dbQueue?.read { db in
+            try Stack.fetchAll(db, sql: """
+                SELECT s.* FROM stack s
+                JOIN stack_stack ss ON ss.childStackId = s.id
+                WHERE ss.parentStackId = ?
+                ORDER BY ss.position ASC, ss.addedAt DESC
+                """, arguments: [stackId])
+        }) ?? []
+    }
+
+    /// Up to `limit` most-recently-added substacks (by `addedAt`), used for
+    /// mosaic preview rendering when a stack's tile needs to show substacks
+    /// alongside highlight thumbnails.
+    func recentSubstacksForStack(stackId: String, limit: Int = 6) -> [Stack] {
+        (try? dbQueue?.read { db in
+            try Stack.fetchAll(db, sql: """
+                SELECT s.* FROM stack s
+                JOIN stack_stack ss ON ss.childStackId = s.id
+                WHERE ss.parentStackId = ?
+                ORDER BY ss.position ASC, ss.addedAt DESC
+                LIMIT ?
+                """, arguments: [stackId, limit])
+        }) ?? []
+    }
+
+    func substackCountForStack(stackId: String) -> Int {
+        (try? dbQueue?.read { db in
+            try Int.fetchOne(db,
+                sql: "SELECT COUNT(*) FROM stack_stack WHERE parentStackId = ?",
+                arguments: [stackId])
+        } ?? 0) ?? 0
+    }
+
+    /// Parent stacks that contain the given child. Used by `StackCard` and
+    /// `AllStacksView` to show a "⊂ Parent" indicator so nested stacks remain
+    /// discoverable even when they also surface at the top level.
+    func parentStacksForStack(stackId: String) -> [Stack] {
+        (try? dbQueue?.read { db in
+            try Stack.fetchAll(db, sql: """
+                SELECT s.* FROM stack s
+                JOIN stack_stack ss ON ss.parentStackId = s.id
+                WHERE ss.childStackId = ?
+                ORDER BY s.updatedAt DESC
+                """, arguments: [stackId])
+        }) ?? []
+    }
+
+    // MARK: - Substack writes
+
+    /// Attach an existing stack as a substack of another. No items move —
+    /// only the parent-child junction row is inserted. New substacks land at
+    /// the TOP of the parent's substack section (MIN(position) - 1), matching
+    /// how `addHighlight` floats new items to the top of their stack.
+    /// Cycles are permitted intentionally; callers that recurse (export,
+    /// reachable-item counts) must carry a visited set.
+    func addSubstack(_ childId: String, toStack parentId: String) {
+        guard let dbQueue else { return }
+        guard childId != parentId else {
+            // Self-reference is nonsense — the only cycle we do reject, for
+            // consistency with `highlight_stack`'s composite PK semantics.
+            return
+        }
+        let now = Date().timeIntervalSince1970
+        do {
+            try dbQueue.write { db in
+                let nextPosition = (try Int.fetchOne(db,
+                    sql: "SELECT COALESCE(MIN(position), 0) - 1 FROM stack_stack WHERE parentStackId = ?",
+                    arguments: [parentId]) ?? -1)
+                try db.execute(sql: """
+                    INSERT OR IGNORE INTO stack_stack (parentStackId, childStackId, addedAt, position)
+                    VALUES (?, ?, ?, ?)
+                    """, arguments: [parentId, childId, now, nextPosition])
+                try db.execute(
+                    sql: "UPDATE stack SET updatedAt = ? WHERE id = ?",
+                    arguments: [now, parentId]
+                )
+            }
+            NotificationCenter.default.post(
+                name: .stackDataDidChange, object: nil,
+                userInfo: ["stackId": parentId, "childStackId": childId]
+            )
+        } catch {
+            CaptureLog.error("Failed to add substack: \(error.localizedDescription)")
+        }
+    }
+
+    /// Detach a substack from its parent. The child stack itself survives
+    /// (it remains a first-class top-level stack); only the parent-child
+    /// relationship is removed. Never auto-prunes the child.
+    func removeSubstack(_ childId: String, fromStack parentId: String) {
+        guard let dbQueue else { return }
+        let now = Date().timeIntervalSince1970
+        do {
+            try dbQueue.write { db in
+                try db.execute(sql: """
+                    DELETE FROM stack_stack
+                    WHERE parentStackId = ? AND childStackId = ?
+                    """, arguments: [parentId, childId])
+                try db.execute(
+                    sql: "UPDATE stack SET updatedAt = ? WHERE id = ?",
+                    arguments: [now, parentId]
+                )
+            }
+            NotificationCenter.default.post(
+                name: .stackDataDidChange, object: nil,
+                userInfo: ["stackId": parentId, "childStackId": childId]
+            )
+        } catch {
+            CaptureLog.error("Failed to remove substack: \(error.localizedDescription)")
+        }
+    }
+
+    /// Persist a new user-defined order for substacks within a parent.
+    /// Mirrors `reorderHighlightsInStack` — `orderedIds` is the complete list
+    /// of substack ids; rows not in the list keep their prior position.
+    func reorderSubstacksInStack(parentId: String, orderedIds: [String]) {
+        guard let dbQueue, !orderedIds.isEmpty else { return }
+        do {
+            try dbQueue.write { db in
+                for (index, childId) in orderedIds.enumerated() {
+                    try db.execute(sql: """
+                        UPDATE stack_stack
+                        SET position = ?
+                        WHERE parentStackId = ? AND childStackId = ?
+                        """, arguments: [index, parentId, childId])
+                }
+            }
+            NotificationCenter.default.post(
+                name: .stackDataDidChange, object: nil,
+                userInfo: ["stackId": parentId, "reorderSubstacks": true]
+            )
+        } catch {
+            CaptureLog.error("Failed to reorder substacks: \(error.localizedDescription)")
+        }
+    }
+
+    /// "Group into substack" — the in-place grouping primitive. Given a
+    /// selection of highlights within a parent stack, create a new unnamed
+    /// child stack, move the selected highlights into it (preserving their
+    /// source order), and attach the child to the parent. The highlights
+    /// are removed from the parent and appear ONLY in the new substack; the
+    /// parent now shows a substack tile in their place.
+    ///
+    /// Returns the new substack on success. All operations run in a single
+    /// transaction so the parent is never left in a half-extracted state.
+    @discardableResult
+    func extractSubstackFromSelection(
+        highlightIds: [String],
+        inStack parentId: String
+    ) -> Stack? {
+        guard let dbQueue else { return nil }
+        guard !highlightIds.isEmpty else { return nil }
+        let now = Date().timeIntervalSince1970
+        let child = Stack(
+            id: UUID().uuidString,
+            name: nil,
+            stackDescription: nil,
+            createdAt: now,
+            updatedAt: now,
+            isPinned: false
+        )
+        do {
+            try dbQueue.write { db in
+                try child.insert(db)
+
+                // Preserve source ordering within the selection.
+                let placeholders = Array(repeating: "?", count: highlightIds.count).joined(separator: ",")
+                var fetchArgs: [DatabaseValueConvertible] = [parentId]
+                fetchArgs.append(contentsOf: highlightIds)
+                let orderedIds = try String.fetchAll(db, sql: """
+                    SELECT highlightId FROM highlight_stack
+                    WHERE stackId = ? AND highlightId IN (\(placeholders))
+                    ORDER BY position ASC, addedAt DESC
+                    """, arguments: StatementArguments(fetchArgs))
+
+                for (index, hid) in orderedIds.enumerated() {
+                    try db.execute(sql: """
+                        INSERT INTO highlight_stack (stackId, highlightId, addedAt, position)
+                        VALUES (?, ?, ?, ?)
+                        """, arguments: [child.id, hid, now, index])
+                }
+
+                var deleteArgs: [DatabaseValueConvertible] = [parentId]
+                deleteArgs.append(contentsOf: highlightIds)
+                try db.execute(sql: """
+                    DELETE FROM highlight_stack
+                    WHERE stackId = ? AND highlightId IN (\(placeholders))
+                    """, arguments: StatementArguments(deleteArgs))
+
+                // Attach the new child as a substack of the parent. Land at
+                // the top of the parent's substack section so it's visible
+                // immediately where the items were.
+                let minExisting = (try Int.fetchOne(db,
+                    sql: "SELECT COALESCE(MIN(position), 0) - 1 FROM stack_stack WHERE parentStackId = ?",
+                    arguments: [parentId]) ?? -1)
+                try db.execute(sql: """
+                    INSERT INTO stack_stack (parentStackId, childStackId, addedAt, position)
+                    VALUES (?, ?, ?, ?)
+                    """, arguments: [parentId, child.id, now, minExisting])
+
+                try db.execute(
+                    sql: "UPDATE stack SET updatedAt = ? WHERE id = ?",
+                    arguments: [now, parentId]
+                )
+            }
+            NotificationCenter.default.post(
+                name: .stackDataDidChange, object: nil,
+                userInfo: ["stackId": parentId, "childStackId": child.id, "extractedSubstack": true]
+            )
+            return child
+        } catch {
+            CaptureLog.error("Failed to extract substack: \(error.localizedDescription)")
+            return nil
         }
     }
 }

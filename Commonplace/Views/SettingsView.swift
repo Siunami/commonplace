@@ -5,13 +5,6 @@ struct SettingsView: View {
     @ObservedObject private var perms = PermissionsMonitor.shared
     @State private var launchAtLogin = false
     @State private var watchedFolders: [String] = []
-    @State private var r2Endpoint = CollectionPublisher.shared.endpoint
-    @State private var r2AccessKey = CollectionPublisher.shared.accessKeyId
-    @State private var r2SecretKey = CollectionPublisher.shared.secretKey
-    @State private var r2Bucket = CollectionPublisher.shared.bucket
-    @State private var r2PublicUrl = CollectionPublisher.shared.publicUrl
-    @State private var r2TestResult: Bool?
-    @State private var r2Testing = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -19,7 +12,12 @@ struct SettingsView: View {
                 .font(.title3)
                 .fontWeight(.semibold)
 
-            // General
+            // Panels below group interactive controls — toggles, buttons,
+            // list editors. Read-only reference (database path, shortcut
+            // table) renders below as flat sections without the fill, so
+            // the eye is drawn to the things a user can actually change.
+
+            // General — interactive (toggle)
             settingsSection {
                 Toggle("Launch at Login", isOn: $launchAtLogin)
                     .font(.callout)
@@ -30,21 +28,9 @@ struct SettingsView: View {
                             try? SMAppService.mainApp.unregister()
                         }
                     }
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Database")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Text(DatabaseManager.appSupportURL.path)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .textSelection(.enabled)
-                }
             }
 
-            // Watched Folders
+            // Watched Folders — interactive (add/remove)
             settingsSection {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Watched Folders")
@@ -86,66 +72,7 @@ struct SettingsView: View {
                 }
             }
 
-            // Shortcuts
-            settingsSection {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Shortcuts")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    shortcutRow("Full screen", "Cmd+Shift+3")
-                    shortcutRow("Region", "Cmd+Shift+4")
-                    shortcutRow("Archive", "Ctrl+Cmd+A")
-                }
-            }
-
-            // Publishing
-            settingsSection {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Publishing (Cloudflare R2)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    Group {
-                        settingsField("Endpoint", text: $r2Endpoint, placeholder: "https://xxx.r2.cloudflarestorage.com")
-                        settingsField("Bucket", text: $r2Bucket, placeholder: "my-captures")
-                        settingsField("Access Key ID", text: $r2AccessKey, placeholder: "")
-                        SecureField("Secret Access Key", text: $r2SecretKey)
-                            .textFieldStyle(.plain)
-                            .font(.caption)
-                            .padding(4)
-                            .background(.quaternary.opacity(0.3))
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
-                        settingsField("Public URL", text: $r2PublicUrl, placeholder: "https://pub-xxx.r2.dev (optional)")
-                    }
-                    .onChange(of: r2Endpoint) { _, v in CollectionPublisher.shared.endpoint = v }
-                    .onChange(of: r2AccessKey) { _, v in CollectionPublisher.shared.accessKeyId = v }
-                    .onChange(of: r2SecretKey) { _, v in CollectionPublisher.shared.secretKey = v }
-                    .onChange(of: r2Bucket) { _, v in CollectionPublisher.shared.bucket = v }
-                    .onChange(of: r2PublicUrl) { _, v in CollectionPublisher.shared.publicUrl = v }
-
-                    HStack(spacing: 8) {
-                        Button(action: testR2) {
-                            if r2Testing {
-                                ProgressView().controlSize(.small)
-                            } else {
-                                Text("Test Connection")
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .font(.caption)
-                        .disabled(r2Testing)
-
-                        if let result = r2TestResult {
-                            Image(systemName: result ? "checkmark.circle.fill" : "xmark.circle.fill")
-                                .foregroundStyle(result ? .green : .red)
-                                .font(.caption)
-                        }
-                    }
-                }
-            }
-
-            // Permissions
+            // Permissions — interactive (grant/manage)
             settingsSection {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Permissions")
@@ -175,6 +102,25 @@ struct SettingsView: View {
                 }
             }
 
+            // Shortcuts — reference only, no panel fill.
+            infoSection(title: "Shortcuts") {
+                VStack(alignment: .leading, spacing: 4) {
+                    shortcutRow("Full screen", "⌘⇧3")
+                    shortcutRow("Region", "⌘⇧4")
+                    shortcutRow("Archive", "⌃⌘A")
+                }
+            }
+
+            // Database path — reference only, no panel fill.
+            infoSection(title: "Database") {
+                Text(DatabaseManager.appSupportURL.path)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
             // Footer
             HStack {
                 Text("Commonplace v1.0")
@@ -198,8 +144,10 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - Section wrapper
+    // MARK: - Section wrappers
 
+    /// Boxed container for interactive controls. The fill draws the eye to
+    /// things the user can act on.
     private func settingsSection<Content: View>(@ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             content()
@@ -208,6 +156,20 @@ struct SettingsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.quaternary.opacity(0.3))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    /// Flat section for read-only reference material — no panel fill, just
+    /// a small caption label over the content. Keeps reference entries
+    /// present but visually secondary to the interactive panels above.
+    private func infoSection<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            content()
+        }
+        .padding(.horizontal, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: - Helpers
@@ -227,32 +189,6 @@ struct SettingsView: View {
     private func removeFolder(_ path: String) {
         FileMonitor.shared.removeFolder(path)
         watchedFolders = FileMonitor.shared.watchedFolders
-    }
-
-    private func testR2() {
-        r2Testing = true
-        r2TestResult = nil
-        Task {
-            let result = await CollectionPublisher.shared.testConnection()
-            await MainActor.run {
-                r2TestResult = result
-                r2Testing = false
-            }
-        }
-    }
-
-    private func settingsField(_ label: String, text: Binding<String>, placeholder: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label)
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-            TextField(placeholder, text: text)
-                .textFieldStyle(.plain)
-                .font(.caption)
-                .padding(4)
-                .background(.quaternary.opacity(0.5))
-                .clipShape(RoundedRectangle(cornerRadius: 4))
-        }
     }
 
     private func permissionRow(_ label: String, description: String, granted: Bool, action: @escaping () -> Void) -> some View {
@@ -293,9 +229,10 @@ struct SettingsView: View {
         HStack {
             Text(label)
                 .font(.caption)
+                .foregroundStyle(.secondary)
             Spacer()
             Text(shortcut)
-                .font(.caption)
+                .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(.tertiary)
         }
     }

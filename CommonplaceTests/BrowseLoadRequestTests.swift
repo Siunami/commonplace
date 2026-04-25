@@ -6,8 +6,7 @@ struct BrowseLoadRequestTests {
     @Test func normalizesSearchText() {
         let request = BrowseLoadRequest(
             searchText: "  launch notes  \n",
-            selectedFilter: .all,
-            selectedApp: nil
+            activeFilters: .init()
         )
 
         #expect(request.normalizedSearchText == "launch notes")
@@ -27,13 +26,11 @@ struct BrowseLoadRequestTests {
     @Test func reloadBehaviorTracksSearchScope() {
         let plainRequest = BrowseLoadRequest(
             searchText: "",
-            selectedFilter: .all,
-            selectedApp: nil
+            activeFilters: .init()
         )
         let searchRequest = BrowseLoadRequest(
             searchText: "meeting",
-            selectedFilter: .all,
-            selectedApp: nil
+            activeFilters: .init()
         )
 
         #expect(!plainRequest.shouldReloadOnHighlightMutation(change: "notes"))

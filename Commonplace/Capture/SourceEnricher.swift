@@ -47,7 +47,10 @@ final class SourceEnricherRegistry {
     static let shared = SourceEnricherRegistry()
 
     private var enrichers: [SourceEnricher] = []
-    private let budget: TimeInterval = 0.3
+    /// Headroom above `BrowserURLExtractor`'s 0.5s AppleScript timeout so
+    /// the enricher can surface a URL (or its cached fallback) instead of
+    /// getting cut off mid-query when Chrome is slow to answer.
+    private let budget: TimeInterval = 0.8
 
     private init() {}
 

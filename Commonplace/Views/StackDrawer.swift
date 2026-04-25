@@ -52,13 +52,13 @@ struct StackDrawer: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            searchField
-
             if filteredStacks.isEmpty {
                 emptyState
             } else {
                 cardColumn
             }
+
+            searchField
         }
         .frame(width: columnWidth)
         .onAppear {

@@ -67,7 +67,7 @@ struct AddTile: View {
 
     private var expandedBody: some View {
         VStack(spacing: 0) {
-            NoteTextView(
+            NoteComposerTextView(
                 text: $text,
                 onSubmit: save,
                 onCancel: cancel,
@@ -143,7 +143,10 @@ private struct AddButton: View {
 /// style, which on most user systems is the fat legacy scrollbar that's always
 /// visible even when the text fits — hence this wrapper. Also surfaces
 /// ⌘+Return and Escape as callbacks, which `TextEditor` can't cleanly expose.
-private struct NoteTextView: NSViewRepresentable {
+/// Shared NSTextView-backed composer used by the Browse "+" tile and
+/// the Stack detail note composer. Supports ⌘+Return to submit and
+/// Escape to cancel; other keys behave like a normal text view.
+struct NoteComposerTextView: NSViewRepresentable {
     @Binding var text: String
     var onSubmit: () -> Void
     var onCancel: () -> Void
@@ -209,8 +212,8 @@ private struct NoteTextView: NSViewRepresentable {
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
-        var parent: NoteTextView
-        init(_ parent: NoteTextView) { self.parent = parent }
+        var parent: NoteComposerTextView
+        init(_ parent: NoteComposerTextView) { self.parent = parent }
 
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
@@ -225,7 +228,7 @@ private struct NoteTextView: NSViewRepresentable {
 
 /// `NSTextView` subclass that surfaces ⌘+Return and Escape as callbacks.
 /// Plain Return still inserts a newline (normal prose behavior).
-private final class KeyTextView: NSTextView {
+final class KeyTextView: NSTextView {
     var onCmdReturn: (() -> Void)?
     var onEscape: (() -> Void)?
 

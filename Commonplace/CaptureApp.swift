@@ -7,7 +7,80 @@ struct CaptureApp: App {
     var body: some Scene {
         // No visible windows — the status item and BrowseWindow are managed by AppDelegate
         Settings { EmptyView() }
+            .commands {
+                TabCommands()
+                FindCommand()
+            }
     }
+}
+
+/// Cmd+F triggers the search sidebar. Posts the toggle notification
+/// that `WorkspaceView` already listens for, so the sidebar opens
+/// (focusing its input) and closes (giving focus back to the mosaic).
+struct FindCommand: Commands {
+    var body: some Commands {
+        CommandGroup(after: .textEditing) {
+            Button("Find") {
+                NotificationCenter.default.post(name: .toggleSearchSidebar, object: nil)
+            }
+            .keyboardShortcut("f", modifiers: [.command])
+        }
+    }
+}
+
+/// Top-level "Tab" menu contributed to the macOS menu bar whenever the
+/// app is in `.regular` activation policy (currently: while the Browse
+/// window is visible — see `BrowseWindowController`). Each item posts
+/// a notification so `BrowseView` — which owns the `WorkspaceState` —
+/// can mutate it without needing a global observable, matching the
+/// app's existing notification-driven pattern.
+struct TabCommands: Commands {
+    var body: some Commands {
+        CommandMenu("Tab") {
+            Button("New Tab") {
+                NotificationCenter.default.post(name: .workspaceCommandNewTab, object: nil)
+            }
+            .keyboardShortcut("t", modifiers: [.command])
+
+            Button("Close Tab") {
+                NotificationCenter.default.post(name: .workspaceCommandCloseActiveTab, object: nil)
+            }
+            .keyboardShortcut("w", modifiers: [.command])
+
+            Divider()
+
+            Button("Next Tab") {
+                NotificationCenter.default.post(name: .workspaceCommandNextTab, object: nil)
+            }
+            .keyboardShortcut("]", modifiers: [.command, .shift])
+
+            Button("Previous Tab") {
+                NotificationCenter.default.post(name: .workspaceCommandPrevTab, object: nil)
+            }
+            .keyboardShortcut("[", modifiers: [.command, .shift])
+
+            Divider()
+
+            ForEach(1...9, id: \.self) { n in
+                Button("Go to Tab \(n)") {
+                    NotificationCenter.default.post(
+                        name: .workspaceCommandSelectTab,
+                        object: nil,
+                        userInfo: ["index": n - 1]
+                    )
+                }
+                .keyboardShortcut(KeyEquivalent(Character("\(n)")), modifiers: [.command])
+            }
+        }
+    }
+}
+
+extension Notification.Name {
+    static let workspaceCommandNewTab = Notification.Name("workspaceCommandNewTab")
+    static let workspaceCommandCloseActiveTab = Notification.Name("workspaceCommandCloseActiveTab")
+    static let workspaceCommandNextTab = Notification.Name("workspaceCommandNextTab")
+    static let workspaceCommandPrevTab = Notification.Name("workspaceCommandPrevTab")
+    static let workspaceCommandSelectTab = Notification.Name("workspaceCommandSelectTab")
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {

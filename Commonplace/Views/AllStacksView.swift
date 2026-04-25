@@ -2,9 +2,11 @@ import SwiftUI
 import Combine
 
 /// Browseable list of every stack in the database, rendered as a single
-/// clean grid of stack previews ordered by most-recent activity.
-/// Empty stacks are pruned automatically so this view only shows stacks
-/// that currently contain at least one item.
+/// clean grid of stack previews ordered by most-recent activity. Stacks
+/// are created implicitly by adding an item to a fresh target from the
+/// archive — there is no explicit "new empty stack" affordance. Unnamed
+/// empty stacks are pruned; named empty stacks (placeholders reached by
+/// renaming or by removing all items from a named stack) are preserved.
 struct AllStacksView: View {
     var onOpenStack: (Stack) -> Void
 
@@ -83,8 +85,8 @@ struct AllStacksView: View {
             }
 
             VStack(alignment: .leading, spacing: 10) {
-                howToRow(number: "1", text: "Pin a stack to make it active.")
-                howToRow(number: "2", text: "Tap the + on any archive item to drop it in.")
+                howToRow(number: "1", text: "Tap the + on any archive item — a fresh stack is created if none is pinned.")
+                howToRow(number: "2", text: "Pin a stack to make it the active drop target.")
                 howToRow(number: "3", text: "Revisit your stack anytime to see it all together.")
             }
             .padding(.top, 6)

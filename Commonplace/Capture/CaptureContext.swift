@@ -59,12 +59,13 @@ struct CaptureContext {
         )
         let entries = SourceEnricherRegistry.shared.enrich(inputs: rawInputs)
 
-        // Source URL precedence: enricher page_url → BrowserURLExtractor
-        // (legacy path, still populated for caches) → AX document URL.
+        // Source URL precedence: enricher page_url → AX document URL.
+        // The enricher already runs BrowserURLExtractor internally, so
+        // re-invoking it here just doubled the AppleScript call and the
+        // user-visible latency. AX document URL is synchronous and
+        // covers the case where AppleScript times out but the browser
+        // still exposes the URL through accessibility.
         var sourceUrl: String? = entries.first(where: { $0.key == "page_url" })?.url
-        if sourceUrl == nil, let bid = bundleId {
-            sourceUrl = BrowserURLExtractor.shared.extractURL(bundleId: bid)
-        }
         if sourceUrl == nil {
             sourceUrl = documentUrl
         }

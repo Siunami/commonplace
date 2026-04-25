@@ -23,6 +23,11 @@ struct FileRecord: Codable, FetchableRecord, MutablePersistableRecord, Identifia
     /// loads, so neighbour cards don't shift when it arrives.
     var imageWidth: Int? = nil
     var imageHeight: Int? = nil
+    /// SHA-256 of the file contents, computed at ingest. Used to dedup
+    /// bytes when the same file is captured twice (e.g. folder watcher
+    /// then drag-and-drop) — the second ingest reuses this row and its
+    /// on-disk copy. Nullable for pre-v22 rows.
+    var fileHash: String? = nil
 
     static let databaseTableName = "file_record"
 

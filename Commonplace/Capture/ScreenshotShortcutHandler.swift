@@ -9,7 +9,16 @@ final class ScreenshotShortcutHandler {
     private var isCapturing = false
     private var retryTimer: Timer?
 
-    var isInstalled: Bool { eventTap != nil }
+    /// True only when the tap was created AND is currently enabled at the
+    /// CG layer. A created-but-disabled tap (e.g. disabled by system
+    /// timeout) would still return `eventTap != nil`, which would make the
+    /// onboarding verifier falsely report success while ⌘⇧3 / ⌘⇧4 fall
+    /// through to the system. Callers use this to confirm the override is
+    /// actually live.
+    var isInstalled: Bool {
+        guard let tap = eventTap else { return false }
+        return CGEvent.tapIsEnabled(tap: tap)
+    }
 
     // MARK: - CGEvent Tap Callback
 
@@ -44,17 +53,16 @@ final class ScreenshotShortcutHandler {
         let handler = Unmanaged<ScreenshotShortcutHandler>.fromOpaque(userInfo).takeUnretainedValue()
 
         switch keyCode {
-        case 20: // key code for '3' — Cmd+Shift+3
+        case 20: // key code for '3' — Cmd+Shift+3 (full-screen capture)
             DispatchQueue.main.async { handler.handleFullScreenCapture() }
-            return nil // consume the event — blocks system screenshot
-        case 21: // key code for '4' — Cmd+Shift+4
+            return nil // consume — blocks system screenshot-to-desktop
+        case 21: // key code for '4' — Cmd+Shift+4 (region capture)
             DispatchQueue.main.async { handler.handleRegionCapture() }
-            return nil
-        // Cmd+Shift+5 (keyCode 23) deliberately falls through to the default
-        // branch so macOS's built-in Screenshot utility handles it. The
-        // recording code (handleToolbarToggle, ScreenRecordingCapture,
-        // RecordingToolbarWindow) is intentionally left in the project and
-        // can be re-enabled by restoring this case.
+            return nil // consume — blocks system region-screenshot-to-desktop
+        // Cmd+Shift+5 (keyCode 23) intentionally falls through so macOS's
+        // built-in Screenshot utility still handles it. Recording code
+        // (handleToolbarToggle, ScreenRecordingCapture, RecordingToolbarWindow)
+        // is kept in the project and can be re-enabled by adding `case 23:`.
         default:
             return Unmanaged.passRetained(event)
         }

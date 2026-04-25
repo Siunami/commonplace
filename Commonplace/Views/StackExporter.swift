@@ -1,27 +1,22 @@
 import Foundation
 import AppKit
 
-/// Writes a Stack to disk as a Textbundle:
+/// Serializes a Stack to disk or to a markdown string. Used by
+/// `StackExportTargets` to build Textbundle packages, flat LLM-friendly
+/// folders, and plain clipboard markdown.
 ///
-///     Stack Name.textbundle/
-///     ├── text.md
-///     ├── info.json
-///     └── assets/
-///         ├── screenshot-001.png
-///         └── recording-002.mov
+/// Three output shapes share one item renderer, parameterized by where
+/// media files land (if at all) and what prefix shows up in markdown
+/// image/file links:
 ///
-/// Textbundle is the standard "markdown + media" wrapper that Bear,
-/// iA Writer, Ulysses, and many others import natively — Bear in
-/// particular resolves `assets/...` references on import so images
-/// and videos land inside the imported note rather than getting dropped.
-///
-/// The bundle is also just a regular folder on disk, so Obsidian users
-/// can drop it into a vault and open `text.md` with working images,
-/// and ChatGPT/Claude users can paste the markdown body unchanged.
+///   * Textbundle:  media → `<bundle>/assets/…`, links → `assets/file.png`
+///   * Flat folder: media → `<folder>/…`,        links → `file.png`
+///   * Text only:   no media copy, links become `[screenshot]` placeholders
 enum StackExporter {
     struct Result {
-        let folderURL: URL
-        let markdownURL: URL
+        let folderURL: URL?
+        let markdownURL: URL?
+        let markdown: String
         let mediaCopied: Int
     }
 
@@ -29,14 +24,16 @@ enum StackExporter {
         case targetExists(URL)
     }
 
-    /// Export `stack` into `parentDirectory`, creating a `.textbundle`
-    /// package named after the stack. Returns the resulting folder URL
-    /// so the caller can reveal it in Finder.
-    static func export(stack: Stack, into parentDirectory: URL) throws -> Result {
-        let db = DatabaseManager.shared
-        let items = db.highlightsForStack(stackId: stack.id)
+    // MARK: - Public API
 
-        let bundleName = exportBundleName(for: stack) + ".textbundle"
+    /// Textbundle package: `<Name>.textbundle/text.md` + `info.json` + `assets/`.
+    /// Standard format for Bear, iA Writer, Ulysses; works as a plain
+    /// folder in Obsidian.
+    static func exportTextbundle(
+        stack: Stack,
+        into parentDirectory: URL
+    ) throws -> Result {
+        let bundleName = exportBundleName(for: stack, prefix: "Stack Export") + ".textbundle"
         let folderURL = parentDirectory.appendingPathComponent(bundleName, isDirectory: true)
         let mediaURL = folderURL.appendingPathComponent("assets", isDirectory: true)
 
@@ -47,22 +44,164 @@ enum StackExporter {
         try fm.createDirectory(at: folderURL, withIntermediateDirectories: true)
         try writeInfoJSON(into: folderURL)
 
-        var mediaCounter = 1
         var mediaCreated = 0
-        var body = ""
+        let markdown = buildMarkdown(
+            stack: stack,
+            seed: nil,
+            mediaDir: mediaURL,
+            mediaLinkPrefix: "assets/",
+            mediaCreated: &mediaCreated
+        )
+        let markdownURL = folderURL.appendingPathComponent("text.md")
+        try markdown.write(to: markdownURL, atomically: true, encoding: .utf8)
 
-        body += "# \(displayName(for: stack))\n\n"
+        if mediaCreated == 0 {
+            try? fm.removeItem(at: mediaURL)
+        }
+
+        return Result(
+            folderURL: folderURL,
+            markdownURL: markdownURL,
+            markdown: markdown,
+            mediaCopied: mediaCreated
+        )
+    }
+
+    /// Flat folder: `<Name>/prompt.md` + media files as siblings. Each
+    /// item's media can be dragged individually into an LLM chat input
+    /// or any tool that doesn't understand Textbundle's asset subfolder
+    /// convention.
+    static func exportFolder(
+        stack: Stack,
+        into parentDirectory: URL,
+        seed: String? = nil
+    ) throws -> Result {
+        let folderName = exportBundleName(for: stack, prefix: "Stack Prompt")
+        let folderURL = parentDirectory.appendingPathComponent(folderName, isDirectory: true)
+
+        let fm = FileManager.default
+        if fm.fileExists(atPath: folderURL.path) {
+            throw ExportError.targetExists(folderURL)
+        }
+        try fm.createDirectory(at: folderURL, withIntermediateDirectories: true)
+
+        var mediaCreated = 0
+        let markdown = buildMarkdown(
+            stack: stack,
+            seed: seed,
+            mediaDir: folderURL,
+            mediaLinkPrefix: "",
+            mediaCreated: &mediaCreated
+        )
+        let markdownURL = folderURL.appendingPathComponent("prompt.md")
+        try markdown.write(to: markdownURL, atomically: true, encoding: .utf8)
+
+        return Result(
+            folderURL: folderURL,
+            markdownURL: markdownURL,
+            markdown: markdown,
+            mediaCopied: mediaCreated
+        )
+    }
+
+    /// Markdown only, no disk I/O. Media items render as placeholders so
+    /// the output paste-cleanly into a chat input without broken links.
+    static func renderMarkdown(stack: Stack, seed: String? = nil) -> String {
+        var dummy = 0
+        return buildMarkdown(
+            stack: stack,
+            seed: seed,
+            mediaDir: nil,
+            mediaLinkPrefix: "",
+            mediaCreated: &dummy
+        )
+    }
+
+    // MARK: - Body construction
+
+    private static func buildMarkdown(
+        stack: Stack,
+        seed: String?,
+        mediaDir: URL?,
+        mediaLinkPrefix: String,
+        mediaCreated: inout Int
+    ) -> String {
+        var body = ""
+        if let trimmed = seed?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !trimmed.isEmpty {
+            body += "\(trimmed)\n\n---\n\n"
+        }
+
+        var mediaCounter = 1
+        var visited = Set<String>()
+        body += renderStackNode(
+            stack: stack,
+            depth: 1,
+            visited: &visited,
+            mediaDir: mediaDir,
+            mediaLinkPrefix: mediaLinkPrefix,
+            mediaCounter: &mediaCounter,
+            mediaCreated: &mediaCreated
+        )
+        return body
+    }
+
+    /// Emits one stack's heading + items, then recurses into its substacks.
+    /// `visited` guards against intentional cycles (the model allows them):
+    /// a revisited stack emits a short "see earlier" pointer and stops, so
+    /// markdown always terminates. The shared media counter keeps asset
+    /// filenames unique across the whole exported tree.
+    private static func renderStackNode(
+        stack: Stack,
+        depth: Int,
+        visited: inout Set<String>,
+        mediaDir: URL?,
+        mediaLinkPrefix: String,
+        mediaCounter: inout Int,
+        mediaCreated: inout Int
+    ) -> String {
+        let db = DatabaseManager.shared
+        if visited.contains(stack.id) {
+            return "_(See earlier “\(displayName(for: stack))”)_\n\n"
+        }
+        visited.insert(stack.id)
+
+        let items = db.highlightsForStack(stackId: stack.id)
+        let substacks = db.substacksForStack(stackId: stack.id)
+
+        var body = ""
+        let hashes = String(repeating: "#", count: min(depth, 6))
+        body += "\(hashes) \(displayName(for: stack))\n\n"
         if let desc = stack.stackDescription?.trimmingCharacters(in: .whitespacesAndNewlines),
            !desc.isEmpty {
             body += "\(desc)\n\n"
         }
-        body += "\(items.count) item\(items.count == 1 ? "" : "s")\n\n"
+
+        var countParts: [String] = []
+        if !substacks.isEmpty {
+            countParts.append("\(substacks.count) stack\(substacks.count == 1 ? "" : "s")")
+        }
+        countParts.append("\(items.count) item\(items.count == 1 ? "" : "s")")
+        body += "\(countParts.joined(separator: " · "))\n\n"
+
+        for child in substacks {
+            body += renderStackNode(
+                stack: child,
+                depth: depth + 1,
+                visited: &visited,
+                mediaDir: mediaDir,
+                mediaLinkPrefix: mediaLinkPrefix,
+                mediaCounter: &mediaCounter,
+                mediaCreated: &mediaCreated
+            )
+        }
 
         for item in items {
             body += "---\n\n"
             body += renderItem(
                 item,
-                mediaDir: mediaURL,
+                mediaDir: mediaDir,
+                mediaLinkPrefix: mediaLinkPrefix,
                 counter: &mediaCounter,
                 mediaCreated: &mediaCreated
             )
@@ -77,21 +216,15 @@ enum StackExporter {
             body += "\n"
         }
 
-        let markdownURL = folderURL.appendingPathComponent("text.md")
-        try body.write(to: markdownURL, atomically: true, encoding: .utf8)
-
-        if mediaCreated == 0 {
-            try? fm.removeItem(at: mediaURL)
-        }
-
-        return Result(folderURL: folderURL, markdownURL: markdownURL, mediaCopied: mediaCreated)
+        return body
     }
 
     // MARK: - Per-item rendering
 
     private static func renderItem(
         _ item: Highlight,
-        mediaDir: URL,
+        mediaDir: URL?,
+        mediaLinkPrefix: String,
         counter: inout Int,
         mediaCreated: inout Int
     ) -> String {
@@ -99,31 +232,28 @@ enum StackExporter {
 
         switch item.highlightType {
         case "screenshot":
-            if let rel = copyMedia(
-                from: item.contentText,
-                to: mediaDir,
+            body += renderMediaItem(
+                sourcePath: item.contentText,
                 kind: "screenshot",
+                preserveName: nil,
+                placeholder: "[screenshot]",
+                mediaDir: mediaDir,
+                mediaLinkPrefix: mediaLinkPrefix,
                 counter: &counter,
-                created: &mediaCreated
-            ) {
-                body += "![](\(rel))\n"
-            } else {
-                body += "_(screenshot unavailable)_\n"
-            }
+                mediaCreated: &mediaCreated
+            )
 
         case "recording":
-            if let rel = copyMedia(
-                from: item.contentText,
-                to: mediaDir,
+            body += renderMediaItem(
+                sourcePath: item.contentText,
                 kind: "recording",
+                preserveName: nil,
+                placeholder: "[recording]",
+                mediaDir: mediaDir,
+                mediaLinkPrefix: mediaLinkPrefix,
                 counter: &counter,
-                created: &mediaCreated
-            ) {
-                let name = (rel as NSString).lastPathComponent
-                body += "[\(name)](\(rel))\n"
-            } else {
-                body += "_(recording unavailable)_\n"
-            }
+                mediaCreated: &mediaCreated
+            )
 
         case "file":
             let sourcePath: String
@@ -136,23 +266,16 @@ enum StackExporter {
                 sourcePath = item.contentText
                 preserve = (sourcePath as NSString).lastPathComponent
             }
-            if let rel = copyMedia(
-                from: sourcePath,
-                to: mediaDir,
+            body += renderMediaItem(
+                sourcePath: sourcePath,
                 kind: "file",
+                preserveName: preserve,
+                placeholder: "[file: \(preserve)]",
+                mediaDir: mediaDir,
+                mediaLinkPrefix: mediaLinkPrefix,
                 counter: &counter,
-                created: &mediaCreated,
-                preserveName: preserve
-            ) {
-                let ext = (rel as NSString).pathExtension.lowercased()
-                if imageExtensions.contains(ext) {
-                    body += "![](\(rel))\n"
-                } else {
-                    body += "[\(preserve)](\(rel))\n"
-                }
-            } else {
-                body += "_(file unavailable: \(preserve))_\n"
-            }
+                mediaCreated: &mediaCreated
+            )
 
         case "highlight", "note":
             body += blockquote(item.contentText) + "\n"
@@ -173,6 +296,43 @@ enum StackExporter {
         }
 
         return body
+    }
+
+    private static func renderMediaItem(
+        sourcePath: String,
+        kind: String,
+        preserveName: String?,
+        placeholder: String,
+        mediaDir: URL?,
+        mediaLinkPrefix: String,
+        counter: inout Int,
+        mediaCreated: inout Int
+    ) -> String {
+        // No disk output requested — render a text placeholder so the
+        // markdown pastes cleanly without broken image links.
+        guard let mediaDir else {
+            return "\(placeholder)\n"
+        }
+
+        guard let filename = copyMedia(
+            from: sourcePath,
+            to: mediaDir,
+            kind: kind,
+            counter: &counter,
+            created: &mediaCreated,
+            preserveName: preserveName
+        ) else {
+            return "_(\(kind) unavailable)_\n"
+        }
+
+        let link = "\(mediaLinkPrefix)\(filename)"
+        let ext = (filename as NSString).pathExtension.lowercased()
+        if imageExtensions.contains(ext) {
+            return "![](\(link))\n"
+        } else {
+            let label = preserveName ?? filename
+            return "[\(label)](\(link))\n"
+        }
     }
 
     // MARK: - Helpers
@@ -243,6 +403,11 @@ enum StackExporter {
         return "\(first)\n\(rest)"
     }
 
+    /// Copies a source file into `mediaDir` with a numbered, sanitized
+    /// filename and returns that filename (no path prefix). The caller
+    /// composes the final markdown link by prepending whatever subdir
+    /// prefix the target expects (`assets/` for Textbundle, `""` for a
+    /// flat folder).
     private static func copyMedia(
         from sourcePath: String,
         to mediaDir: URL,
@@ -287,7 +452,7 @@ enum StackExporter {
 
         counter += 1
         created += 1
-        return "assets/\(filename)"
+        return filename
     }
 
     private static func sanitizedFolderName(_ name: String) -> String {
@@ -295,20 +460,19 @@ enum StackExporter {
         return cleaned.isEmpty ? "Untitled Stack" : cleaned
     }
 
-    /// Export folder name with leading `Stack Export` tag and an ISO
+    /// Export folder name with a leading `prefix` tag and an ISO
     /// date + time suffix. The tag up front makes these easy to spot
-    /// when re-imported into the archiving tool, and the timestamp
-    /// sorts chronologically and disambiguates repeat exports of the
-    /// same stack on the same day.
+    /// when re-imported, the timestamp sorts chronologically and
+    /// disambiguates repeat exports of the same stack on the same day.
     ///
     /// Example: `Stack Export — My Reading List — 2026-04-20 1432`
-    private static func exportBundleName(for stack: Stack) -> String {
+    private static func exportBundleName(for stack: Stack, prefix: String) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd HHmm"
         let stamp = formatter.string(from: Date())
         let title = sanitizedFolderName(displayName(for: stack))
-        return "Stack Export — \(title) — \(stamp)"
+        return "\(prefix) — \(title) — \(stamp)"
     }
 
     private static func sanitizeFilename(_ name: String) -> String {

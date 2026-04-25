@@ -4,6 +4,7 @@ import QuickLookThumbnailing
 import AppKit
 import PDFKit
 import AVFoundation
+import CryptoKit
 
 final class FileMonitor {
     static let shared = FileMonitor()
@@ -104,12 +105,13 @@ final class FileMonitor {
     /// `tagIds` — apply these tags to the new highlight after insertion. Used by the Browse
     /// "+" tile / drop handler to inherit the current collection filter.
     func importFile(from sourceURL: URL, tagIds: [String] = []) async {
-        guard let record = await ingestFile(
+        guard let ingested = await ingestFile(
             from: sourceURL,
             sourceFolder: "Drag & Drop",
             logTag: "imported via drag-and-drop"
         ) else { return }
 
+        let record = ingested.record
         let thumbImage: NSImage? = record.thumbnailPath.flatMap { NSImage(contentsOfFile: $0) }
 
         await MainActor.run {
@@ -117,7 +119,8 @@ final class FileMonitor {
                 fileRecord: record,
                 thumbnailImage: thumbImage,
                 tagIds: tagIds,
-                sourceUrl: record.originalUrl
+                sourceUrl: record.originalUrl,
+                sourceContext: ingested.sourceContext
             )
         }
     }
@@ -141,12 +144,15 @@ final class FileMonitor {
             originalUrl: originalUrl,
             moveInsteadOfCopy: true,
             logTag: "downloaded from link"
-        )
+        )?.record
     }
 
     /// Shared implementation for importFile / importDownloadedFile.
     /// Places sourceURL into files/{dayString}/ (copying or moving), inserts
-    /// a FileRecord, and generates a thumbnail. Does NOT create a Highlight.
+    /// a FileRecord, generates a thumbnail, and runs
+    /// `FileMetadataExtractor` against the final persistent path. Returns
+    /// the record + the JSON-encoded source context (nil when extraction
+    /// produced nothing). Does NOT create a Highlight.
     private func ingestFile(
         from sourceURL: URL,
         sourceFolder: String,
@@ -154,7 +160,7 @@ final class FileMonitor {
         originalUrl: String? = nil,
         moveInsteadOfCopy: Bool = false,
         logTag: String
-    ) async -> FileRecord? {
+    ) async -> (record: FileRecord, sourceContext: String?)? {
         let fm = FileManager.default
         guard fm.fileExists(atPath: sourceURL.path) else { return nil }
         guard let attrs = try? fm.attributesOfItem(atPath: sourceURL.path) else { return nil }
@@ -167,6 +173,23 @@ final class FileMonitor {
         let contentType = Self.contentTypeCategory(from: ext, uti: uti)
         let now = Date()
         let dayString = ScreenshotCapture.dayString(for: now)
+
+        // Bytes-level dedup: hash the source and look for an existing FileRecord
+        // with the same contents. On hit, skip the copy/move and reuse the
+        // existing persistent copy. The caller still gets a fresh Highlight
+        // for this capture event — siblings are resolved later via fileId.
+        let sourceHash = Self.hashFile(at: sourceURL.path)
+        if let sourceHash, let existing = db.fileRecord(byHash: sourceHash) {
+            if moveInsteadOfCopy {
+                try? fm.removeItem(at: sourceURL)
+            }
+            let reusedContext = await encodedSourceContext(
+                path: existing.filePath,
+                contentType: existing.contentType
+            )
+            CaptureLog.info("FileMonitor: dedup hit on hash (\(logTag)): reusing #\(existing.id ?? 0) for \(chosenName)")
+            return (existing, reusedContext)
+        }
 
         let filesDir = Self.filesURL.appendingPathComponent(dayString)
         try? fm.createDirectory(at: filesDir, withIntermediateDirectories: true)
@@ -235,7 +258,8 @@ final class FileMonitor {
             pageCount: pageCount,
             originalUrl: effectiveOriginalUrl,
             imageWidth: dims?.0,
-            imageHeight: dims?.1
+            imageHeight: dims?.1,
+            fileHash: sourceHash
         )
 
         db.insertFileRecord(&record)
@@ -246,7 +270,21 @@ final class FileMonitor {
             record.thumbnailPath = thumbPath
         }
 
-        return record
+        let sourceContext = await encodedSourceContext(path: persistentPath, contentType: contentType)
+        return (record, sourceContext)
+    }
+
+    /// Runs `FileMetadataExtractor` and encodes the entries as JSON using
+    /// the same shape `Highlight.sourceContext` already persists. Returns
+    /// nil when the extractor produced no usable rows.
+    private func encodedSourceContext(path: String, contentType: String?) async -> String? {
+        let entries = await FileMetadataExtractor.extract(path: path, contentType: contentType)
+        guard !entries.isEmpty,
+              let data = try? JSONEncoder().encode(entries),
+              let json = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return json
     }
 
     // MARK: - Processing
@@ -269,41 +307,58 @@ final class FileMonitor {
         let now = Date()
         let dayString = ScreenshotCapture.dayString(for: now)
 
-        // Copy file to persistent storage
-        let filesDir = Self.filesURL.appendingPathComponent(dayString)
-        try? fm.createDirectory(at: filesDir, withIntermediateDirectories: true)
-
-        var destURL = filesDir.appendingPathComponent(fileName)
-        if fm.fileExists(atPath: destURL.path) {
-            let stem = url.deletingPathExtension().lastPathComponent
-            let suffix = String(UUID().uuidString.prefix(6))
-            destURL = filesDir.appendingPathComponent(ext.isEmpty ? "\(stem)-\(suffix)" : "\(stem)-\(suffix).\(ext)")
-        }
-
-        let persistentPath: String
-        do {
-            try fm.copyItem(at: url, to: destURL)
-            persistentPath = destURL.path
-            CaptureLog.info("FileMonitor: copied \(fileName) to persistent storage")
-        } catch {
-            CaptureLog.warning("FileMonitor: copy failed, using original path: \(error.localizedDescription)")
-            persistentPath = filePath
-        }
-
-        // Get page count for PDFs
-        let pageCount: Int? = if contentType == "pdf" {
-            PDFDocument(url: URL(fileURLWithPath: persistentPath))?.pageCount
-        } else {
-            nil
-        }
-
-        // Generate thumbnail from the persistent copy, then hand off to HighlightCapture.
-        // Insert happens inside the Task so intrinsic dimensions can be read
-        // async (video metadata is async-only) and persisted with the row —
-        // that way the masonry card reserves an aspect-correct frame the
-        // first time it renders.
-        let thumbSourceURL = URL(fileURLWithPath: persistentPath)
+        // Move the rest of the work into a Task so hashing and async metadata
+        // reads happen off the watcher thread.
         Task {
+            // Bytes-level dedup: hash the source and reuse an existing
+            // FileRecord if one already stores these bytes. The user's
+            // file on Desktop stays where it is — we just skip our copy.
+            let sourceHash = Self.hashFile(at: filePath)
+            if let sourceHash, let existing = db.fileRecord(byHash: sourceHash) {
+                let thumbImage: NSImage? = existing.thumbnailPath.flatMap { NSImage(contentsOfFile: $0) }
+                let reusedContext = await encodedSourceContext(
+                    path: existing.filePath,
+                    contentType: existing.contentType
+                )
+                await MainActor.run {
+                    HighlightCapture.shared.captureFromFileDetection(
+                        fileRecord: existing,
+                        thumbnailImage: thumbImage,
+                        sourceUrl: existing.originalUrl,
+                        sourceContext: reusedContext
+                    )
+                }
+                CaptureLog.info("FileMonitor: dedup hit on hash: reusing #\(existing.id ?? 0) for \(fileName) from \(sourceFolder)")
+                return
+            }
+
+            // Miss — copy to persistent storage and ingest fresh.
+            let filesDir = Self.filesURL.appendingPathComponent(dayString)
+            try? fm.createDirectory(at: filesDir, withIntermediateDirectories: true)
+
+            var destURL = filesDir.appendingPathComponent(fileName)
+            if fm.fileExists(atPath: destURL.path) {
+                let stem = url.deletingPathExtension().lastPathComponent
+                let suffix = String(UUID().uuidString.prefix(6))
+                destURL = filesDir.appendingPathComponent(ext.isEmpty ? "\(stem)-\(suffix)" : "\(stem)-\(suffix).\(ext)")
+            }
+
+            let persistentPath: String
+            do {
+                try fm.copyItem(at: url, to: destURL)
+                persistentPath = destURL.path
+                CaptureLog.info("FileMonitor: copied \(fileName) to persistent storage")
+            } catch {
+                CaptureLog.warning("FileMonitor: copy failed, using original path: \(error.localizedDescription)")
+                persistentPath = filePath
+            }
+
+            let pageCount: Int? = if contentType == "pdf" {
+                PDFDocument(url: URL(fileURLWithPath: persistentPath))?.pageCount
+            } else {
+                nil
+            }
+
             let dims = await Self.readIntrinsicDimensions(at: persistentPath, contentType: contentType)
 
             // Pull download provenance from the xattr the browser wrote (kMDItemWhereFroms).
@@ -326,10 +381,12 @@ final class FileMonitor {
                 pageCount: pageCount,
                 originalUrl: whereFromsUrl,
                 imageWidth: dims?.0,
-                imageHeight: dims?.1
+                imageHeight: dims?.1,
+                fileHash: sourceHash
             )
             db.insertFileRecord(&record)
 
+            let thumbSourceURL = URL(fileURLWithPath: persistentPath)
             let thumbPath = await generateThumbnail(for: thumbSourceURL, dayString: dayString)
             if let thumbPath, let recordId = record.id {
                 db.updateFileRecordThumbnail(id: recordId, thumbnailPath: thumbPath)
@@ -337,17 +394,19 @@ final class FileMonitor {
             }
 
             let thumbImage: NSImage? = if let thumbPath { NSImage(contentsOfFile: thumbPath) } else { nil }
+            let sourceContext = await encodedSourceContext(path: persistentPath, contentType: contentType)
 
             await MainActor.run {
                 HighlightCapture.shared.captureFromFileDetection(
                     fileRecord: record,
                     thumbnailImage: thumbImage,
-                    sourceUrl: whereFromsUrl
+                    sourceUrl: whereFromsUrl,
+                    sourceContext: sourceContext
                 )
             }
-        }
 
-        CaptureLog.info("FileMonitor: captured \(fileName) (\(RecordingRecord.formatFileSize(fileSize))) from \(sourceFolder)")
+            CaptureLog.info("FileMonitor: captured \(fileName) (\(RecordingRecord.formatFileSize(fileSize))) from \(sourceFolder)")
+        }
     }
 
     // MARK: - Thumbnail
@@ -500,13 +559,38 @@ final class FileMonitor {
         return thumbFile.path
     }
 
+    // MARK: - Content Hash (bytes-level dedup)
+
+    /// SHA-256 the file at `path` streaming in 1 MB chunks. Used to dedup
+    /// bytes across capture events (same file dropped twice, downloaded
+    /// twice, etc.). Returns a lowercase hex digest, or nil on I/O error.
+    /// Sync and CPU-bound (~500 MB/s on M-series); call off-main.
+    static func hashFile(at path: String) -> String? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        let chunkSize = 1 * 1024 * 1024
+        while true {
+            let chunk: Data?
+            do {
+                chunk = try handle.read(upToCount: chunkSize)
+            } catch {
+                return nil
+            }
+            guard let chunk, !chunk.isEmpty else { break }
+            hasher.update(data: chunk)
+        }
+        let digest = hasher.finalize()
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
     // MARK: - WhereFroms (download provenance)
 
     /// Read `com.apple.metadata:kMDItemWhereFroms` — the extended attribute
     /// browsers write to downloaded files. Typically an array of two strings:
     /// `[directDownloadURL, referrerPageURL]`. Returns an empty array if the
     /// attribute is missing or can't be decoded.
-    private static func readWhereFroms(path: String) -> [String] {
+    static func readWhereFroms(path: String) -> [String] {
         let attrName = "com.apple.metadata:kMDItemWhereFroms"
         let size = getxattr(path, attrName, nil, 0, 0, 0)
         guard size > 0 else { return [] }

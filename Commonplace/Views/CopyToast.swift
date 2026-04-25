@@ -820,41 +820,19 @@ struct CopyToastView: View {
     // MARK: - Compact (text captures: minimal preview)
 
     private var compactContent: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(content)
-                .font(.system(size: 12))
-                .lineLimit(2)
-                .truncationMode(.tail)
-                .foregroundStyle(.primary)
-                .padding(.horizontal, 12)
-                .padding(.top, 8)
-                .padding(.bottom, 4)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    onExpand?() ?? { stateHolder.state = .expanded }()
-                }
-
-            sourceUrlLink
-                .padding(.horizontal, 12)
-
-            toastMetadataFooter
-                .padding(.horizontal, 12)
-                .padding(.bottom, 8)
-        }
-        .fixedSize(horizontal: false, vertical: true)
-    }
-
-    @ViewBuilder
-    private var toastMetadataFooter: some View {
-        let parts = [sourceApp, windowTitle?.prefix(40).description].compactMap { $0 }
-        if !parts.isEmpty {
-            Text(parts.joined(separator: " · "))
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-        }
+        Text(content)
+            .font(.system(size: 12))
+            .lineLimit(3)
+            .truncationMode(.tail)
+            .foregroundStyle(.primary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                onExpand?() ?? { stateHolder.state = .expanded }()
+            }
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     // MARK: - Expanded

@@ -112,7 +112,16 @@ final class PermissionsMonitor: ObservableObject {
 
     private func startPolling() {
         guard pollTimer == nil else { return }
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        // `refresh()` calls `probeScreenRecording()`, which does
+        // `SCShareableContent.excludingDesktopWindows(...)` — a full
+        // window-enumeration system call that can cost 100–500ms of CPU
+        // on a busy desktop. At 2s intervals that was the single biggest
+        // driver of idle CPU / "High" energy impact. The real trigger
+        // we care about (user toggling permission in System Settings) is
+        // already caught by `didBecomeActiveNotification` → refresh — no
+        // one toggles a permission without switching to Settings and
+        // back. 60s is just a belt-and-suspenders fallback.
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
     }

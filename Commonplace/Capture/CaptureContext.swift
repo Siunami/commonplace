@@ -1,6 +1,25 @@
 import AppKit
 import CoreWLAN
 import CryptoKit
+import Foundation
+
+/// Why a card is being written. Threaded into `HighlightCapture` so the
+/// archive can answer "where did this come from?" without inferring it
+/// from heuristics. V1 origins:
+/// - `.captured`: arrived from outside (default — clipboard, screenshot,
+///   file watcher, drag-import). Existing call sites all map to this.
+/// - `.workspaceCreated`: authored inline in a workspace canvas. The
+///   canvas writes both the highlight (with originType set) and the
+///   placement at the click point.
+/// - `.derived`: produced from a parent card (V1: text-excerpt only).
+///   The parent's provenance is snapshotted into `inheritedProvenance`
+///   at derive time so the derived card stays self-contained even if
+///   the parent is later deleted.
+enum OriginContext {
+    case captured
+    case workspaceCreated(workspaceId: String)
+    case derived(parentCardId: String, range: NSRange)
+}
 
 struct CaptureContext {
     // App & window

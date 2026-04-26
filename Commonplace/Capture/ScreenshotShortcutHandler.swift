@@ -148,7 +148,8 @@ final class ScreenshotShortcutHandler {
                 filePath: result.filePath,
                 image: image,
                 screenshotId: result.screenshotId,
-                context: result.context
+                context: result.context,
+                sources: result.sources
             )
         }
     }
@@ -187,7 +188,8 @@ final class ScreenshotShortcutHandler {
                     filePath: result.filePath,
                     image: image,
                     screenshotId: result.screenshotId,
-                    context: result.context
+                    context: result.context,
+                    sources: result.sources
                 )
             }
         }

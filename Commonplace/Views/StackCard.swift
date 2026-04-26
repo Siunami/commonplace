@@ -12,6 +12,14 @@ struct StackCard: View {
     let stack: Stack
     var isPinned: Bool = false
     var onTap: (() -> Void)? = nil
+    /// Whether this card emits a `CanvasDragItem(.stack)` drag payload.
+    /// Defaults to true for the all-stacks grid + card-detail pivot —
+    /// dragging those onto a workspace cascades the stack's members.
+    /// The pinned floater (and other workspace-chrome surfaces that
+    /// happen to render a `StackCard`) opt out by passing false: those
+    /// instances are affordances, not draggable content, and the user
+    /// shouldn't be able to start a drop accidentally by grabbing them.
+    var isDraggable: Bool = true
 
     @State private var slots: [MosaicSlot] = []
     @State private var totalCount: Int = 0
@@ -23,15 +31,19 @@ struct StackCard: View {
     /// Mosaic positions can hold either a highlight or a substack. The
     /// mosaic renders both as full-fidelity previews so a stack tile
     /// truthfully reflects "what's inside" even when some of the recent
-    /// children are themselves stacks.
+    /// children are themselves stacks. `overflow` occupies the last slot
+    /// when more items exist than fit in the 6-cell grid, so the mosaic
+    /// reads as "5 visible items + N hidden" instead of silently truncating.
     enum MosaicSlot: Identifiable {
         case highlight(Highlight)
         case substack(Stack)
+        case overflow(Int)
 
         var id: String {
             switch self {
             case .highlight(let h): return "h-\(h.id)"
             case .substack(let s): return "s-\(s.id)"
+            case .overflow(let n): return "overflow-\(n)"
             }
         }
     }
@@ -61,6 +73,13 @@ struct StackCard: View {
         .shadow(color: UITokens.shadowCard, radius: isPinned ? 14 : 6, y: isPinned ? 5 : 2)
         .contentShape(RoundedRectangle(cornerRadius: UITokens.radiusCard))
         .onTapGesture { onTap?() }
+        // Drag a stack onto a workspace canvas to drop placements for
+        // every member at once (cascaded along the diagonal so they
+        // don't all overlap). Modern Transferable-based payload so the
+        // canvas's `.dropDestination` matches it cleanly. Suppressed on
+        // chrome surfaces (pinned floater) where dragging would be
+        // accidental rather than intentional.
+        .modifier(ConditionalDraggable(isEnabled: isDraggable, payload: CanvasDragItem(kind: .stack, id: stack.id)))
         .task(id: stack.id) { reload() }
         .onReceive(NotificationCenter.default.publisher(for: .stackDataDidChange)) { note in
             let changed = note.userInfo?["stackId"] as? String
@@ -153,6 +172,8 @@ struct StackCard: View {
                 StackItemPreview(highlight: h)
             case .substack(let child):
                 SubstackMosaicSlot(child: child)
+            case .overflow(let n):
+                OverflowMosaicSlot(count: n)
             case nil:
                 Color.clear
             }
@@ -194,14 +215,24 @@ struct StackCard: View {
         // Substacks land in the mosaic first so the tile communicates the
         // tree structure — a stack with 2 substacks and 10 items reads as
         // "those 2 substacks + 4 recent items," not "10 random items."
-        let substacks = db.recentSubstacksForStack(stackId: stack.id, limit: 6)
-        let remaining = max(0, 6 - substacks.count)
+        // When the stack has more items than fit, the last slot becomes
+        // a "+N" cell so the mosaic and the count summary agree.
+        let cap = 6
+        let total = db.itemCountForStack(stackId: stack.id)
+        let overflow = max(0, total - cap)
+        let slotsBudget = overflow > 0 ? cap - 1 : cap
+        let substacks = db.recentSubstacksForStack(stackId: stack.id, limit: slotsBudget)
+        let remaining = max(0, slotsBudget - substacks.count)
         let highlights = remaining > 0
             ? db.recentHighlightsForStack(stackId: stack.id, limit: remaining)
             : []
-        slots = substacks.map(MosaicSlot.substack)
+        var newSlots: [MosaicSlot] = substacks.map(MosaicSlot.substack)
             + highlights.map(MosaicSlot.highlight)
-        totalCount = db.itemCountForStack(stackId: stack.id)
+        if overflow > 0 {
+            newSlots.append(.overflow(overflow))
+        }
+        slots = newSlots
+        totalCount = total
         substackCount = db.substackCountForStack(stackId: stack.id)
     }
 }
@@ -320,6 +351,24 @@ private struct SubstackMosaicSlot: View {
     private var displayName: String? {
         guard child.isNamed, let name = child.name else { return nil }
         return name
+    }
+}
+
+/// Last-slot indicator for stacks whose item count exceeds the mosaic's
+/// 6-cell budget. Reads as "+\(n)" on the same recessed surface as the
+/// mosaic background so it sits inside the panel without competing with
+/// the actual content cells.
+private struct OverflowMosaicSlot: View {
+    let count: Int
+
+    var body: some View {
+        ZStack {
+            Color.primary.opacity(0.05)
+            Text("+\(count)")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+        }
     }
 }
 
@@ -501,5 +550,23 @@ private struct NoteSnippetCell: View {
             .padding(.vertical, 3)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .background(UITokens.surfaceCard)
+    }
+}
+
+/// Wraps `.draggable(...)` so callers can opt out without forking the
+/// view body. SwiftUI's `.draggable` has no built-in disable knob — gating
+/// at the modifier level via `if isEnabled { content.draggable(...) } else
+/// { content }` would yield two distinct view types and disrupt identity,
+/// so we use a single ViewModifier that conditionally attaches.
+private struct ConditionalDraggable<Payload: Transferable>: ViewModifier {
+    let isEnabled: Bool
+    let payload: Payload
+
+    func body(content: Content) -> some View {
+        if isEnabled {
+            content.draggable(payload)
+        } else {
+            content
+        }
     }
 }

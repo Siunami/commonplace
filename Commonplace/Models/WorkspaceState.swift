@@ -16,6 +16,11 @@ enum WorkspaceTabContent: Codable, Equatable {
     /// chooser replaces this tab's content with the chosen view in
     /// place — see `BrowseView.handleChooserPick`.
     case newTab
+    /// V1 spatial canvas — a `Workspace` row rendered as a freeform
+    /// surface holding `Placement`s. Sibling to `.stack(id:)` rather
+    /// than a replacement: the tab/pane shell still owns layout and
+    /// navigation; the canvas is just one possible body type.
+    case workspace(id: String)
 }
 
 /// One open view inside a pane. Identity is per-tab so close/move/
@@ -150,19 +155,23 @@ struct WorkspaceState: Codable, Equatable {
     /// pane itself collapses and its width redistributes proportionally
     /// to surviving neighbours. If the closed pane was the only pane,
     /// the workspace resets to `.initial` so it never reaches an empty
-    /// state.
-    mutating func closeTab(paneId: UUID, tabId: UUID) {
-        guard let paneIdx = panes.firstIndex(where: { $0.id == paneId }) else { return }
-        guard let tabIdx = panes[paneIdx].tabs.firstIndex(where: { $0.id == tabId }) else { return }
+    /// state. Returns the closed tab's content so callers can fire
+    /// content-specific cleanup (e.g. pruning empty unnamed workspaces).
+    @discardableResult
+    mutating func closeTab(paneId: UUID, tabId: UUID) -> WorkspaceTabContent? {
+        guard let paneIdx = panes.firstIndex(where: { $0.id == paneId }) else { return nil }
+        guard let tabIdx = panes[paneIdx].tabs.firstIndex(where: { $0.id == tabId }) else { return nil }
+        let closedContent = panes[paneIdx].tabs[tabIdx].content
         panes[paneIdx].tabs.remove(at: tabIdx)
         if panes[paneIdx].tabs.isEmpty {
             removePane(at: paneIdx)
-            return
+            return closedContent
         }
         if panes[paneIdx].activeTabId == tabId {
             let fallbackIdx = max(0, tabIdx - 1)
             panes[paneIdx].activeTabId = panes[paneIdx].tabs[min(fallbackIdx, panes[paneIdx].tabs.count - 1)].id
         }
+        return closedContent
     }
 
     /// Replace a tab's content in place. Used by the new-tab chooser
@@ -261,10 +270,15 @@ struct WorkspaceState: Codable, Equatable {
         activePaneId = newPane.id
     }
 
-    /// Close a whole pane (and all its tabs).
-    mutating func closePane(paneId: UUID) {
-        guard let idx = panes.firstIndex(where: { $0.id == paneId }) else { return }
+    /// Close a whole pane (and all its tabs). Returns the contents of
+    /// every tab that was in the pane so callers can fire per-content
+    /// cleanup (e.g. pruning empty unnamed workspaces).
+    @discardableResult
+    mutating func closePane(paneId: UUID) -> [WorkspaceTabContent] {
+        guard let idx = panes.firstIndex(where: { $0.id == paneId }) else { return [] }
+        let closedContents = panes[idx].tabs.map(\.content)
         removePane(at: idx)
+        return closedContents
     }
 
     // MARK: - Width mutations
@@ -284,10 +298,21 @@ struct WorkspaceState: Codable, Equatable {
     }
 
     private mutating func insertPaneInternal(_ newPane: WorkspacePane, at index: Int) {
-        // Width: shrink the affected neighbour by half, give the rest
-        // to the new pane. Affected neighbour is the pane currently AT
-        // the insertion index (it'll be shifted right) when there is
-        // one; otherwise the pane to the left.
+        // Equal-width heuristic: if the existing panes are all roughly
+        // equal-width, the user hasn't expressed any sizing preference
+        // (or has dragged back to balance) — redistribute evenly across
+        // (n+1) panes so the new pane joins on equal footing.
+        //
+        // Otherwise the user has shifted dividers to a particular
+        // layout — preserve their intent by halving only the donor pane
+        // (the one whose space the new pane displaces). All other panes
+        // keep their widths.
+        if Self.nearlyEqual(paneWidths) {
+            panes.insert(newPane, at: index)
+            paneWidths = Self.evenWidths(count: panes.count)
+            return
+        }
+
         let donorIdx = (index < panes.count) ? index : max(0, panes.count - 1)
         if !paneWidths.indices.contains(donorIdx) {
             // Empty / inconsistent state — fall back to even widths
@@ -339,6 +364,17 @@ struct WorkspaceState: Codable, Equatable {
             let fallbackIdx = min(index, panes.count - 1)
             activePaneId = panes[fallbackIdx].id
         }
+    }
+
+    /// True iff every width is within `tolerance` of the first.
+    /// Used by `insertPaneInternal` to switch between even-redistribute
+    /// (panes were balanced — no expressed user intent) and donor-halve
+    /// (panes were imbalanced — preserve the user's chosen layout).
+    /// Tolerance of 0.01 covers small float drift from drag-back-to-
+    /// balance while still tripping on any meaningful imbalance (≥1%).
+    private static func nearlyEqual(_ widths: [Double], tolerance: Double = 0.01) -> Bool {
+        guard let first = widths.first else { return true }
+        return widths.allSatisfy { abs($0 - first) <= tolerance }
     }
 
     private static func evenWidths(count: Int) -> [Double] {

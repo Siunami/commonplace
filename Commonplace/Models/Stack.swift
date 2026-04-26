@@ -9,6 +9,14 @@ struct Stack: Codable, FetchableRecord, PersistableRecord, Identifiable, Equatab
     var updatedAt: Double
     var isPinned: Bool
 
+    // v26 origin metadata — populated when the stack is created from a
+    // workspace canvas selection. Snapshot is JSON: [{cardId, x, y, w, h}]
+    // frozen at create time so "View origin arrangement" can return to
+    // the moment the relation was first seen, even if the cards are
+    // moved afterwards.
+    var originWorkspaceId: String? = nil
+    var originArrangementSnapshot: String? = nil
+
     static let databaseTableName = "stack"
 
     enum CodingKeys: String, CodingKey {
@@ -18,6 +26,8 @@ struct Stack: Codable, FetchableRecord, PersistableRecord, Identifiable, Equatab
         case createdAt
         case updatedAt
         case isPinned
+        case originWorkspaceId
+        case originArrangementSnapshot
     }
 
     var isNamed: Bool {

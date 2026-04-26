@@ -100,7 +100,29 @@ struct AllViewFilterBar: View {
                 onRemove: { activeFilters.apps.remove(app) }
             ))
         }
+        // URL pills land here when the user adds them via the "filter
+        // by this URL" funnel on a card-detail metadata chip. Display
+        // label is the host (e.g. `youtube.com`) since full URLs are
+        // too long for a pill; full value lives in `activeFilters.urls`
+        // and drives the SQL.
+        let orderedURLs = activeFilters.urls.sorted()
+        for url in orderedURLs {
+            pills.append(FilterPillModel(
+                id: "url:\(url)",
+                icon: .symbol("link"),
+                label: Self.urlPillLabel(url),
+                onRemove: { activeFilters.urls.remove(url) }
+            ))
+        }
         return pills
+    }
+
+    /// Strips scheme + path so the URL fits in a pill. Falls back to
+    /// the original string when parsing fails (rare — `sourceUrl`
+    /// values come from system pasteboard / browser AS at capture time).
+    private static func urlPillLabel(_ raw: String) -> String {
+        guard let host = URL(string: raw)?.host else { return raw }
+        return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
     }
 
     // MARK: - Add trigger

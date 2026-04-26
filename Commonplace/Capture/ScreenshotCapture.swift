@@ -13,6 +13,11 @@ final class ScreenshotCapture {
         let screenshotId: Int64?
         let ocrText: String?
         let context: CaptureContext
+        /// Full list of apps with visible pixels inside the capture
+        /// region, ordered by visible area descending. Empty when the
+        /// capture didn't go through the source resolver (paste paths).
+        /// JSON-encoded form lives on Highlight + ScreenshotRecord.
+        let sources: [ScreenshotSource]
     }
 
     private let db = DatabaseManager.shared
@@ -72,9 +77,16 @@ final class ScreenshotCapture {
                 configuration: config
             )
 
+            // Resolve every app whose visible pixels land inside the
+            // captured region. Full-screen captures use the display's
+            // global frame as the region — global coords match SCWindow.frame.
+            let displayFrame = displayGlobalFrame(for: targetDisplayID)
+            let sources = ScreenshotSources.resolve(rect: displayFrame, windows: content.windows)
+
             let result = await saveAndOCR(
                 image: image, captureType: "full",
-                displayId: targetDisplayID, context: context
+                displayId: targetDisplayID, context: context,
+                sources: sources
             )
             ScreenRecordingPermission.recordCaptureSuccess()
             return result
@@ -83,6 +95,20 @@ final class ScreenshotCapture {
             ScreenRecordingPermission.recordCaptureFailure()
             return nil
         }
+    }
+
+    /// Display frame in the global screen coordinate space — the same
+    /// space `SCWindow.frame` lives in. Falls back to the display's
+    /// own pixel size at origin when the display id can't be matched
+    /// to an `NSScreen` (rare; handles displays disconnected mid-flow).
+    private func displayGlobalFrame(for displayID: CGDirectDisplayID) -> CGRect {
+        for screen in NSScreen.screens {
+            guard let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID,
+                  id == displayID else { continue }
+            return screen.frame
+        }
+        let bounds = CGDisplayBounds(displayID)
+        return bounds
     }
 
     func captureRegion(
@@ -154,10 +180,21 @@ final class ScreenshotCapture {
             // Encode capture rect as JSON for storage
             let rectJSON = "{\"x\":\(rect.origin.x),\"y\":\(rect.origin.y),\"width\":\(rect.width),\"height\":\(rect.height)}"
 
+            // Resolve every app with visible pixels in the captured
+            // region — uses the same window list and overlay-exclusion
+            // set we already built for the SCContentFilter.
+            let excludedSet = Set(excludingWindowIDs)
+            let sources = ScreenshotSources.resolve(
+                rect: rect,
+                windows: content.windows,
+                excluding: excludedSet
+            )
+
             let result = await saveAndOCR(
                 image: cropped, captureType: "region",
                 displayId: displayID, context: resolvedContext,
-                captureRect: rectJSON, scaleFactor: Double(scaleX)
+                captureRect: rectJSON, scaleFactor: Double(scaleX),
+                sources: sources
             )
             ScreenRecordingPermission.recordCaptureSuccess()
             return result
@@ -176,11 +213,15 @@ final class ScreenshotCapture {
     /// id as a placeholder (clipboard images don't have a meaningful originating
     /// display).
     func saveClipboardImage(image: CGImage, context: CaptureContext) async -> CaptureResult? {
+        // Pasted images don't have a capture region we could resolve
+        // sources from — leave the source list empty so the column
+        // stores nothing for these rows.
         return await saveAndOCR(
             image: image,
             captureType: "paste",
             displayId: CGMainDisplayID(),
-            context: context
+            context: context,
+            sources: []
         )
     }
 
@@ -189,7 +230,8 @@ final class ScreenshotCapture {
     private func saveAndOCR(
         image: CGImage, captureType: String,
         displayId: CGDirectDisplayID, context: CaptureContext,
-        captureRect: String? = nil, scaleFactor: Double? = nil
+        captureRect: String? = nil, scaleFactor: Double? = nil,
+        sources: [ScreenshotSource] = []
     ) async -> CaptureResult? {
         let now = Date()
         let dayString = Self.dayFormatter.string(from: now)
@@ -208,6 +250,7 @@ final class ScreenshotCapture {
         let fileSize = (try? FileManager.default.attributesOfItem(atPath: filePath.path))?[.size] as? Int64 ?? 0
 
         let ocrText = await TextExtractor.shared.extract(from: image)
+        let sourcesJSON = ScreenshotSources.encodeJSON(sources)
 
         var record = ScreenshotRecord(
             timestamp: now.timeIntervalSince1970,
@@ -222,18 +265,20 @@ final class ScreenshotCapture {
             captureRect: captureRect,
             scaleFactor: scaleFactor,
             imageWidth: image.width,
-            imageHeight: image.height
+            imageHeight: image.height,
+            sources: sourcesJSON
         )
         db.insertScreenshot(&record)
 
-        CaptureLog.info("Screenshot saved: \(captureType), display: \(displayId), window: \(context.windowTitle ?? "nil")")
+        CaptureLog.info("Screenshot saved: \(captureType), display: \(displayId), window: \(context.windowTitle ?? "nil"), sources: \(sources.count)")
 
         return CaptureResult(
             cgImage: image,
             filePath: filePath.path,
             screenshotId: record.id,
             ocrText: ocrText,
-            context: context
+            context: context,
+            sources: sources
         )
     }
 

@@ -21,6 +21,12 @@ struct ScreenshotRecord: Codable, FetchableRecord, MutablePersistableRecord, Ide
     var imageWidth: Int?
     var imageHeight: Int?
 
+    // v27 multi-source attribution. JSON-encoded [ScreenshotSource]
+    // listing every app with visible pixels in the capture region,
+    // ordered by visible area descending. Nullable for compatibility
+    // with paste-image flows and historical rows.
+    var sources: String?
+
     static let databaseTableName = "screenshot"
 
     mutating func didInsert(_ inserted: InsertionSuccess) {

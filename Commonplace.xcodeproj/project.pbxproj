@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		6584BD802F64BD8200AFA3B8 /* GRDB in Frameworks */ = {isa = PBXBuildFile; productRef = 6584BD822F64BD8200AFA3B8 /* GRDB */; };
+		F0F0F0F0F0F0F0F0F0F0F001 /* MarkdownUI in Frameworks */ = {isa = PBXBuildFile; productRef = F0F0F0F0F0F0F0F0F0F0F003 /* MarkdownUI */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -57,6 +58,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				6584BD802F64BD8200AFA3B8 /* GRDB in Frameworks */,
+				F0F0F0F0F0F0F0F0F0F0F001 /* MarkdownUI in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -118,6 +120,7 @@
 			name = Commonplace;
 			packageProductDependencies = (
 				6584BD822F64BD8200AFA3B8 /* GRDB */,
+				F0F0F0F0F0F0F0F0F0F0F003 /* MarkdownUI */,
 			);
 			productName = Commonplace;
 			productReference = 6584BD462F64BD8100AFA3B8 /* Commonplace.app */;
@@ -203,6 +206,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				6584BD812F64BD8200AFA3B8 /* XCRemoteSwiftPackageReference "GRDB.swift" */,
+				F0F0F0F0F0F0F0F0F0F0F002 /* XCRemoteSwiftPackageReference "swift-markdown-ui" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 6584BD472F64BD8100AFA3B8 /* Products */;
@@ -600,6 +604,14 @@
 				minimumVersion = 6.24.0;
 			};
 		};
+		F0F0F0F0F0F0F0F0F0F0F002 /* XCRemoteSwiftPackageReference "swift-markdown-ui" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/gonzalezreal/swift-markdown-ui";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.4.0;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -607,6 +619,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 6584BD812F64BD8200AFA3B8 /* XCRemoteSwiftPackageReference "GRDB.swift" */;
 			productName = GRDB;
+		};
+		F0F0F0F0F0F0F0F0F0F0F003 /* MarkdownUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = F0F0F0F0F0F0F0F0F0F0F002 /* XCRemoteSwiftPackageReference "swift-markdown-ui" */;
+			productName = MarkdownUI;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

@@ -1132,6 +1132,26 @@ final class DatabaseManager {
         }) ?? false
     }
 
+    /// Most-recent highlight whose `contentHash` matches `hash`,
+    /// regardless of type. The workspace canvas's paste handler uses
+    /// this to **link** a pasted card to the existing archive entry
+    /// (the clipboard monitor likely captured the same text already
+    /// as a `copy` highlight) instead of creating a duplicate. Type
+    /// is intentionally ignored so a paste that matches an earlier
+    /// inline note also dedupes; if the user wants stricter behavior
+    /// later we can add a type filter.
+    func highlightByContentHash(_ hash: String) -> Highlight? {
+        guard let dbQueue, !hash.isEmpty else { return nil }
+        return try? dbQueue.read { db in
+            try Highlight.fetchOne(db, sql: """
+                SELECT * FROM highlight
+                WHERE contentHash = ?
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """, arguments: [hash])
+        }
+    }
+
     // MARK: - Tags
 
     func findOrCreateTag(name: String) -> Tag? {

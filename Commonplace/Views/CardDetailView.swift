@@ -4,6 +4,44 @@ import PDFKit
 import Quartz
 import Combine
 
+/// One "filter the All view by this metadata value" intent surfaced by
+/// the CardDetailView funnel buttons. Generic so adding more facets
+/// (bundleId, document path, source-context entries) is just a new case.
+enum CardDetailFilter {
+    case app(String)
+    case url(String)
+}
+
+/// Compact funnel button shared by every CardDetailView metadata chip
+/// that supports "filter the All view by this value." Hover-revealed by
+/// the parent so it doesn't sit as constant chrome on the chip; the
+/// button itself stays styled identically across chip types so the
+/// affordance reads as one consistent vocabulary.
+struct FilterByFunnelButton: View {
+    let help: String
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "line.3.horizontal.decrease.circle")
+                .font(.system(size: 13, weight: .regular))
+                .foregroundStyle(isHovered ? Color.accentColor : Color.secondary)
+                .frame(width: 22, height: 22)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(Color.primary.opacity(isHovered ? 0.08 : 0))
+                )
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.10)) { isHovered = hovering }
+        }
+    }
+}
+
 // MARK: - Card Detail View
 
 struct CardDetailView: View {
@@ -31,6 +69,17 @@ struct CardDetailView: View {
     /// All tab, and scroll-snaps the archive to this highlight's row.
     /// Nil → the affordance is hidden.
     var onRevealInAll: ((Highlight) -> Void)?
+    /// Callback invoked when the user clicks a "filter All view by this
+    /// attribute" funnel on a metadata chip in the Source section. The
+    /// host adds the value to `activeFilters`, dismisses the modal, and
+    /// brings the All tab forward. Nil → funnels are hidden.
+    var onAddFilter: ((CardDetailFilter) -> Void)?
+    /// Workspace id when this detail was opened from a workspace canvas.
+    /// Threaded into `deriveFromSelection` so a derived card auto-places
+    /// near the parent on the same canvas. Nil for non-workspace surfaces
+    /// (the derivation still writes the highlight, just without a
+    /// placement).
+    var inWorkspaceId: String? = nil
     @State private var image: NSImage?
     @State private var screenshotHovered = false
     @State private var fileImageHovered = false
@@ -54,6 +103,16 @@ struct CardDetailView: View {
     /// single synchronous block collapses the arrival into one clean
     /// render. Reset on `.task` so arrow-key siblings start fresh.
     @State private var isReady = false
+
+    /// Live selection range inside the prose body's NSTextView. Drives
+    /// the enabled-state of the Derive shortcut + the range we hand to
+    /// `HighlightCapture.deriveFromSelection` when the user invokes
+    /// derive (floating button, right-click, or shortcut).
+    @State private var selectedTextRange: NSRange = NSRange(location: 0, length: 0)
+    /// Bounding rect of the current selection in the prose text view's
+    /// local coordinates. Drives the floating "Create card" affordance
+    /// that anchors above the selection. Nil when nothing is selected.
+    @State private var selectedTextRect: CGRect? = nil
 
     // Video playback — controller is shared with whichever video player
     // renders (recording vs. file-video). Used to capture the current time
@@ -109,6 +168,7 @@ struct CardDetailView: View {
         }
         .frame(minWidth: 520, idealWidth: 740, maxWidth: .infinity, minHeight: 420, idealHeight: 720, maxHeight: .infinity)
         .background(arrowNavShortcuts)
+        .background(deriveShortcut)
         .task(id: highlight.id) {
             await loadAllAndCommit()
         }
@@ -151,59 +211,90 @@ struct CardDetailView: View {
         isReady = true
     }
 
-    /// Extracted so the gating `if isReady { ... }` stays readable. This
-    /// is the original scroll body — no behavioral changes.
+    /// Width cap for the reading column. Long-form prose past ~720pt
+    /// becomes hard to track from line to line; capping here gives the
+    /// detail view a consistent measure regardless of window width and
+    /// echoes the masonry's column rhythm.
+    private static let contentMaxWidth: CGFloat = 720
+
+    /// Vertical breathing room between the primary content + notes
+    /// (tight, since they're one unit of thought) and the reference
+    /// sections below (loose, since they're ancillary metadata).
+    private static let referenceSpacing: CGFloat = 40
+
+    /// Extracted so the gating `if isReady { ... }` stays readable.
     @ViewBuilder
     private var readyContent: some View {
-        VStack(alignment: .leading, spacing: UITokens.sectionSpacing) {
-            if isScreenshot {
-                if let image {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(maxWidth: .infinity)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                        .overlay(alignment: .topTrailing) {
-                            if let onImageFullscreen {
-                                ExpandImageButton(isHovered: screenshotHovered) {
-                                    onImageFullscreen(image)
-                                }
-                            }
-                        }
-                        .onHover { screenshotHovered = $0 }
-                        .onTapGesture { onImageFullscreen?(image) }
-                }
-            } else if isRecording {
-                recordingDetailContent
-            } else if isFile {
-                fileDetailContent
-            } else if highlight.isURLCopy {
-                if highlight.fileId != nil {
-                    downloadedFileLinkContent
-                } else {
-                    linkDetailContent
-                }
-            } else {
-                // Copied text — styled as a clipping, sized to read as
-                // the primary content. Everything else on the page is
-                // deliberately quieter so this stays center stage.
-                HStack(alignment: .top, spacing: 14) {
-                    RoundedRectangle(cornerRadius: 1.5)
-                        .fill(Color.primary.opacity(0.15))
-                        .frame(width: 3)
-
-                    Text(highlight.contentText)
-                        .font(.system(size: 18, design: .serif))
-                        .lineSpacing(4)
-                        .foregroundStyle(.primary.opacity(0.92))
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+        // Two stacks: a tight primary stack (content + notes) and a
+        // looser reference stack below. Both centered within the same
+        // 720pt column — the eye reads top-to-bottom in one measure
+        // without having to re-anchor when the window stretches wide.
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 16) {
+                primaryContent
+                notesTimeline
             }
 
-            notesTimeline
+            ancillaryContent
+                .padding(.top, Self.referenceSpacing)
+        }
+        .frame(maxWidth: Self.contentMaxWidth, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 24)
+    }
 
+    @ViewBuilder
+    private var primaryContent: some View {
+        if isScreenshot {
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(alignment: .topTrailing) {
+                        if let onImageFullscreen {
+                            ExpandImageButton(isHovered: screenshotHovered) {
+                                onImageFullscreen(image)
+                            }
+                        }
+                    }
+                    .onHover { screenshotHovered = $0 }
+                    .onTapGesture { onImageFullscreen?(image) }
+            }
+        } else if isRecording {
+            recordingDetailContent
+        } else if isFile {
+            fileDetailContent
+        } else if highlight.isURLCopy {
+            if highlight.fileId != nil {
+                downloadedFileLinkContent
+            } else {
+                linkDetailContent
+            }
+        } else {
+            // Copied text — IS the primary content. Rendered as a
+            // selectable NSTextView so the user can pick a passage and
+            // derive a new card from it (Phase D). The serif/line-spacing
+            // mirrors `.commonplace` so the visual reading rhythm stays
+            // consistent with screenshot/file detail bodies.
+            SelectableProseTextView(
+                text: highlight.contentText,
+                selectedRange: $selectedTextRange,
+                selectedRect: $selectedTextRect,
+                onDeriveSelection: { range in
+                    deriveAndShowToast(range: range)
+                }
+            )
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .overlay(alignment: .topLeading) { selectionDeriveButton }
+        }
+    }
+
+    @ViewBuilder
+    private var ancillaryContent: some View {
+        VStack(alignment: .leading, spacing: UITokens.sectionSpacing) {
             if isScreenshot, let screenshotId = highlight.screenshotId,
                let screenshot = DatabaseManager.shared.screenshot(byId: screenshotId),
                let ocrText = screenshot.ocrText, !ocrText.isEmpty {
@@ -222,7 +313,104 @@ struct CardDetailView: View {
 
             sourceSection
         }
-        .padding(20)
+    }
+
+    /// ⌘⇧D — derive a new card from the currently-selected text. Only
+    /// fires when the prose body has a non-empty selection; otherwise
+    /// the button is disabled so the shortcut falls through to anything
+    /// else that might want it.
+    @ViewBuilder
+    private var deriveShortcut: some View {
+        Button("") {
+            deriveAndShowToast(range: selectedTextRange)
+        }
+        .keyboardShortcut("d", modifiers: [.command, .shift])
+        .disabled(selectedTextRange.length == 0)
+        .opacity(0)
+        .accessibilityHidden(true)
+        .frame(width: 0, height: 0)
+    }
+
+    /// Floating affordance that hovers over the active selection in the
+    /// prose body. Anchored to the top edge of the selection rect so it
+    /// reads as "act on this passage" — the same convention browser
+    /// translation/quote popovers use. Hidden when nothing is selected.
+    @ViewBuilder
+    private var selectionDeriveButton: some View {
+        if selectedTextRange.length > 0, let rect = selectedTextRect {
+            Button {
+                deriveAndShowToast(range: selectedTextRange)
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "rectangle.stack.badge.plus")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("Create card")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5)
+                .background(
+                    Capsule().fill(Color.accentColor)
+                )
+                .overlay(
+                    Capsule().strokeBorder(Color.black.opacity(0.15), lineWidth: 0.5)
+                )
+                .shadow(color: .black.opacity(0.18), radius: 3, y: 1)
+            }
+            .buttonStyle(.plain)
+            .help("Create a new card from this excerpt (⌘⇧D)")
+            .offset(
+                x: max(0, rect.midX - 56),
+                y: max(0, rect.minY - 30)
+            )
+            .transition(.opacity.combined(with: .scale(scale: 0.92, anchor: .bottom)))
+        }
+    }
+
+    /// Write the derived card and surface the same copy-toast affordance
+    /// the rest of the capture paths use, so deriving feels like any
+    /// other capture event (with the bottom-right thumbnail + note
+    /// composer). Provenance shown on the toast snapshots from the
+    /// parent — the persisted highlight stores the same values in
+    /// `inheritedProvenance` via `HighlightCapture.deriveFromSelection`.
+    private func deriveAndShowToast(range: NSRange) {
+        guard range.length > 0 else { return }
+        guard let newId = HighlightCapture.shared.deriveFromSelection(
+            parent: highlight,
+            range: range,
+            inWorkspaceId: inWorkspaceId
+        ) else { return }
+
+        let ns = highlight.contentText as NSString
+        let safeEnd = min(range.location + range.length, ns.length)
+        let safeStart = min(range.location, safeEnd)
+        let safeRange = NSRange(location: safeStart, length: safeEnd - safeStart)
+        let excerpt = ns.substring(with: safeRange) as String
+
+        // Toast's annotation submit normally finds an existing
+        // AnnotationStore entry — create one for the derived card so
+        // notes typed in the toast persist alongside the highlight.
+        AnnotationStore.shared.save(AnnotationEntry(
+            id: newId,
+            content: excerpt,
+            timestamp: Date().timeIntervalSince1970,
+            sourceApp: highlight.sourceApp,
+            type: "note",
+            annotation: nil
+        ))
+
+        CopyToastController.shared.show(
+            content: excerpt,
+            entryId: newId,
+            sourceUrl: highlight.sourceUrl,
+            sourceApp: highlight.sourceApp,
+            windowTitle: highlight.windowTitle,
+            onAnnotation: { id, note in
+                AnnotationStore.shared.updateAnnotation(id: id, note: note)
+                DatabaseManager.shared.addNoteToHighlight(highlightId: id, body: note)
+            }
+        )
     }
 
     /// Invisible keyboard-shortcut buttons for arrow-key gallery
@@ -446,16 +634,41 @@ struct CardDetailView: View {
         let showApp = (app?.isEmpty == false)
         // `page_url` is already rendered via EmbeddedLinkPreview.
         let contextEntries = highlight.decodedSourceContext.filter { $0.key != "page_url" }
+        // Extra sources (everything beyond the primary). The primary is
+        // already covered by `AppSourceBadge` above — we're filling in
+        // the other apps that contributed visible pixels to this
+        // screenshot's region.
+        let extraSources = highlight.decodedSources.dropFirst()
 
-        if showURL || showApp || !contextEntries.isEmpty {
+        if showURL || showApp || !contextEntries.isEmpty || !extraSources.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 SectionLabel(text: "Source")
                 VStack(alignment: .leading, spacing: 8) {
                     if showURL, let url {
-                        EmbeddedLinkPreview(urlString: url)
+                        EmbeddedLinkPreview(
+                            urlString: url,
+                            onAddFilter: onAddFilter.map { handler in
+                                { handler(.url(url)) }
+                            }
+                        )
                     }
                     if showApp, let app {
-                        AppSourceBadge(appName: app, bundleId: highlight.bundleId)
+                        AppSourceBadge(
+                            appName: app,
+                            bundleId: highlight.bundleId,
+                            onAddFilter: onAddFilter.map { handler in
+                                { handler(.app(app)) }
+                            }
+                        )
+                    }
+                    ForEach(Array(extraSources.enumerated()), id: \.offset) { _, source in
+                        AppSourceBadge(
+                            appName: source.name ?? "Unknown",
+                            bundleId: source.bundleId,
+                            onAddFilter: onAddFilter.flatMap { handler in
+                                source.name.map { name in { handler(.app(name)) } }
+                            }
+                        )
                     }
                     ForEach(contextEntries, id: \.key) { entry in
                         ContextualSourceRow(entry: entry)
@@ -472,32 +685,38 @@ struct CardDetailView: View {
 
     // MARK: - Notes
 
+    /// Notes attached to this highlight. Sit visually flush with the
+    /// primary content (no SectionLabel, tight top spacing) — they're a
+    /// continuation of the same unit of thought, not a sibling section.
+    /// Each note carries the marginalia treatment used elsewhere in the
+    /// app: thin neutral left rule, italic serif body at 0.7 opacity.
     @ViewBuilder
     private var notesTimeline: some View {
         if !notes.isEmpty {
-            VStack(alignment: .leading, spacing: 8) {
-                SectionLabel(text: "Notes")
-
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(notes) { note in
-                        NoteRow(
-                            note: note,
-                            onDelete: { deleteNote(note) },
-                            onTimestampTap: isVideoHighlight ? { seconds in
-                                videoController.seek(to: seconds)
-                            } : nil
-                        )
-                    }
+            VStack(alignment: .leading, spacing: 12) {
+                ForEach(notes) { note in
+                    NoteRow(
+                        note: note,
+                        onDelete: { deleteNote(note) },
+                        onTimestampTap: isVideoHighlight ? { seconds in
+                            videoController.seek(to: seconds)
+                        } : nil
+                    )
                 }
             }
+            .padding(.top, 4)
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
+    /// Footer composer for adding a new note. Sits visually below the
+    /// reading column at the same width so the input lines up with the
+    /// notes above it. Buttons are quieter than before — small, idle
+    /// tertiary, accent only when there's content to send.
     private var noteInput: some View {
-        HStack(alignment: .center, spacing: 10) {
-            TextField("Add a note...", text: $newNoteText, axis: .vertical)
+        HStack(alignment: .center, spacing: 8) {
+            TextField("Add a note…", text: $newNoteText, axis: .vertical)
                 .font(.system(size: 13))
                 .textFieldStyle(.plain)
                 .lineLimit(1...5)
@@ -511,26 +730,37 @@ struct CardDetailView: View {
                     return .handled
                 }
 
-            Button(action: clearNote) {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 18))
-                    .foregroundStyle(noteIsEmpty ? Color.gray.opacity(0.25) : Color.secondary)
+            if !noteIsEmpty {
+                Button(action: clearNote) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 18, height: 18)
+                        .background(Circle().fill(Color.primary.opacity(0.06)))
+                }
+                .buttonStyle(.plain)
+                .help("Clear")
+                .transition(.opacity)
             }
-            .buttonStyle(.plain)
-            .disabled(noteIsEmpty)
-            .help("Clear")
 
             Button(action: submitNote) {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 20))
-                    .foregroundStyle(noteIsEmpty ? Color.gray.opacity(0.3) : Color.accentColor)
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(noteIsEmpty ? Color.secondary.opacity(0.4) : Color.white)
+                    .frame(width: 22, height: 22)
+                    .background(
+                        Circle().fill(noteIsEmpty ? Color.primary.opacity(0.06) : Color.accentColor)
+                    )
             }
             .buttonStyle(.plain)
             .disabled(noteIsEmpty)
             .keyboardShortcut(.return, modifiers: .command)
-            .help("Add")
+            .help("Add note (⌘↵)")
         }
-        .padding(.horizontal, 14)
+        .animation(.easeInOut(duration: 0.12), value: noteIsEmpty)
+        .frame(maxWidth: Self.contentMaxWidth, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.horizontal, 24)
         .padding(.vertical, 10)
     }
 
@@ -900,6 +1130,13 @@ struct StableVideoPlayer: View {
 private struct AppSourceBadge: View {
     let appName: String
     let bundleId: String?
+    /// Optional "filter the All view by this app" affordance. When
+    /// supplied, a hover-revealed funnel button appears at the trailing
+    /// edge of the badge — clicking it adds an `apps` constraint to
+    /// `ActiveFilters` and dismisses the detail modal.
+    var onAddFilter: (() -> Void)? = nil
+
+    @State private var isHovered = false
 
     var body: some View {
         HStack(alignment: .center, spacing: 10) {
@@ -916,6 +1153,13 @@ private struct AppSourceBadge: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
+            if onAddFilter != nil {
+                FilterByFunnelButton(help: "Filter All view by \(appName)") {
+                    onAddFilter?()
+                }
+                .opacity(isHovered ? 1 : 0)
+                .allowsHitTesting(isHovered)
+            }
         }
         .padding(10)
         .background(
@@ -926,6 +1170,9 @@ private struct AppSourceBadge: View {
             RoundedRectangle(cornerRadius: 8)
                 .strokeBorder(Color.secondary.opacity(0.12), lineWidth: 0.5)
         )
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.12)) { isHovered = hovering }
+        }
     }
 
     @ViewBuilder
@@ -1198,3 +1445,178 @@ struct StackChip: View {
         }
     }
 }
+
+// MARK: - Derive-from-selection support
+
+/// Selectable prose body for `CardDetailView`. Wraps an `NSTextView` so
+/// the user's selection is observable (SwiftUI's `.textSelection(.enabled)`
+/// hides the range from us) — derive-from-selection needs the live
+/// (location, length) tuple. Inline markdown (bold/italic/links) is
+/// rendered via `NSAttributedString.markdown`; block-level features the
+/// MarkdownUI theme used to render are flattened to plain serif body
+/// since this is the surface we need selection access on.
+struct SelectableProseTextView: NSViewRepresentable {
+    let text: String
+    @Binding var selectedRange: NSRange
+    @Binding var selectedRect: CGRect?
+    var onDeriveSelection: (NSRange) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeNSView(context: Context) -> SelectableProseNSTextView {
+        let textView = SelectableProseNSTextView()
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.backgroundColor = .clear
+        textView.textContainerInset = .zero
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.maxSize = CGSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.heightTracksTextView = false
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.delegate = context.coordinator
+        textView.onDeriveSelection = { [weak coordinator = context.coordinator] in
+            guard let coordinator else { return }
+            coordinator.parent.onDeriveSelection(textView.selectedRange())
+        }
+        textView.textStorage?.setAttributedString(Self.attributed(from: text))
+        return textView
+    }
+
+    func updateNSView(_ textView: SelectableProseNSTextView, context: Context) {
+        // Keep a reference back to the latest parent so the closure
+        // captured at make-time still hits the current SwiftUI state.
+        context.coordinator.parent = self
+        textView.onDeriveSelection = { [weak coordinator = context.coordinator] in
+            guard let coordinator else { return }
+            coordinator.parent.onDeriveSelection(textView.selectedRange())
+        }
+        if textView.string != text {
+            textView.textStorage?.setAttributedString(Self.attributed(from: text))
+            textView.invalidateIntrinsicContentSize()
+        }
+    }
+
+    static func attributed(from text: String) -> NSAttributedString {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 4
+        paragraph.paragraphSpacing = 6
+        let serifDescriptor = NSFont.systemFont(ofSize: 18)
+            .fontDescriptor.withDesign(.serif) ?? NSFont.systemFont(ofSize: 18).fontDescriptor
+        let serifFont = NSFont(descriptor: serifDescriptor, size: 18)
+            ?? NSFont.systemFont(ofSize: 18)
+        let baseAttrs: [NSAttributedString.Key: Any] = [
+            .font: serifFont,
+            .foregroundColor: NSColor.labelColor.withAlphaComponent(0.92),
+            .paragraphStyle: paragraph
+        ]
+        // Inline-only markdown so newlines stay newlines (otherwise the
+        // markdown parser collapses them into prose paragraphs and the
+        // user sees their copied bullets and line breaks merged together).
+        let parsed: NSAttributedString
+        if let attr = try? NSAttributedString(
+            markdown: text,
+            options: AttributedString.MarkdownParsingOptions(
+                interpretedSyntax: .inlineOnlyPreservingWhitespace
+            )
+        ) {
+            parsed = attr
+        } else {
+            parsed = NSAttributedString(string: text)
+        }
+        let mutable = NSMutableAttributedString(attributedString: parsed)
+        mutable.addAttributes(
+            baseAttrs,
+            range: NSRange(location: 0, length: mutable.length)
+        )
+        return mutable
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: SelectableProseTextView
+        init(parent: SelectableProseTextView) { self.parent = parent }
+
+        func textViewDidChangeSelection(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            let range = textView.selectedRange()
+            let rect: CGRect? = {
+                guard range.length > 0,
+                      let layoutManager = textView.layoutManager,
+                      let textContainer = textView.textContainer else { return nil }
+                let glyphRange = layoutManager.glyphRange(
+                    forCharacterRange: range, actualCharacterRange: nil
+                )
+                let bounding = layoutManager.boundingRect(
+                    forGlyphRange: glyphRange, in: textContainer
+                )
+                let origin = textView.textContainerOrigin
+                return bounding.offsetBy(dx: origin.x, dy: origin.y)
+            }()
+            // SwiftUI state mutations during the AppKit selection
+            // callback occasionally trigger a "modifying state during
+            // view update" warning — bouncing through the main queue
+            // defers the write to the next runloop tick.
+            DispatchQueue.main.async {
+                self.parent.selectedRange = range
+                self.parent.selectedRect = rect
+            }
+        }
+
+        func textView(
+            _ view: NSTextView,
+            menu: NSMenu,
+            for event: NSEvent,
+            at charIndex: Int
+        ) -> NSMenu? {
+            guard view.selectedRange().length > 0 else { return menu }
+            let item = NSMenuItem(
+                title: "Create card from selection",
+                action: #selector(SelectableProseNSTextView.deriveFromSelectionAction(_:)),
+                keyEquivalent: "d"
+            )
+            item.keyEquivalentModifierMask = [.command, .shift]
+            item.target = view
+            menu.insertItem(item, at: 0)
+            menu.insertItem(NSMenuItem.separator(), at: 1)
+            return menu
+        }
+    }
+}
+
+/// `NSTextView` subclass that exposes its intrinsic content size so
+/// SwiftUI can lay it out in the scroll body, and routes the derive
+/// menu item back through a closure to the SwiftUI parent.
+final class SelectableProseNSTextView: NSTextView {
+    var onDeriveSelection: (() -> Void)?
+
+    override var intrinsicContentSize: NSSize {
+        guard let textContainer, let layoutManager else {
+            return super.intrinsicContentSize
+        }
+        layoutManager.ensureLayout(for: textContainer)
+        let used = layoutManager.usedRect(for: textContainer).size
+        return NSSize(width: NSView.noIntrinsicMetric, height: ceil(used.height))
+    }
+
+    override func didChangeText() {
+        super.didChangeText()
+        invalidateIntrinsicContentSize()
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        invalidateIntrinsicContentSize()
+    }
+
+    @objc func deriveFromSelectionAction(_ sender: Any?) {
+        onDeriveSelection?()
+    }
+}
+

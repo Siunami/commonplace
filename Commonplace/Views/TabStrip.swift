@@ -165,6 +165,11 @@ struct TabStrip: View {
             return "Settings"
         case .newTab:
             return "New tab"
+        case .workspace(let id):
+            if let ws = DatabaseManager.shared.workspace(byId: id) {
+                return ws.isNamed ? (ws.name ?? "Workspace") : "Unnamed workspace"
+            }
+            return "Workspace"
         }
     }
 
@@ -178,6 +183,8 @@ struct TabStrip: View {
             return "gear"
         case .newTab:
             return "plus"
+        case .workspace:
+            return "rectangle.split.3x3"
         }
     }
 

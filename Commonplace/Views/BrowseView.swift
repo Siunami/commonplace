@@ -6,6 +6,45 @@ import UniformTypeIdentifiers
 import PDFKit
 import Quartz
 import QuickLookThumbnailing
+import MarkdownUI
+
+// MARK: - Pinned floater placement
+
+/// Which edge of the workspace the pinned-stack floater sits against.
+/// Persisted via `@AppStorage` in `BrowseView`; toggled by tossing the
+/// floater past the flip threshold or via the right-click context menu.
+/// Which of the four corners of the archive surface the pinned-stack
+/// floater currently lives in. Persisted via `@AppStorage` under a new
+/// key (`pinnedFloaterCorner`) — existing users on the old two-state
+/// `pinnedFloaterSide` key get the new default `.bottomTrailing`, which
+/// matches their old `.trailing` behavior.
+enum FloaterCorner: String {
+    case topLeading
+    case topTrailing
+    case bottomLeading
+    case bottomTrailing
+
+    var alignment: Alignment {
+        switch self {
+        case .topLeading: return .topLeading
+        case .topTrailing: return .topTrailing
+        case .bottomLeading: return .bottomLeading
+        case .bottomTrailing: return .bottomTrailing
+        }
+    }
+
+    var hStackAlignment: HorizontalAlignment {
+        switch self {
+        case .topLeading, .bottomLeading: return .leading
+        case .topTrailing, .bottomTrailing: return .trailing
+        }
+    }
+
+    var isTop: Bool { self == .topLeading || self == .topTrailing }
+    var isBottom: Bool { self == .bottomLeading || self == .bottomTrailing }
+    var isLeading: Bool { self == .topLeading || self == .bottomLeading }
+    var isTrailing: Bool { self == .topTrailing || self == .bottomTrailing }
+}
 
 // MARK: - Search result highlighting
 
@@ -193,12 +232,11 @@ struct NoteRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(note.body)
-                    .font(.system(.title3, design: .serif))
-                    .foregroundStyle(.primary)
-                    .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 4) {
+                Markdown(note.body)
+                    .markdownTheme(.commonplaceMarginalia)
                     .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
                 HStack(spacing: 8) {
@@ -225,20 +263,21 @@ struct NoteRow: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-            .padding(.leading, 14)
+            .padding(.leading, 12)
             .overlay(alignment: .leading) {
-                // Accent bar as an overlay so it hugs the text block exactly —
-                // putting it as an HStack sibling let SwiftUI add slack.
-                RoundedRectangle(cornerRadius: 1.5)
-                    .fill(Color.orange.opacity(0.85))
-                    .frame(width: 2.5)
+                // Thin neutral bar — same marginalia treatment used by
+                // the timeline + stack list, so notes read as one
+                // consistent vocabulary across surfaces.
+                Rectangle()
+                    .fill(Color.primary.opacity(0.18))
+                    .frame(width: 1)
             }
 
             Button(action: onDelete) {
                 Image(systemName: "xmark")
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(.tertiary)
-                    .frame(width: 18, height: 18)
+                    .frame(width: 16, height: 16)
                     .background(Circle().fill(Color.primary.opacity(0.05)))
                     .opacity(isHovered ? 1 : 0)
             }
@@ -316,6 +355,13 @@ struct BrowseView: View {
     /// archive. Reset to empty whenever the modal opens from anywhere
     /// else (a non-stack tab) so the archive list takes over instead.
     @State private var modalSourceStackItems: [Highlight] = []
+    /// Workspace id threaded into `CardDetailView.inWorkspaceId` so a
+    /// Phase D derive-from-selection auto-places the new card on the
+    /// same canvas the parent was opened from. Set when the card is
+    /// opened from a workspace tab; cleared when opened from anywhere
+    /// else (archive, stack tab) so the derive flow doesn't
+    /// accidentally place into a workspace the user wasn't even viewing.
+    @State private var selectedHighlightWorkspaceId: String? = nil
     @State private var fullScreenImage: NSImage?
     @State private var footerBarFrame: CGRect = .zero
     /// Drawer state — a recent-stacks picker that slides in from the right
@@ -324,6 +370,18 @@ struct BrowseView: View {
     /// without navigating away from the current view.
     @State private var drawerOpen = false
     @State private var drawerHoverTask: Task<Void, Never>? = nil
+
+    /// Which side the pinned floater (and its drawer column) lands on.
+    /// Persisted across launches so the user's preference sticks.
+    /// Toggleable by tossing the floater past the threshold or via
+    /// the right-click context menu on the floater.
+    @AppStorage("pinnedFloaterCorner") private var pinnedFloaterCorner: FloaterCorner = .bottomTrailing
+    /// Live drag offset while the user is "tossing" the floater toward
+    /// the other side. Reset to zero (with a spring) on drag end —
+    /// either the side flipped (and we land at the new anchor) or the
+    /// drag was below threshold (and we snap back to where we started).
+    @State private var floaterDragOffset: CGSize = .zero
+    @State private var isDraggingFloater: Bool = false
     /// When non-nil, the stream was loaded as a windowed slice centered
     /// on this highlight — the user jumped here from a detail-view
     /// capture-event handle. Drives the "Back to newest" chip + changes
@@ -347,23 +405,27 @@ struct BrowseView: View {
     /// path's task slot. Bool is sufficient — only one upward fetch at
     /// a time, and we don't need to cancel it externally.
     @State private var newerLoadInFlight = false
-    /// True once the masonry has been scrolled past `backToNewestRevealOffset`
-    /// from the top. Drives `BackToNewestChip` visibility — hiding it while
-    /// the user is already at the top avoids redundant chrome.
+    /// True once the archive is scrolled past `backToTopRevealOffset`.
+    /// Drives the top-anchored Back-to-top pill (with its ⌘↑ shortcut
+    /// chip) — hidden while the user is already at the top so it doesn't
+    /// add chrome to the obvious case.
     @State private var isScrolledAwayFromTop = false
-    @AppStorage("browseViewMode") private var viewMode: BrowseViewMode = .mosaic
+    private let backToTopRevealOffset: CGFloat = 200
+
+    // (mosaic view was removed — All view is timeline-only)
+    // (sticky overlay header was removed — `ArchiveListView` uses native
+    // pinned section headers via `LazyVStack(pinnedViews:)`, so the
+    // sticky behaviour lives inside the scroll content rather than as a
+    // separate top-bar overlay. Eliminates the duplicate "current
+    // chunk" label that used to appear in both surfaces.)
+
     /// Smaller than you'd expect because MasonryLayout measures every
     /// subview on state change — 20 cards is the sweet spot where the
     /// first paint feels instant across searches. Infinite scroll fills
     /// in more as the user scrolls past the viewport.
     private let pageSize = 20
     private let jumpWindowSize = 75
-    /// Scroll offset (in pt, from the top) past which the "back to newest"
-    /// chip becomes eligible to show. Below this the user is effectively
-    /// already at the top — surfacing the chip would just be visual noise.
-    private let backToNewestRevealOffset: CGFloat = 200
-
-    /// The pinned stack rendered as a compact, intrinsic-sized floating tile
+/// The pinned stack rendered as a compact, intrinsic-sized floating tile
     /// anchored to the browse window's bottom-right corner. Sized by content
     /// (small square mosaic + label row) so it never dominates the window.
     /// The floater lives just above the footer bar, reuses the same card
@@ -379,7 +441,12 @@ struct BrowseView: View {
                 // Pinned stack tap opens a fresh tab in whichever
                 // pane is currently active. No teleport-to-existing.
                 workspaceState.openTab(.stack(id: pinned.id))
-            }
+            },
+            // Pinned floater is workspace chrome — accidentally
+            // grabbing it shouldn't kick off a CanvasDragItem(.stack)
+            // drag that lights up every stack/canvas drop target on
+            // the screen. The tap still opens the stack in a tab.
+            isDraggable: false
         )
         .overlay(alignment: .topTrailing) {
             StackUnpinBadge {
@@ -400,11 +467,88 @@ struct BrowseView: View {
             }
             .buttonStyle(.plain)
             .offset(x: -6, y: -6)
-            .help("Switch pinned stack")
+            .help(drawerOpen ? "Hide recent stacks" : "Show recent stacks")
         }
         .id("pinned-stack-\(pinned.id)")
-        .onHover { hovering in
-            handleFloaterHover(hovering)
+    }
+
+    /// Alignment for the floater overlay frame. Maps the four-corner
+    /// state directly to a SwiftUI `Alignment`.
+    private var pinnedFloaterAlignment: Alignment {
+        pinnedFloaterCorner.alignment
+    }
+
+    /// HStack alignment for the floater + drawer column. Mirrors the
+    /// frame alignment so the drawer's cards line up flush with the
+    /// floater on whichever side it's sitting.
+    private var pinnedFloaterHStackAlignment: HorizontalAlignment {
+        pinnedFloaterCorner.hStackAlignment
+    }
+
+    /// Drag-to-toss with 4-corner snap. The floater tracks the cursor
+    /// freely in 2D during the drag; on release we project where the
+    /// floater would *end up* if it kept moving with its current
+    /// velocity (`predictedEndTranslation` — SwiftUI rolls the velocity
+    /// into a residual translation) and snap to whichever screen
+    /// quadrant that predicted center lands in. So a drag that ends
+    /// slightly left of center but flicks rightward lands on a right
+    /// corner, matching the user's spatial intent rather than the
+    /// raw release point.
+    private func floaterDragGesture(in containerSize: CGSize) -> some Gesture {
+        DragGesture(minimumDistance: 8)
+            .onChanged { value in
+                if !isDraggingFloater {
+                    isDraggingFloater = true
+                    if drawerOpen {
+                        withAnimation(.easeInOut(duration: 0.15)) { drawerOpen = false }
+                    }
+                }
+                // Track the full 2D translation — the floater follows
+                // the cursor anywhere on the surface.
+                floaterDragOffset = value.translation
+            }
+            .onEnded { value in
+                let currentAnchor = Self.floaterAnchor(for: pinnedFloaterCorner, in: containerSize)
+                let predictedCenter = CGPoint(
+                    x: currentAnchor.x + value.predictedEndTranslation.width,
+                    y: currentAnchor.y + value.predictedEndTranslation.height
+                )
+                let nextCorner = Self.nearestFloaterCorner(to: predictedCenter, in: containerSize)
+                withAnimation(.spring(response: 0.45, dampingFraction: 0.78)) {
+                    pinnedFloaterCorner = nextCorner
+                    floaterDragOffset = .zero
+                }
+                isDraggingFloater = false
+            }
+    }
+
+    /// Approximate on-screen center of the floater while at `corner`.
+    /// `pad + half` accounts for the corner padding the overlay applies
+    /// plus half the floater's footprint, giving a reasonable anchor
+    /// for the predicted-center quadrant test.
+    private static func floaterAnchor(for corner: FloaterCorner, in size: CGSize) -> CGPoint {
+        let pad: CGFloat = 24
+        let half: CGFloat = 60
+        switch corner {
+        case .topLeading:     return CGPoint(x: pad + half, y: pad + half)
+        case .topTrailing:    return CGPoint(x: size.width - pad - half, y: pad + half)
+        case .bottomLeading:  return CGPoint(x: pad + half, y: size.height - pad - half)
+        case .bottomTrailing: return CGPoint(x: size.width - pad - half, y: size.height - pad - half)
+        }
+    }
+
+    /// Pick the corner whose quadrant contains the predicted center.
+    /// Velocity-weighting falls out naturally because the caller passes
+    /// `currentAnchor + predictedEndTranslation`, and predicted-end
+    /// already factors in residual velocity.
+    private static func nearestFloaterCorner(to point: CGPoint, in size: CGSize) -> FloaterCorner {
+        let isLeft = point.x < size.width / 2
+        let isTop = point.y < size.height / 2
+        switch (isLeft, isTop) {
+        case (true, true):   return .topLeading
+        case (false, true):  return .topTrailing
+        case (true, false):  return .bottomLeading
+        case (false, false): return .bottomTrailing
         }
     }
 
@@ -545,7 +689,7 @@ struct BrowseView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .workspaceCommandCloseActiveTab).receive(on: DispatchQueue.main)) { _ in
             guard let pane = workspaceState.activePane else { return }
-            workspaceState.closeTab(paneId: pane.id, tabId: pane.activeTabId)
+            pruneIfClosedWorkspace(workspaceState.closeTab(paneId: pane.id, tabId: pane.activeTabId))
         }
         .onReceive(NotificationCenter.default.publisher(for: .workspaceCommandNextTab).receive(on: DispatchQueue.main)) { _ in
             shiftActiveTab(by: 1)
@@ -645,48 +789,7 @@ struct BrowseView: View {
             loadCaptures(reset: true)
             withAnimation(.easeInOut(duration: 0.2)) { selectedHighlight = highlight }
         }
-        .overlay {
-            if let highlight = selectedHighlight {
-                ZStack {
-                    Color.black.opacity(0.3)
-                        .ignoresSafeArea()
-                        .onTapGesture { dismissHighlight() }
-
-                    CardDetailView(
-                        highlight: highlight,
-                        onDismiss: { dismissHighlight() },
-                        onStackNavigation: { stack in
-                            withAnimation(.easeInOut(duration: 0.2)) {
-                                selectedHighlight = nil
-                                modalSourceStackItems = []
-                            }
-                            workspaceState.openTab(.stack(id: stack.id))
-                        },
-                        onImageFullscreen: { image in
-                            withAnimation(.easeInOut(duration: 0.2)) { fullScreenImage = image }
-                        },
-                        siblings: siblings(for: highlight),
-                        onNavigate: { sibling in
-                            selectedHighlight = sibling
-                        },
-                        onJumpTo: { target in
-                            jumpToHighlight(target)
-                        },
-                        onRevealInAll: { target in
-                            revealInAll(target)
-                        }
-                    )
-                        .id(highlight.id)
-                        .frame(maxWidth: 700, maxHeight: .infinity)
-                        .background(Color(.windowBackgroundColor))
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                        .shadow(color: .black.opacity(0.25), radius: 16, y: 4)
-                        .padding(40)
-                }
-                .transition(.opacity)
-                .onExitCommand { dismissHighlight() }
-            }
-        }
+        .overlay { cardDetailOverlay }
         .overlay {
             if let image = fullScreenImage {
                 FullImageViewer(
@@ -704,41 +807,43 @@ struct BrowseView: View {
         // The column (when open) sits directly above the floater in the
         // same VStack so it reads as "more pinned-style tiles stacked
         // above the pinned one," like messages rising from a chat input.
-        .overlay(alignment: .bottomTrailing) {
+        // Side (leading vs trailing) is user-toggleable — drag the
+        // floater past the threshold toward the other edge to "toss"
+        // it across; persists in @AppStorage.
+        .overlay(alignment: pinnedFloaterAlignment) {
             if let pinned = pinnedStack {
                 GeometryReader { geo in
-                    VStack(alignment: .trailing, spacing: 8) {
-                        if drawerOpen {
-                            StackDrawer(
-                                currentPinnedId: pinned.id,
-                                maxColumnHeight: max(
-                                    120,
-                                    geo.size.height - footerBarFrame.height - 240
-                                ),
-                                onPick: { stack in
-                                    DatabaseManager.shared.setPinnedStack(id: stack.id)
-                                    withAnimation(.easeInOut(duration: 0.2)) { drawerOpen = false }
-                                },
-                                onDismiss: {
-                                    withAnimation(.easeInOut(duration: 0.2)) { drawerOpen = false }
-                                },
-                                onHoverChange: { hovering in
-                                    handleDrawerHover(hovering)
-                                }
-                            )
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    VStack(alignment: pinnedFloaterHStackAlignment, spacing: 8) {
+                        // Drawer + floater stack order depends on which
+                        // half of the screen the floater lives in. At a
+                        // bottom corner the drawer "rises" above the
+                        // floater (chat-input metaphor); at a top corner
+                        // it "descends" below so the column doesn't run
+                        // off-screen.
+                        if pinnedFloaterCorner.isBottom {
+                            if drawerOpen {
+                                drawerView(for: pinned, in: geo.size)
+                            }
+                            floaterView(for: pinned, in: geo.size)
+                        } else {
+                            floaterView(for: pinned, in: geo.size)
+                            if drawerOpen {
+                                drawerView(for: pinned, in: geo.size)
+                            }
                         }
-
-                        pinnedStackFloater(pinned)
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
                     .frame(
                         maxWidth: .infinity,
                         maxHeight: .infinity,
-                        alignment: .bottomTrailing
+                        alignment: pinnedFloaterAlignment
                     )
-                    .padding(.trailing, 24)
-                    .padding(.bottom, footerBarFrame.height + 16)
+                    // Uniform 24pt corner inset on the leading/trailing
+                    // edge the floater hugs; bottom corners also clear
+                    // the footer bar.
+                    .padding(.leading, pinnedFloaterCorner.isLeading ? 24 : 0)
+                    .padding(.trailing, pinnedFloaterCorner.isTrailing ? 24 : 0)
+                    .padding(.top, pinnedFloaterCorner.isTop ? 24 : 0)
+                    .padding(.bottom, pinnedFloaterCorner.isBottom ? footerBarFrame.height + 16 : 0)
                 }
             }
         }
@@ -747,6 +852,54 @@ struct BrowseView: View {
         // origin breadcrumb, card detail, stack detail — renders its
         // "in stack" state without needing the set threaded as a prop.
         .environment(\.pinnedStackMembers, pinnedStackMembers)
+    }
+
+    // MARK: - Floater + drawer subviews
+
+    /// The pinned-stack pill itself, with the 4-corner drag gesture and
+    /// a context menu that lets the user jump directly to any corner
+    /// without dragging.
+    @ViewBuilder
+    private func floaterView(for pinned: Stack, in containerSize: CGSize) -> some View {
+        pinnedStackFloater(pinned)
+            .transition(.move(edge: pinnedFloaterCorner.isBottom ? .bottom : .top).combined(with: .opacity))
+            .offset(floaterDragOffset)
+            .simultaneousGesture(floaterDragGesture(in: containerSize))
+            .contextMenu {
+                cornerMenuButton("Top left", target: .topLeading)
+                cornerMenuButton("Top right", target: .topTrailing)
+                cornerMenuButton("Bottom left", target: .bottomLeading)
+                cornerMenuButton("Bottom right", target: .bottomTrailing)
+            }
+    }
+
+    @ViewBuilder
+    private func cornerMenuButton(_ label: String, target: FloaterCorner) -> some View {
+        Button(label) {
+            withAnimation(.spring(response: 0.45, dampingFraction: 0.78)) {
+                pinnedFloaterCorner = target
+            }
+        }
+        .disabled(pinnedFloaterCorner == target)
+    }
+
+    /// The stack-switch column. Sits above the floater at bottom corners
+    /// and below at top corners (set by the parent VStack ordering).
+    @ViewBuilder
+    private func drawerView(for pinned: Stack, in containerSize: CGSize) -> some View {
+        StackDrawer(
+            currentPinnedId: pinned.id,
+            maxColumnHeight: max(120, containerSize.height - footerBarFrame.height - 240),
+            onPick: { stack in
+                DatabaseManager.shared.setPinnedStack(id: stack.id)
+                withAnimation(.easeInOut(duration: 0.2)) { drawerOpen = false }
+            },
+            onDismiss: {
+                withAnimation(.easeInOut(duration: 0.2)) { drawerOpen = false }
+            },
+            onHoverChange: { _ in }
+        )
+        .transition(.move(edge: pinnedFloaterCorner.isBottom ? .bottom : .top).combined(with: .opacity))
     }
 
     // MARK: - Card tap routing
@@ -762,6 +915,62 @@ struct BrowseView: View {
         withAnimation(.easeInOut(duration: 0.2)) {
             selectedHighlight = nil
             modalSourceStackItems = []
+            selectedHighlightWorkspaceId = nil
+        }
+    }
+
+    /// Item-detail modal extracted from the main `body` overlay. Lives
+    /// here so the body's @ViewBuilder chain stays inside the type
+    /// checker's reach — embedding the full CardDetailView call (9
+    /// argument labels + 5 trailing modifiers) inside the body's nested
+    /// .overlay/.if/ZStack tree blew the type-check budget when Phase D
+    /// added one more argument to the call.
+    @ViewBuilder
+    private var cardDetailOverlay: some View {
+        if let highlight = selectedHighlight {
+            ZStack {
+                Color.black.opacity(0.3)
+                    .ignoresSafeArea()
+                    .onTapGesture { dismissHighlight() }
+
+                CardDetailView(
+                    highlight: highlight,
+                    onDismiss: { dismissHighlight() },
+                    onStackNavigation: { stack in
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            selectedHighlight = nil
+                            modalSourceStackItems = []
+                            selectedHighlightWorkspaceId = nil
+                        }
+                        workspaceState.openTab(.stack(id: stack.id))
+                    },
+                    onImageFullscreen: { image in
+                        withAnimation(.easeInOut(duration: 0.2)) { fullScreenImage = image }
+                    },
+                    siblings: siblings(for: highlight),
+                    onNavigate: { sibling in
+                        selectedHighlight = sibling
+                    },
+                    onJumpTo: { target in
+                        jumpToHighlight(target)
+                    },
+                    onRevealInAll: { target in
+                        revealInAll(target)
+                    },
+                    onAddFilter: { filter in
+                        applyDetailFilter(filter)
+                    },
+                    inWorkspaceId: selectedHighlightWorkspaceId
+                )
+                .id(highlight.id)
+                .frame(maxWidth: 700, maxHeight: .infinity)
+                .background(Color(.windowBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .shadow(color: .black.opacity(0.25), radius: 16, y: 4)
+                .padding(40)
+            }
+            .transition(.opacity)
+            .onExitCommand { dismissHighlight() }
         }
     }
 
@@ -825,6 +1034,25 @@ struct BrowseView: View {
         }
     }
 
+    /// Apply a "filter the All view by this metadata value" intent
+    /// raised by a CardDetailView funnel button. Dismisses the detail
+    /// modal, ensures an All-view tab is active, and inserts the value
+    /// into the right `ActiveFilters` facet. The pill bar shows the new
+    /// constraint immediately and the masonry reloads via the existing
+    /// `.onChange(of: activeFilters)` path.
+    private func applyDetailFilter(_ filter: CardDetailFilter) {
+        dismissHighlight()
+        if !workspaceState.focusExisting(.allView) {
+            workspaceState.openTab(.allView)
+        }
+        switch filter {
+        case .app(let name):
+            activeFilters.apps.insert(name)
+        case .url(let url):
+            activeFilters.urls.insert(url)
+        }
+    }
+
     /// Shift the active pane's active tab by `delta`, wrapping at both
     /// ends. Drives `⌘⇧]` / `⌘⇧[` from the Tab menu.
     private func shiftActiveTab(by delta: Int) {
@@ -848,20 +1076,31 @@ struct BrowseView: View {
         workspaceState.panes[paneIdx].activeTabId = pane.tabs[index].id
     }
 
-    /// Leave windowed mode — reset the stream to the newest-first view
-    /// the user started from, and scroll to the top.
-    private func exitWindowedMode(proxy: ScrollViewProxy) {
-        focusedHighlightId = nil
-        isWindowedMode = false
-        hasNewer = false
-        highlightsOffset = 0
-        loadCaptures(reset: true)
-        if let firstId = highlights.first?.id {
+    /// Scroll the All-view archive back to its first row. When in
+    /// windowed mode (i.e. the user jumped to a moment via "Show in
+    /// All"), this also resets the stream to the global newest-first
+    /// view — the user expects "back to top" to mean "back to the
+    /// freshest captures", not "the top of this random window slice".
+    private func jumpToTop(proxy: ScrollViewProxy) {
+        if isWindowedMode {
+            isWindowedMode = false
+            hasNewer = false
+            highlightsOffset = 0
+            loadCaptures(reset: true)
+            // Defer the scroll a runloop tick so the new (reset)
+            // highlights are mounted before scrollTo resolves the id.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    proxy.scrollTo(firstId, anchor: .top)
+                if let firstId = highlights.first?.id {
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        proxy.scrollTo(firstId, anchor: .top)
+                    }
                 }
             }
+            return
+        }
+        guard let firstId = filteredHighlights.first?.id else { return }
+        withAnimation(.easeInOut(duration: 0.25)) {
+            proxy.scrollTo(firstId, anchor: .top)
         }
     }
 
@@ -924,6 +1163,21 @@ struct BrowseView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(UITokens.surfaceBackground)
+        case .workspace(let id):
+            WorkspaceCanvasView(
+                workspaceId: id,
+                onOpenHighlight: { highlight in
+                    // Same channel All view + StackBody use — the
+                    // CardDetailView modal is owned at the BrowseView
+                    // level so every body type opens the same overlay.
+                    // Stamp the workspace id so a Phase D derive lands
+                    // a placement on this canvas next to the parent.
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        selectedHighlightWorkspaceId = id
+                        selectedHighlight = highlight
+                    }
+                }
+            )
         }
     }
 
@@ -961,6 +1215,9 @@ struct BrowseView: View {
                     for (paneId, tabId) in closures {
                         workspaceState.closeTab(paneId: paneId, tabId: tabId)
                     }
+                },
+                onOpenOriginWorkspace: { workspaceId in
+                    workspaceState.openTab(.workspace(id: workspaceId))
                 }
             )
         } else {
@@ -1008,7 +1265,7 @@ struct BrowseView: View {
                     }
                 )
 
-                if filteredHighlights.isEmpty && !(showAddTile && viewMode == .mosaic) {
+                if filteredHighlights.isEmpty {
                     VStack(spacing: 12) {
                         Spacer()
                         Image(systemName: "tray")
@@ -1037,67 +1294,45 @@ struct BrowseView: View {
                 } else {
                     ScrollViewReader { proxy in
                         ScrollView {
-                            Group {
-                                switch viewMode {
-                                case .mosaic:
-                                    MasonryLayout(minColumnWidth: 260, spacing: 14, pinFirst: showAddTile) {
-                                        if showAddTile {
-                                            AddTile()
-                                        }
-                                        ForEach(filteredHighlights) { highlight in
-                                            MasonryCard(
-                                                highlight: highlight,
-                                                noteCount: noteCounts[highlight.id] ?? 0,
-                                                preferredAspectRatio: aspectRatios[highlight.id],
-                                                sourceLink: sourceLinks[highlight.id],
-                                                fileRecord: highlight.fileId.flatMap { fileRecords[$0] },
-                                                searchQuery: searchText
-                                            )
-                                            .id(highlight.id)
-                                            .overlay {
-                                                if jumpFlashId == highlight.id {
-                                                    RoundedRectangle(cornerRadius: UITokens.radiusCard)
-                                                        .strokeBorder(Color.accentColor, lineWidth: 3)
-                                                        .allowsHitTesting(false)
-                                                        .transition(.asymmetric(
-                                                            insertion: .opacity.animation(.easeIn(duration: 0.18)),
-                                                            removal: .opacity.animation(.easeOut(duration: 0.7))
-                                                        ))
-                                                }
-                                            }
-                                            .onTapGesture {
-                                                routeCardTap(highlight)
-                                            }
-                                        }
-                                    }
-                                    .padding(.horizontal, 16).padding(.vertical, 12)
-                                case .list:
-                                    ArchiveListView(
-                                        highlights: filteredHighlights,
-                                        highlightNotes: highlightNotes,
-                                        noteCounts: noteCounts,
-                                        onSelect: { highlight in
-                                            routeCardTap(highlight)
-                                        },
-                                        onApproachEnd: {
-                                            if hasMore { loadCaptures(reset: false) }
-                                        }
-                                    )
+                            ArchiveListView(
+                                highlights: filteredHighlights,
+                                highlightNotes: highlightNotes,
+                                noteCounts: noteCounts,
+                                onSelect: { highlight in
+                                    routeCardTap(highlight)
+                                },
+                                onApproachEnd: {
+                                    if hasMore { loadCaptures(reset: false) }
                                 }
-                            }
-                            .id(viewMode)
+                            )
                             .padding(.bottom, pinnedStack != nil ? 220 : 0)
                             .animation(nil, value: pinnedStack)
                         }
+                        // Persistent vertical scroller. Default `.automatic`
+                        // hid the indicator unless actively scrolling, which
+                        // read as "the scrollbar doesn't work" — the bar
+                        // simply wasn't on screen long enough to grab.
+                        .scrollIndicators(.visible, axes: .vertical)
                         .overlay(alignment: .top) {
-                            if isWindowedMode && isScrolledAwayFromTop {
-                                BackToNewestChip {
-                                    exitWindowedMode(proxy: proxy)
-                                }
-                                .padding(.top, 12)
-                                .transition(.opacity.combined(with: .move(edge: .top)))
+                            if isScrolledAwayFromTop {
+                                BackToTopChip(action: { jumpToTop(proxy: proxy) })
+                                    .padding(.top, 12)
+                                    .transition(.opacity.combined(with: .move(edge: .top)))
                             }
                         }
+                        .background(
+                            // Invisible ⌘↑ keyboard binding scoped to the
+                            // archive ScrollView. Lives in the background
+                            // so it doesn't add chrome but participates
+                            // in the window's command table while the
+                            // archive is on screen.
+                            Button("") { jumpToTop(proxy: proxy) }
+                                .keyboardShortcut(.upArrow, modifiers: .command)
+                                .opacity(0)
+                                .accessibilityHidden(true)
+                                .frame(width: 0, height: 0)
+                                .allowsHitTesting(false)
+                        )
                         .onScrollGeometryChange(for: Bool.self) { geo in
                             let bottomEdge = geo.contentOffset.y + geo.containerSize.height
                             let threshold = geo.contentSize.height - 400
@@ -1108,7 +1343,7 @@ struct BrowseView: View {
                             }
                         }
                         .onScrollGeometryChange(for: Bool.self) { geo in
-                            geo.contentOffset.y > backToNewestRevealOffset
+                            geo.contentOffset.y > backToTopRevealOffset
                         } action: { _, scrolled in
                             withAnimation(.easeInOut(duration: 0.15)) {
                                 isScrolledAwayFromTop = scrolled
@@ -1138,18 +1373,6 @@ struct BrowseView: View {
                                 try? await Task.sleep(for: .milliseconds(950))
                                 guard !Task.isCancelled else { return }
                                 await MainActor.run { jumpFlashId = nil }
-                            }
-                        }
-                        .onChange(of: viewMode) { _, _ in
-                            // When the user toggles between mosaic and
-                            // history while a jump target is active,
-                            // re-apply the scroll so the target lands
-                            // in view on the newly-mounted branch.
-                            guard let id = focusedHighlightId else { return }
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-                                withAnimation(.easeInOut(duration: 0.2)) {
-                                    proxy.scrollTo(id, anchor: .center)
-                                }
                             }
                         }
                     }
@@ -1184,7 +1407,6 @@ struct BrowseView: View {
                         ProgressView()
                             .controlSize(.small)
                     }
-                    BrowseViewModeToggle(viewMode: $viewMode)
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
@@ -1202,6 +1424,16 @@ struct BrowseView: View {
             .simultaneousGesture(TapGesture().onEnded { clearFocus() })
             .onDrop(of: [.fileURL, .item], isTargeted: $isDropTargeted) { providers in
                 handleDrop(providers)
+            }
+            // Internal cross-pane drop. Cards / stacks dragged from
+            // anywhere also land here — semantically a no-op (the
+            // archive already holds every captured card by definition)
+            // but accepted so the All-view follows the same
+            // unopinionated "every list takes drops" rule as workspaces
+            // and stacks.
+            .dropDestination(for: CanvasDragItem.self) { items, _ in
+                CaptureLog.info("[all-view drop] received \(items.count) item(s) — no-op (already in archive)")
+                return !items.isEmpty
             }
             .overlay {
                 if isDropTargeted {
@@ -1902,6 +2134,10 @@ private struct MasonryCard: View {
             }
         }
         .materialContextMenu(for: highlight)
+        // Drag this card to a workspace canvas (creates a placement) or
+        // to another stack (adds membership). Uses `Transferable` with a
+        // private custom UTType so external apps don't see the payload.
+        .draggable(CanvasDragItem(kind: .highlight, id: highlight.id))
         // Publish the highlight id so `MasonryLayout` can memoize
         // height across relayouts via `MasonryHeightCache`.
         .layoutValue(key: MasonryCardIdKey.self, value: highlight.id)
@@ -2795,10 +3031,17 @@ struct DetailLinkPreview: View {
 
 struct EmbeddedLinkPreview: View {
     let urlString: String
+    /// Hover-revealed "filter All view by this URL" affordance. When
+    /// supplied, the funnel button appears at the trailing edge — its
+    /// click adds the URL to `ActiveFilters.urls` and dismisses the
+    /// detail modal. Tapping the body of the preview itself still
+    /// opens the URL in the browser, the existing primary action.
+    var onAddFilter: (() -> Void)? = nil
     @State private var preview: LinkPreview?
     @State private var heroImage: NSImage?
     @State private var faviconImage: NSImage?
     @State private var didLoad = false
+    @State private var isHovered = false
 
     private var displayHost: String {
         preview?.siteName ?? LinkHostCache.host(for: urlString)
@@ -2859,6 +3102,13 @@ struct EmbeddedLinkPreview: View {
                             .multilineTextAlignment(.leading)
                     }
                     Spacer(minLength: 0)
+                    if onAddFilter != nil {
+                        FilterByFunnelButton(help: "Filter All view by this URL") {
+                            onAddFilter?()
+                        }
+                        .opacity(isHovered ? 1 : 0)
+                        .allowsHitTesting(isHovered)
+                    }
                 }
                 .padding(10)
                 .background(
@@ -2871,6 +3121,9 @@ struct EmbeddedLinkPreview: View {
                 )
             }
             .buttonStyle(.plain)
+            .onHover { hovering in
+                withAnimation(.easeInOut(duration: 0.12)) { isHovered = hovering }
+            }
             .task {
                 let fetched = await LinkPreviewStore.shared.preview(for: urlString)
                 self.preview = fetched
@@ -2993,35 +3246,57 @@ func openFile(_ path: String) {
     }
 }
 
-/// Top-anchored pill surfaced while the archive is in "jumped-to-moment"
-/// mode. Tapping it drops the windowed slice and scrolls back to the top
-/// of the newest-first stream.
-private struct BackToNewestChip: View {
-    let onTap: () -> Void
+/// Top-anchored pill that scrolls the archive back to its first row.
+/// Shown only after the user has scrolled `backToTopRevealOffset` away
+/// from the top, so it never adds chrome to the "I'm already at the
+/// top" case. Surfaces the ⌘↑ shortcut inline as a small kbd-style
+/// chip — clicking the pill and pressing the shortcut do the same thing.
+private struct BackToTopChip: View {
+    let action: () -> Void
     @State private var isHovered = false
 
     var body: some View {
-        Button(action: onTap) {
-            HStack(spacing: 6) {
+        Button(action: action) {
+            HStack(spacing: 8) {
                 Image(systemName: "arrow.up.to.line")
-                    .font(.caption2.weight(.semibold))
-                Text("Back to newest")
-                    .font(.caption.weight(.medium))
+                    .font(.system(size: 11, weight: .semibold))
+                Text("Back to top")
+                    .font(.system(size: 12, weight: .medium))
+                shortcutChip
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+            .foregroundStyle(isHovered ? .primary : .secondary)
+            .padding(.leading, 12)
+            .padding(.trailing, 6)
+            .padding(.vertical, 5)
             .background(
                 Capsule()
                     .fill(UITokens.surfaceFloater)
                     .shadow(color: UITokens.shadowFloater, radius: 6, y: 2)
             )
             .overlay(
-                Capsule().strokeBorder(UITokens.surfaceBorderStrong, lineWidth: 0.5)
+                Capsule()
+                    .strokeBorder(UITokens.surfaceBorderStrong, lineWidth: 0.5)
             )
-            .foregroundStyle(isHovered ? .primary : .secondary)
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
+        .help("Scroll to the most recent capture (⌘↑)")
+    }
+
+    private var shortcutChip: some View {
+        Text("⌘↑")
+            .font(.system(size: 10, weight: .semibold, design: .rounded))
+            .foregroundStyle(.tertiary)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(Color.primary.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 4)
+                    .strokeBorder(Color.primary.opacity(0.10), lineWidth: 0.5)
+            )
     }
 }
 
@@ -3110,60 +3385,6 @@ private struct CardMetadataFooter: View {
 }
 
 // CardDetailView and StableVideoPlayer live in CardDetailView.swift
-
-// MARK: - Browse View Mode
-
-enum BrowseViewMode: String, CaseIterable {
-    case mosaic
-    case list
-
-    /// Decode legacy persisted values. Earlier builds wrote `"history"`
-    /// for what is now `.list`; keep that mapping so existing workspaces
-    /// don't reset to mosaic on first launch after the rename.
-    init?(rawValue: String) {
-        switch rawValue {
-        case "mosaic": self = .mosaic
-        case "list", "history": self = .list
-        default: return nil
-        }
-    }
-}
-
-private struct BrowseViewModeToggle: View {
-    @Binding var viewMode: BrowseViewMode
-
-    var body: some View {
-        HStack(spacing: 2) {
-            button(mode: .mosaic, icon: "square.grid.2x2.fill", help: "Mosaic")
-            button(mode: .list, icon: "list.bullet", help: "List")
-        }
-        .padding(2)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(UITokens.chipFill)
-        )
-    }
-
-    @ViewBuilder
-    private func button(mode: BrowseViewMode, icon: String, help: String) -> some View {
-        let selected = viewMode == mode
-        Button(action: { viewMode = mode }) {
-            Image(systemName: icon)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(selected ? .primary : Color.secondary.opacity(0.7))
-                .frame(width: 22, height: 18)
-                .background(
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(selected ? UITokens.surfaceCard : Color.clear)
-                        .shadow(color: selected ? UITokens.shadowCard : .clear, radius: 2, y: 1)
-                )
-                .contentShape(RoundedRectangle(cornerRadius: 4))
-        }
-        .buttonStyle(.plain)
-        .help(help)
-    }
-}
-
 
 // MARK: - Highlight Thumbnail Loader
 //

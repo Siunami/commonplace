@@ -29,6 +29,11 @@ struct StackBody: View {
     /// us (merged into another stack, removed from the all-stacks view,
     /// etc.). The owning workspace closes the tab in response.
     var onStackVanished: () -> Void = {}
+    /// Opens the workspace this stack was extracted from as a new tab.
+    /// Wired by the caller to `workspaceState.openTab(.workspace(id:))`
+    /// — only fires when `stack.originWorkspaceId` resolves to a real
+    /// workspace, so the badge that triggers it is hidden otherwise.
+    var onOpenOriginWorkspace: (String) -> Void = { _ in }
 
     @State private var currentStack: Stack
     @State private var items: [Highlight] = []
@@ -68,27 +73,11 @@ struct StackBody: View {
     @State private var anchorSelectionIndex: Int? = nil
     @State private var splitConfirmationText: String? = nil
 
-    // Drag-to-reorder. The in-flow cell for the dragged item becomes
-    // invisible while a floating preview — rendered as a sibling of the
-    // grid in the same "stackGrid" coordinate space — follows the
-    // cursor via `.position`. Decoupling the preview from the grid's
-    // layout means cursor-tracking is instant and doesn't fight the
-    // spring animation that reshuffles neighbour cells.
-    @State private var cellFrames: [String: CGRect] = [:]
-    @State private var slotSize: CGSize = .zero
-    @State private var draggingId: String? = nil
-    @State private var dragCursor: CGPoint = .zero
-    @State private var dragCursorOffsetInCell: CGSize = .zero
-    /// Set briefly on drag end so the concurrent `onTapGesture` in the
-    /// cell doesn't fire `onOpen()` as a side-effect of the release.
-    @State private var didJustDrag = false
-
-    /// Per-row frames collected via a preference key so the list
-    /// drag-to-reorder can find which row the cursor is over. Separate
-    /// from `cellFrames` because the two views use different
-    /// coordinate spaces and row geometries.
-    @State private var listRowFrames: [String: CGRect] = [:]
-    @State private var listContentWidth: CGFloat = 0
+    // (In-stack drag-to-reorder removed — V1 unifies all drag actions
+    // around cross-pane card movement. Cards in this stack are draggable
+    // via `.draggable(CanvasDragItem)` to other workspaces / stacks; the
+    // body itself is a `.dropDestination` that adds dropped highlights
+    // to this stack.)
 
     /// Grid vs. list rendering of the items section. Session-local for
     /// now — list is an experiment; if it proves sticky we can persist
@@ -105,12 +94,14 @@ struct StackBody: View {
         stack: Stack,
         onOpenHighlight: @escaping (Highlight) -> Void = { _ in },
         onOpenSubstack: @escaping (Stack) -> Void = { _ in },
-        onStackVanished: @escaping () -> Void = {}
+        onStackVanished: @escaping () -> Void = {},
+        onOpenOriginWorkspace: @escaping (String) -> Void = { _ in }
     ) {
         self.stack = stack
         self.onOpenHighlight = onOpenHighlight
         self.onOpenSubstack = onOpenSubstack
         self.onStackVanished = onStackVanished
+        self.onOpenOriginWorkspace = onOpenOriginWorkspace
 
         // Hot-mount path: if this stack was rendered recently (e.g. the
         // user just dragged its tab into a new pane), paint the first
@@ -143,6 +134,21 @@ struct StackBody: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(UITokens.surfaceBackground)
+        // Drop a card from another pane (canvas, BrowseView, another
+        // stack) to add it to this stack. INSERT-OR-IGNORE semantics
+        // in `addHighlight` make re-drops of an existing member a
+        // silent no-op; cross-stack drops effectively copy (the source
+        // stack keeps its membership). Stack-onto-stack drops are
+        // ignored — substacks are managed via the dedicated picker.
+        .dropDestination(for: CanvasDragItem.self) { items, _ in
+            CaptureLog.info("[stack drop] received \(items.count) item(s) for stack \(currentStack.id)")
+            var accepted = false
+            for item in items where item.kind == .highlight {
+                db.addHighlight(item.id, toStack: currentStack.id)
+                accepted = true
+            }
+            return accepted
+        }
         .overlay(alignment: .bottom) {
             if !selectedIds.isEmpty {
                 selectionActionBar
@@ -225,6 +231,7 @@ struct StackBody: View {
                 VStack(alignment: .leading, spacing: 4) {
                     nameField
                     descriptionField
+                    originBadge
                     Text(countsSummary)
                         .font(.system(size: 11))
                         .foregroundStyle(.tertiary)
@@ -288,6 +295,35 @@ struct StackBody: View {
                     descriptionDraft = currentStack.stackDescription ?? ""
                     isEditingDescription = true
                 }
+        }
+    }
+
+    /// Pill that surfaces the workspace this stack was extracted from.
+    /// Renders only when `originWorkspaceId` resolves to a workspace that
+    /// still exists — a deleted origin reads as "no origin" rather than
+    /// a broken link. Tap opens the origin as a new tab via the caller's
+    /// workspace-state mutator.
+    @ViewBuilder
+    private var originBadge: some View {
+        if let originId = currentStack.originWorkspaceId,
+           let origin = db.workspace(byId: originId) {
+            Button {
+                onOpenOriginWorkspace(originId)
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.up.forward.app")
+                        .font(.system(size: 9))
+                    Text("From \(origin.isNamed ? (origin.name ?? "") : "Untitled workspace")")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(Color.primary.opacity(0.06)))
+            }
+            .buttonStyle(.plain)
+            .help("Open the workspace this stack was extracted from")
+            .padding(.top, 2)
         }
     }
 
@@ -534,6 +570,9 @@ struct StackBody: View {
             .padding(.horizontal, 20)
             .padding(.vertical, 20)
         }
+        // Persistent vertical scroller — matches the All-view archive's
+        // affordance so both list contexts feel the same.
+        .scrollIndicators(.visible, axes: .vertical)
     }
 
     // MARK: - Note composer
@@ -709,164 +748,40 @@ struct StackBody: View {
         }
     }
 
-    /// The existing square-cell grid with drag-to-reorder. Keeps the
-    /// drag-reorder "stackGrid" coordinate space scoped to this subtree.
+    /// Square-cell grid. Cards are draggable to other panes (canvas /
+    /// stack); intra-stack reorder gestures were removed in the V1
+    /// drag unification.
     private var itemsGridBody: some View {
-        ZStack(alignment: .topLeading) {
-            LazyVGrid(columns: gridColumns, spacing: 14) {
-                ForEach(items) { item in
-                    cellWrapper(for: item)
-                }
-            }
-
-            if let id = draggingId,
-               let draggedItem = items.first(where: { $0.id == id }) {
-                floatingDragPreview(for: draggedItem)
-            }
-        }
-        .coordinateSpace(name: "stackGrid")
-        .onPreferenceChange(CellFramesKey.self) { frames in
-            var dict: [String: CGRect] = [:]
-            for frame in frames { dict[frame.id] = frame.frame }
-            cellFrames = dict
-            if let any = frames.first?.frame.size, any != .zero {
-                slotSize = any
+        LazyVGrid(columns: gridColumns, spacing: 14) {
+            ForEach(items) { item in
+                cellWrapper(for: item)
             }
         }
     }
 
-    /// Document-style list. Items flow without per-row chrome; a drag
-    /// handle appears on hover in the leading gutter and re-orders the
-    /// list inline. The dragged row lifts into a floating preview that
-    /// tracks the cursor while its neighbours animate around it.
+    /// Document-style list. Each row is the full content of one item.
+    /// Cards are draggable out to canvas / other stacks; in-list
+    /// reorder was removed in the V1 drag unification.
     private var itemsListBody: some View {
-        ZStack(alignment: .topLeading) {
-            LazyVStack(alignment: .leading, spacing: 10) {
-                ForEach(items) { item in
-                    listRowWrapper(for: item)
-                }
+        LazyVStack(alignment: .leading, spacing: 6) {
+            ForEach(items) { item in
+                listRowWrapper(for: item)
             }
-            .background(
-                GeometryReader { geo in
-                    Color.clear
-                        .preference(key: ListContentWidthKey.self, value: geo.size.width)
-                }
-            )
-
-            if let id = draggingId,
-               let draggedItem = items.first(where: { $0.id == id }) {
-                floatingListDragPreview(for: draggedItem)
-            }
-        }
-        .coordinateSpace(name: "stackList")
-        .onPreferenceChange(ListRowFramesKey.self) { frames in
-            var dict: [String: CGRect] = [:]
-            for f in frames { dict[f.id] = f.frame }
-            listRowFrames = dict
-        }
-        .onPreferenceChange(ListContentWidthKey.self) { w in
-            listContentWidth = w
         }
     }
 
     @ViewBuilder
     private func listRowWrapper(for item: Highlight) -> some View {
-        let isDragging = draggingId == item.id
         MaterialListRow(
             highlight: item,
             noteCount: noteCounts[item.id] ?? 0,
             notes: highlightNotes[item.id] ?? [],
             isSelected: selectedIds.contains(item.id),
-            isBeingDragged: isDragging,
-            didJustDrag: didJustDrag,
             onRemove: { db.removeHighlight(item.id, fromStack: currentStack.id) },
             onOpen: { handleCellTap(item) },
-            onHandleDragChanged: { location in handleListDragChanged(item: item, location: location) },
-            onHandleDragEnded: { handleListDragEnded(item: item) }
+            collapseNotes: true
         )
-        .background(
-            GeometryReader { geo in
-                Color.clear.preference(
-                    key: ListRowFramesKey.self,
-                    value: [ListRowFrame(id: item.id, frame: geo.frame(in: .named("stackList")))]
-                )
-            }
-        )
-        .opacity(isDragging ? 0 : 1)
-    }
-
-    /// Floating copy of the dragged row that tracks the cursor in the
-    /// "stackList" coordinate space. The original row becomes invisible
-    /// (via `.opacity(0)`) while this preview stands in, so the row's
-    /// layout slot keeps its height and neighbours reshuffle cleanly.
-    @ViewBuilder
-    private func floatingListDragPreview(for item: Highlight) -> some View {
-        let rowSize = listRowFrames[item.id]?.size ?? CGSize(width: max(listContentWidth, 320), height: 60)
-        MaterialListRow(
-            highlight: item,
-            noteCount: noteCounts[item.id] ?? 0,
-            isSelected: false,
-            isBeingDragged: true,
-            didJustDrag: false,
-            onRemove: nil,
-            onOpen: {},
-            onHandleDragChanged: nil,
-            onHandleDragEnded: nil
-        )
-        .frame(width: rowSize.width, height: rowSize.height)
-        .scaleEffect(1.01)
-        .shadow(color: .black.opacity(0.22), radius: 14, y: 6)
-        .position(
-            x: rowSize.width / 2,
-            y: dragCursor.y - dragCursorOffsetInCell.height + rowSize.height / 2
-        )
-        .allowsHitTesting(false)
-        .transition(.opacity)
-    }
-
-    private func handleListDragChanged(item: Highlight, location: CGPoint) {
-        if draggingId == nil {
-            let origin = listRowFrames[item.id]?.origin ?? .zero
-            dragCursorOffsetInCell = CGSize(
-                width: location.x - origin.x,
-                height: location.y - origin.y
-            )
-            dragCursor = location
-            draggingId = item.id
-        } else {
-            dragCursor = location
-        }
-        guard let targetId = listRowIDContaining(y: location.y),
-              targetId != item.id,
-              let from = items.firstIndex(where: { $0.id == item.id }),
-              let to = items.firstIndex(where: { $0.id == targetId }) else {
-            return
-        }
-        let destination = to > from ? to + 1 : to
-        withAnimation(.interactiveSpring(response: 0.18, dampingFraction: 0.86)) {
-            items.move(fromOffsets: IndexSet(integer: from), toOffset: destination)
-        }
-    }
-
-    private func handleListDragEnded(item: Highlight) {
-        guard draggingId == item.id else { return }
-        let order = items.map(\.id)
-        let stackId = currentStack.id
-        Task.detached(priority: .userInitiated) {
-            DatabaseManager.shared.reorderHighlightsInStack(stackId: stackId, orderedIds: order)
-        }
-        draggingId = nil
-        didJustDrag = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-            didJustDrag = false
-        }
-    }
-
-    private func listRowIDContaining(y: CGFloat) -> String? {
-        for (id, frame) in listRowFrames where y >= frame.minY && y <= frame.maxY {
-            return id
-        }
-        return nil
+        .draggable(CanvasDragItem(kind: .highlight, id: item.id))
     }
 
     @ViewBuilder
@@ -901,13 +816,10 @@ struct StackBody: View {
 
     @ViewBuilder
     private func cellWrapper(for item: Highlight) -> some View {
-        let isDragging = draggingId == item.id
         let isSelected = selectedIds.contains(item.id)
         StackDetailItemCell(
             highlight: item,
             noteCount: noteCounts[item.id] ?? 0,
-            isBeingDragged: isDragging,
-            didJustDrag: didJustDrag,
             isSelected: isSelected,
             onRemove: {
                 db.removeHighlight(item.id, fromStack: currentStack.id)
@@ -917,16 +829,7 @@ struct StackBody: View {
             }
         )
         .aspectRatio(1, contentMode: .fit)
-        .background(
-            GeometryReader { geo in
-                Color.clear.preference(
-                    key: CellFramesKey.self,
-                    value: [CellFrame(id: item.id, frame: geo.frame(in: .named("stackGrid")))]
-                )
-            }
-        )
-        .opacity(isDragging ? 0 : 1)
-        .simultaneousGesture(dragGesture(for: item))
+        .draggable(CanvasDragItem(kind: .highlight, id: item.id))
     }
 
     /// Resolve a cell tap against the current modifier flags. Cmd toggles
@@ -959,85 +862,6 @@ struct StackBody: View {
             return
         }
         onOpenHighlight(item)
-    }
-
-    /// Floats above the grid in the same coordinate space. `.position`
-    /// is a pure-layout modifier that reads `dragCursor` directly — no
-    /// animation, no dependency on the cell's natural slot origin, so
-    /// it tracks the cursor 1:1 on every drag tick.
-    @ViewBuilder
-    private func floatingDragPreview(for item: Highlight) -> some View {
-        StackDetailItemCell(
-            highlight: item,
-            noteCount: noteCounts[item.id] ?? 0,
-            isBeingDragged: true,
-            didJustDrag: false,
-            isSelected: false,
-            onRemove: {},
-            onOpen: {}
-        )
-        .frame(width: slotSize.width, height: slotSize.height)
-        .scaleEffect(1.04)
-        .shadow(color: .black.opacity(0.3), radius: 18, y: 8)
-        .rotationEffect(.degrees(1.2))
-        .position(
-            x: dragCursor.x - dragCursorOffsetInCell.width + slotSize.width / 2,
-            y: dragCursor.y - dragCursorOffsetInCell.height + slotSize.height / 2
-        )
-        .allowsHitTesting(false)
-        .transition(.opacity)
-    }
-
-    private func dragGesture(for item: Highlight) -> some Gesture {
-        // Short minimumDistance keeps drag engagement feeling
-        // immediate while still letting a pure click reach the cell's
-        // onTapGesture (open-in-detail).
-        DragGesture(minimumDistance: 3, coordinateSpace: .named("stackGrid"))
-            .onChanged { value in
-                if draggingId == nil {
-                    let origin = cellFrames[item.id]?.origin ?? .zero
-                    dragCursorOffsetInCell = CGSize(
-                        width: value.startLocation.x - origin.x,
-                        height: value.startLocation.y - origin.y
-                    )
-                    dragCursor = value.location
-                    draggingId = item.id
-                } else {
-                    dragCursor = value.location
-                }
-                guard let targetId = cellIDContainingPoint(value.location),
-                      targetId != item.id,
-                      let from = items.firstIndex(where: { $0.id == item.id }),
-                      let to = items.firstIndex(where: { $0.id == targetId }) else {
-                    return
-                }
-                let destination = to > from ? to + 1 : to
-                withAnimation(.interactiveSpring(response: 0.18, dampingFraction: 0.86)) {
-                    items.move(fromOffsets: IndexSet(integer: from), toOffset: destination)
-                }
-            }
-            .onEnded { _ in
-                guard draggingId == item.id else { return }
-                let order = items.map(\.id)
-                let stackId = currentStack.id
-                Task.detached(priority: .userInitiated) {
-                    DatabaseManager.shared.reorderHighlightsInStack(stackId: stackId, orderedIds: order)
-                }
-                draggingId = nil
-                didJustDrag = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                    didJustDrag = false
-                }
-            }
-    }
-
-    private func cellIDContainingPoint(_ point: CGPoint) -> String? {
-        // Require containment (not nearest-center) so cursors in the
-        // gutter between cells don't thrash neighbouring cells.
-        for (id, frame) in cellFrames where frame.contains(point) {
-            return id
-        }
-        return nil
     }
 
     /// Adaptive square cells — column count scales with the window,
@@ -1257,42 +1081,9 @@ struct StackBody: View {
 // types show inline readable text. No internal aspect constraint,
 // because the Layout above has already picked the box.
 
-struct CellFrame: Equatable {
-    let id: String
-    let frame: CGRect
-}
-
-struct CellFramesKey: PreferenceKey {
-    static let defaultValue: [CellFrame] = []
-    static func reduce(value: inout [CellFrame], nextValue: () -> [CellFrame]) {
-        value.append(contentsOf: nextValue())
-    }
-}
-
-struct ListRowFrame: Equatable {
-    let id: String
-    let frame: CGRect
-}
-
-struct ListRowFramesKey: PreferenceKey {
-    static let defaultValue: [ListRowFrame] = []
-    static func reduce(value: inout [ListRowFrame], nextValue: () -> [ListRowFrame]) {
-        value.append(contentsOf: nextValue())
-    }
-}
-
-struct ListContentWidthKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
-    }
-}
-
 private struct StackDetailItemCell: View {
     let highlight: Highlight
     var noteCount: Int = 0
-    var isBeingDragged: Bool = false
-    var didJustDrag: Bool = false
     var isSelected: Bool = false
     var onRemove: () -> Void
     var onOpen: () -> Void
@@ -1326,15 +1117,12 @@ private struct StackDetailItemCell: View {
             }
         }
         .overlay(alignment: .topTrailing) {
-            if isHovered && !isBeingDragged && !isSelected {
+            if isHovered && !isSelected {
                 removeButton.padding(6).transition(.opacity)
             }
         }
         .contentShape(Rectangle())
-        .onTapGesture {
-            guard !isBeingDragged, !didJustDrag else { return }
-            onOpen()
-        }
+        .onTapGesture { onOpen() }
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.15)) { isHovered = hovering }
         }

@@ -84,6 +84,15 @@ struct BrowseFilterSQL {
             args.append(app)
         }
 
+        // URL filters land here when the user clicks the funnel on a
+        // card-detail URL chip. AND-joined like every other facet,
+        // making "show me captures from this URL AND this app" trivial.
+        let orderedURLs = filters.urls.sorted()
+        for url in orderedURLs {
+            parts.append("h.sourceUrl = ?")
+            args.append(url)
+        }
+
         self.whereClause = parts.joined(separator: " AND ")
         self.arguments = args
     }

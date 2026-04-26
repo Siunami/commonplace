@@ -492,7 +492,8 @@ final class RecordingToolbarController {
                 let image = NSImage(cgImage: result.cgImage, size: NSSize(width: result.cgImage.width, height: result.cgImage.height))
                 HighlightCapture.shared.captureFromUserScreenshot(
                     filePath: result.filePath, image: image,
-                    screenshotId: result.screenshotId, context: result.context
+                    screenshotId: result.screenshotId, context: result.context,
+                    sources: result.sources
                 )
             }
 
@@ -503,7 +504,8 @@ final class RecordingToolbarController {
                 let image = NSImage(cgImage: result.cgImage, size: NSSize(width: result.cgImage.width, height: result.cgImage.height))
                 HighlightCapture.shared.captureFromUserScreenshot(
                     filePath: result.filePath, image: image,
-                    screenshotId: result.screenshotId, context: result.context
+                    screenshotId: result.screenshotId, context: result.context,
+                    sources: result.sources
                 )
             }
 
@@ -521,7 +523,8 @@ final class RecordingToolbarController {
                     let image = NSImage(cgImage: result.cgImage, size: NSSize(width: result.cgImage.width, height: result.cgImage.height))
                     HighlightCapture.shared.captureFromUserScreenshot(
                         filePath: result.filePath, image: image,
-                        screenshotId: result.screenshotId, context: result.context
+                        screenshotId: result.screenshotId, context: result.context,
+                        sources: result.sources
                     )
                 }
             }

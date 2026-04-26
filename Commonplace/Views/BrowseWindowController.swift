@@ -84,13 +84,20 @@ final class BrowseWindowController: NSObject, NSWindowDelegate, ManagedWindowCon
             window = w
         }
 
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        // Become a regular app while Browse is visible — unlocks the
-        // macOS menu bar so SwiftUI Commands (⌘T / ⌘W / tab switching)
-        // can render and fire. Reverted in `dismiss()` so the app
-        // returns to its status-bar-extra character when hidden.
+        // Order matters here:
+        //   1. Flip activation policy FIRST so the app can fully take
+        //      focus from another foreground app. Calling activate
+        //      while still `.accessory` sometimes leaves the window
+        //      behind whatever was previously active.
+        //   2. Activate, then makeKeyAndOrderFront, then a defensive
+        //      orderFrontRegardless to win against edge cases where
+        //      the previous frontmost app refuses to yield focus.
+        // Net effect: the archive window reliably surfaces as the
+        // topmost window on the desktop on every show().
         NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+        window?.orderFrontRegardless()
 
         // Tell BrowseView to refresh its data
         NotificationCenter.default.post(name: Self.windowDidShowNotification, object: nil)

@@ -1077,5 +1077,110 @@ struct AppMigrations {
             let elapsed = Int(Date().timeIntervalSince(backfillStart) * 1000)
             CaptureLog.info("[migration v25] FTS5 per-column backfill: \(count) highlights indexed in \(elapsed)ms")
         }
+
+        // V1 spec primitives: a Workspace is a spatial surface, a Placement
+        // is a card's appearance inside one — both net-new at v26 (pre-v26
+        // the app was archive + stacks only). The new columns on
+        // highlight/stack capture Card.origin_type and Stack.origin_*
+        // metadata so the system can answer "where did this come from /
+        // where does it live now" without an expensive backfill — a
+        // DEFAULT 'captured' on origin_type fills existing rows in-place
+        // (ALTER TABLE ADD COLUMN does not fire AFTER UPDATE triggers,
+        // so the v25 FTS5 mirror is untouched).
+        migrator.registerMigration("v26_workspace_and_origin") { db in
+            // Workspace — a named spatial surface. id is a UUID string so
+            // it can be carried inside `case .workspace(id: String)` on
+            // WorkspaceTabContent (Phase B) without a join.
+            try db.create(table: "workspace", ifNotExists: true) { t in
+                t.primaryKey("id", .text)
+                t.column("name", .text)
+                t.column("createdAt", .double).notNull()
+                t.column("updatedAt", .double).notNull()
+            }
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_workspace_updatedAt
+                ON workspace(updatedAt)
+                """)
+
+            // Placement — one card's appearance in one workspace at given
+            // coordinates. UNIQUE(workspaceId, cardId) enforces the V1
+            // invariant that a card appears at most once per workspace
+            // (the spec parks "cards appearing multiple times in same
+            // workspace" as explicitly excluded). Cascading deletes from
+            // both parents keep the table clean without app-side bookkeeping.
+            try db.create(table: "placement", ifNotExists: true) { t in
+                t.primaryKey("id", .text)
+                t.column("workspaceId", .text).notNull()
+                    .references("workspace", onDelete: .cascade)
+                t.column("cardId", .text).notNull()
+                    .references("highlight", onDelete: .cascade)
+                t.column("x", .double).notNull()
+                t.column("y", .double).notNull()
+                t.column("width", .double).notNull()
+                t.column("height", .double).notNull()
+                t.column("createdAt", .double).notNull()
+            }
+            try db.execute(sql: """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_placement_workspace_card
+                ON placement(workspaceId, cardId)
+                """)
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_placement_workspaceId
+                ON placement(workspaceId)
+                """)
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_placement_cardId
+                ON placement(cardId)
+                """)
+
+            // Card.origin_type / parent_card_id / derivation columns.
+            // origin_type is NOT NULL DEFAULT 'captured' so SQLite back-fills
+            // every existing row in-place at ALTER time — no UPDATE sweep
+            // is needed, and the v25 highlight_search_au trigger (which
+            // fires on any UPDATE to highlight) stays quiet.
+            try db.alter(table: "highlight") { t in
+                t.add(column: "originType", .text).notNull().defaults(to: "captured")
+                t.add(column: "originWorkspaceId", .text)
+                t.add(column: "parentCardId", .text)
+                t.add(column: "derivationType", .text)
+                t.add(column: "derivationData", .text)
+                t.add(column: "inheritedProvenance", .text)
+            }
+            // Reverse derivation lookup ("Derived from this" — Phase E).
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_highlight_parentCardId
+                ON highlight(parentCardId)
+                """)
+            // Cards authored inside a given workspace.
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS idx_highlight_originWorkspaceId
+                ON highlight(originWorkspaceId)
+                """)
+
+            // Stack.origin_workspace_id + arrangement snapshot — populated
+            // when a stack is created from a workspace canvas selection
+            // (Phase F). Snapshot is JSON: [{cardId, x, y, w, h}] frozen
+            // at create time. Both nullable so today's non-canvas creation
+            // paths (AllStacksView "+ New stack", merge, etc.) leave them
+            // null and don't gain a "View origin arrangement" link.
+            try db.alter(table: "stack") { t in
+                t.add(column: "originWorkspaceId", .text)
+                t.add(column: "originArrangementSnapshot", .text)
+            }
+        }
+
+        migrator.registerMigration("v27_screenshot_sources") { db in
+            // Multi-source attribution for screenshots — JSON-encoded
+            // [ScreenshotSource] computed at capture time by walking
+            // the SCWindow z-order over the capture rect with
+            // occlusion subtraction. Nullable so historical rows and
+            // non-screenshot capture paths render unchanged.
+            try db.alter(table: "highlight") { t in
+                t.add(column: "sources", .text)
+            }
+            try db.alter(table: "screenshot") { t in
+                t.add(column: "sources", .text)
+            }
+        }
     }
 }

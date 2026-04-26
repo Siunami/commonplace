@@ -63,6 +63,12 @@ struct AppFacet: Identifiable {
 struct ActiveFilters: Equatable {
     var types: Set<CaptureFilter> = []
     var apps: Set<String> = []
+    /// Source-URL filter values. URLs are too high-cardinality to
+    /// enumerate in the `+ Filter` popover, so values land here only
+    /// when the user clicks a "filter by this URL" affordance on a
+    /// card-detail metadata chip. Pills for active URL filters render
+    /// in the bar and remove like any other.
+    var urls: Set<String> = []
 
-    var isEmpty: Bool { types.isEmpty && apps.isEmpty }
+    var isEmpty: Bool { types.isEmpty && apps.isEmpty && urls.isEmpty }
 }
